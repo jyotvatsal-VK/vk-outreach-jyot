@@ -1,0 +1,41 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper: get the calling user's profile
+    function userProfile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    function isSignedIn() { return request.auth != null; }
+    function isApproved() { return isSignedIn() && userProfile().approved == true && userProfile().status == 'active'; }
+    function isMaster() { return isApproved() && userProfile().role == 'Master'; }
+    function isHOD() { return isApproved() && (userProfile().role == 'HOD' || userProfile().role == 'Master'); }
+
+    // Users collection: anyone signed in can read their own doc; Masters can read all; only backend/master writes
+    match /users/{uid} {
+      allow read: if isSignedIn() && (request.auth.uid == uid || isMaster());
+      allow create: if isSignedIn() && request.auth.uid == uid; // self-registration
+      allow update: if isMaster() || (isSignedIn() && request.auth.uid == uid && request.resource.data.role == resource.data.role); // can't self-promote
+      allow delete: if isMaster();
+    }
+
+    // App state (active event pointer): approved users read; HODs write
+    match /app_state/{doc} {
+      allow read: if isApproved();
+      allow write: if isHOD();
+    }
+
+    // Activity log: approved users read; any approved user can write (insert only)
+    match /activity_log/{doc} {
+      allow read: if isApproved();
+      allow create: if isApproved();
+      allow update, delete: if isMaster();
+    }
+
+    // All operational data: approved read; HOD/Master write
+    match /{collection}/{docId} {
+      allow read: if isApproved();
+      allow write: if isHOD();
+    }
+  }
+}
