@@ -3886,6 +3886,133 @@ function VolModal({ item, onClose, toast, vols = [], canSetAvailability = false,
    Shows assignments as badges with navigation links.
 ══════════════════════════════════════════════════════════════════ */
 
+/* ══════════════════════════════════════════════════════════════════
+   AVAILABILITY SLOTS
+   A day can have up to MAX_SLOTS separate windows, e.g. 09:00–13:00 and 17:00–22:00.
+   Stored on each availability record as `slots: [{start,end}]`.
+   `start`/`end` are also written with the FIRST slot, so an old cached build only ever
+   sees a smaller window (never the gap between slots as free).
+   Old records that only have start/end read as one slot — no migration needed.
+   Every check in the app goes through availSlots().
+══════════════════════════════════════════════════════════════════ */
+const MAX_SLOTS = 2;
+const SHIFT_PRESETS = { morning: { start: '09:00', end: '13:00', label: 'Morning (9–1)' }, evening: { start: '17:00', end: '22:00', label: 'Evening (5–10)' } };
+const slotMin = t => { if (!t) return 0; const [h, m] = String(t).split(':'); return (parseInt(h, 10) || 0) * 60 + (parseInt(m, 10) || 0); };
+const sortSlotList = list => [...list].sort((a, b) => slotMin(a.start) - slotMin(b.start));
+const presetSlot = k => ({ start: SHIFT_PRESETS[k].start, end: SHIFT_PRESETS[k].end });
+const slotsText = slots => slots.map(s => `${s.start}–${s.end}`).join(', ');
+
+/* Complete slots for a record, sorted. `fallback` ({start,end}) is used when the day is ticked but has no times. */
+function availSlots(a, fallback) {
+  if (!a || !a.checked) return [];
+  if (!a.fullDay && Array.isArray(a.slots) && a.slots.length) {
+    const s = a.slots.filter(x => x && x.start && x.end);
+    if (s.length) return sortSlotList(s);
+  }
+  if (a.start && a.end) return [{ start: a.start, end: a.end }];
+  return fallback ? [fallback] : [];
+}
+/* Slots as stored, including half-filled ones — for editors only. */
+function rawSlots(a) {
+  if (Array.isArray(a?.slots) && a.slots.length) return a.slots.map(x => ({ start: x?.start || '', end: x?.end || '' }));
+  if (a?.start || a?.end) return [{ start: a.start || '', end: a.end || '' }];
+  return [];
+}
+/* '' when valid, otherwise a short reason. */
+function slotsError(slots) {
+  if (!slots.length) return 'Add a time slot';
+  for (const x of slots) {
+    if (!x.start || !x.end) return 'Pick a start and end time';
+    if (slotMin(x.end) <= slotMin(x.start)) return `${x.start}–${x.end}: end must be after start`;
+  }
+  const s = sortSlotList(slots);
+  for (let i = 1; i < s.length; i++)
+    if (slotMin(s[i].start) < slotMin(s[i - 1].end)) return `${slotsText([s[i - 1]])} and ${slotsText([s[i]])} overlap`;
+  return '';
+}
+/* Fields to write on an availability record. */
+function slotFields(slots) {
+  const done = slots.every(x => x.start && x.end);
+  const list = done ? sortSlotList(slots) : slots;
+  const first = list.find(x => x.start && x.end) || list[0] || { start: '', end: '' };
+  return { slots: list, start: first.start, end: first.end };
+}
+/* Suggested second slot: Evening if the first one ends before it, otherwise blank. */
+function nextSlot(slots) {
+  const ends = slots.map(x => x.end).filter(Boolean);
+  const lastEnd = ends.length ? Math.max(...ends.map(slotMin)) : null;
+  if (lastEnd !== null && lastEnd <= slotMin(SHIFT_PRESETS.evening.start)) return presetSlot('evening');
+  return { start: '', end: '' };
+}
+
+/* Edit a day's slots: start–end rows, ✕ to remove, "+ Add slot" up to MAX_SLOTS. */
+function SlotEditor({ slots, onChange }) {
+  const list = slots.length ? slots : [{ start: '', end: '' }];
+  const upd = (i, k, v) => onChange(list.map((x, j) => j === i ? { ...x, [k]: v } : x));
+  const err = list.every(x => x.start && x.end) ? slotsError(list) : '';
+  return (
+    <div className="slot-ed">
+      {list.map((x, i) => (
+        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap', marginBottom: 4 }}>
+          <TimePicker value={x.start} onChange={v => upd(i, 'start', v)} />
+          <span className="muted-sm">to</span>
+          <TimePicker value={x.end} onChange={v => upd(i, 'end', v)} />
+          {list.length > 1 && <button type="button" className="btn ghost xs" title="Remove this slot" aria-label="Remove slot"
+            onClick={() => onChange(list.filter((_, j) => j !== i))}>✕</button>}
+        </div>
+      ))}
+      {list.length < MAX_SLOTS && <button type="button" className="linkbtn" style={{ fontSize: 12 }}
+        onClick={() => onChange([...list, nextSlot(list)])}>+ Add slot</button>}
+      {err && <div style={{ fontSize: 11, color: 'var(--rose)', marginTop: 2 }}>{err}</div>}
+    </div>
+  );
+}
+
+/* Time choice used by the Add / edit availability form: a preset, or custom slots. */
+const SHIFT_CHOICES = fd => [
+  ['full', `Full day (${fd.start || '09:00'}–${fd.end || '22:00'})`],
+  ['morning', SHIFT_PRESETS.morning.label],
+  ['evening', SHIFT_PRESETS.evening.label],
+  ['both', 'Morning + Evening'],
+  ['custom', 'Custom'],
+];
+function choiceSlots(ch, fd) {
+  if (ch.shift === 'full') return [{ start: fd.start || '09:00', end: fd.end || '22:00' }];
+  if (ch.shift === 'morning') return [presetSlot('morning')];
+  if (ch.shift === 'evening') return [presetSlot('evening')];
+  if (ch.shift === 'both') return [presetSlot('morning'), presetSlot('evening')];
+  return ch.slots || [];
+}
+function choiceFromRecord(a) {
+  if (!a || !a.checked) return null;
+  if (a.fullDay) return { shift: 'full', slots: [] };
+  const s = availSlots(a);
+  const eq = (x, k) => x.start === SHIFT_PRESETS[k].start && x.end === SHIFT_PRESETS[k].end;
+  if (s.length === 1 && eq(s[0], 'morning')) return { shift: 'morning', slots: s };
+  if (s.length === 1 && eq(s[0], 'evening')) return { shift: 'evening', slots: s };
+  if (s.length === 2 && eq(s[0], 'morning') && eq(s[1], 'evening')) return { shift: 'both', slots: s };
+  return { shift: 'custom', slots: s.length ? s : [{ start: '09:00', end: '18:00' }] };
+}
+const sameChoice = (a, b, fd) => !!a && !!b && a.shift === b.shift && slotsText(choiceSlots(a, fd)) === slotsText(choiceSlots(b, fd));
+
+function TimeChoice({ value, onChange, fd }) {
+  const pick = k => {
+    if (k === value.shift) return;
+    // Switching to Custom starts from the times currently shown
+    onChange({ shift: k, slots: k === 'custom' ? choiceSlots(value, fd).map(x => ({ ...x })) : value.slots });
+  };
+  return (<>
+    <div className="av-chips">
+      {SHIFT_CHOICES(fd).map(([k, l]) => (
+        <button type="button" key={k} className={'av-chip' + (value.shift === k ? ' on' : '')} onClick={() => pick(k)}>{l}</button>
+      ))}
+    </div>
+    {value.shift === 'custom' && (
+      <div style={{ marginTop: 6 }}><SlotEditor slots={value.slots || []} onChange={slots => onChange({ ...value, slots })} /></div>
+    )}
+  </>);
+}
+
 export function Volunteers({ store, activeEventId }) {
   const toast  = useToast();
   const vols   = (store.volunteers || []).sort((a,b)=>(a.name||'').localeCompare(b.name||''));
@@ -3926,10 +4053,19 @@ export function Volunteers({ store, activeEventId }) {
   async function setFullDay(volId, day, checked) {
     const ex = getAvail(volId, day);
     const update = { ...ex, fullDay: checked };
-    if (checked) { update.start = fdConfig.start||'09:00'; update.end = fdConfig.end||'22:00'; }
+    if (checked) Object.assign(update, slotFields([{ start: fdConfig.start||'09:00', end: fdConfig.end||'22:00' }]));
     await saveItem('availability',{
       id: ex.id||`${volId}_${day}_${activeEventId}`,
       volId, day, eventId: activeEventId, ...update,
+    });
+  }
+
+  /* Replace a day's time slots (detail popup + grid). Saves as typed, like the other inline edits. */
+  async function setDaySlots(volId, day, slots) {
+    const ex = getAvail(volId, day);
+    await saveItem('availability',{
+      id: ex.id||`${volId}_${day}_${activeEventId}`,
+      volId, day, eventId: activeEventId, ...ex, fullDay: false, ...slotFields(slots),
     });
   }
 
@@ -3998,7 +4134,8 @@ export function Volunteers({ store, activeEventId }) {
     const a = getAvail(volId, day);
     if (!a.checked) return { state: 'off' };
     if (a.fullDay) return { state: 'full' };
-    return { state: 'time', text: a.start && a.end ? `${a.start}–${a.end}` : 'Available' };
+    const s = availSlots(a);
+    return { state: 'time', text: s.length ? slotsText(s) : 'Available' };
   };
   /* ── Merged directory features: profile add/edit/delete, import, detail panel ── */
   const { profile: myProfile } = useAuth();
@@ -4017,6 +4154,7 @@ export function Volunteers({ store, activeEventId }) {
       ['Name','Contact','City','Area','Skills','Pre Event','Event Days','Time Slot','Departments'],
       ['Raj Doshi','9876543210','Mumbai','Mulund','POC, Hospitality','Yes','16,17,18','Full Day','POC Team'],
       ['Priya Shah','9876543211','Thane','Ghodbunder','Logistics','No','17-19','10:00-14:00','Logistics'],
+      ['Amit Mehta','9876543212','Mumbai','Borivali','POC','No','16,17','09:00-13:00, 17:00-22:00','POC Team'],
     ]);
     ws['!cols'] = [{wch:18},{wch:14},{wch:12},{wch:14},{wch:18},{wch:10},{wch:12},{wch:12},{wch:18}];
     XLSX.utils.book_append_sheet(wb, ws, 'Volunteers');
@@ -4047,13 +4185,22 @@ export function Volunteers({ store, activeEventId }) {
          .replace(/\d{1,2}/g, m => { nums.add(+m); return ''; });
         return eventDays.filter(d => nums.has(dayNum(d)));
       };
+      /* Time Slot cell → slots. "9-13, 17-22", "morning & evening", "Full Day" … */
       const parseSlot = txt => {
+        const full = { fullDay:true, ...slotFields([{ start: fdConfig.start || '09:00', end: fdConfig.end || '22:00' }]) };
         const t = txt.toLowerCase();
-        const m = t.match(/(\d{1,2})[:.]?(\d{2})?\s*(?:-|–|to)\s*(\d{1,2})[:.]?(\d{2})?/);
-        if (m) return { fullDay:false, start:`${m[1].padStart(2,'0')}:${m[2]||'00'}`, end:`${m[3].padStart(2,'0')}:${m[4]||'00'}` };
-        if (t.includes('morning')) return { fullDay:false, ...SHIFT_PRESETS.morning };
-        if (t.includes('evening')) return { fullDay:false, ...SHIFT_PRESETS.evening };
-        return { fullDay:true, start: fdConfig.start || '09:00', end: fdConfig.end || '22:00' };
+        if (!t.trim() || /full/.test(t)) return full;
+        const hhmm = (h, m) => `${String(h).padStart(2,'0')}:${m||'00'}`;
+        const slots = [];
+        t.replace(/(\d{1,2})[:.]?(\d{2})?\s*(?:-|–|to)\s*(\d{1,2})[:.]?(\d{2})?/g, (_, h1, m1, h2, m2) => {
+          slots.push({ start: hhmm(h1, m1), end: hhmm(h2, m2) }); return '';
+        });
+        if (!slots.length) {
+          if (t.includes('morning')) slots.push(presetSlot('morning'));
+          if (t.includes('evening')) slots.push(presetSlot('evening'));
+        }
+        if (!slots.length) return full;
+        return { fullDay:false, ...slotFields(slots.slice(0, MAX_SLOTS)) };
       };
       let added = 0, updated = 0, skipped = 0, availRows = [];
       const known = [...vols];
@@ -4302,16 +4449,12 @@ export function Volunteers({ store, activeEventId }) {
                                 style={{accentColor:'var(--teal)'}}/>
                               <span style={{fontSize:11}}>Full Day</span>
                             </label>
-                            {/* Time range */}
-                            <div style={{display:'flex',alignItems:'center',gap:3,marginBottom:4}}>
-                              <TimePicker value={a.start||''} onChange={val=>setDayAvail(v.id,day,'start',val)}/>
-                              <span style={{fontSize:10,color:'var(--muted)'}}>–</span>
-                              <TimePicker value={a.end||''} onChange={val=>setDayAvail(v.id,day,'end',val)}/>
-                            </div>
-                            {/* Show availability window */}
-                            {a.start&&a.end&&(
+                            {/* Time slots (up to MAX_SLOTS) */}
+                            {!a.fullDay&&<SlotEditor slots={rawSlots(a)} onChange={sl=>setDaySlots(v.id,day,sl)}/>}
+                            {/* Show availability window(s) */}
+                            {availSlots(a).length>0&&(
                               <div style={{fontSize:10.5,color:'var(--teal)',fontWeight:500,marginBottom:3}}>
-                                {a.start}–{a.end}
+                                {slotsText(availSlots(a))}
                               </div>
                             )}
                           </>)}
@@ -4348,7 +4491,7 @@ export function Volunteers({ store, activeEventId }) {
       {detailId && vols.find(v => v.id === detailId) && (
         <VolunteerDetail vol={vols.find(v => v.id === detailId)} depts={depts} eventDays={eventDays} noDays={noDays}
           getAvail={getAvail} getPreEvent={getPreEvent} getDeptIds={getDeptIds} getAssignments={getAssignments}
-          setDayAvail={setDayAvail} setFullDay={setFullDay} setPreEvent={setPreEvent} setDeptIds={setDeptIds}
+          setDayAvail={setDayAvail} setFullDay={setFullDay} setDaySlots={setDaySlots} setPreEvent={setPreEvent} setDeptIds={setDeptIds}
           canEditAvail={canEdit} canEditVol={canEditVol} canDelVol={canDelVol} eventName={eventName}
           onEditProfile={v => setVolModal({ type: 'edit', vol: v })} onDelete={v => setDelVol(v)}
           onClose={() => setDetailId(null)} />
@@ -4367,7 +4510,7 @@ export const VolunteerAvailability = Volunteers;
 
 /* ── Volunteer detail: profile (all events) + this event's availability, editable per day ── */
 function VolunteerDetail({ vol, depts, eventDays, noDays, getAvail, getPreEvent, getDeptIds, getAssignments,
-  setDayAvail, setFullDay, setPreEvent, setDeptIds, canEditAvail, canEditVol, canDelVol, eventName, onEditProfile, onDelete, onClose }) {
+  setDayAvail, setFullDay, setDaySlots, setPreEvent, setDeptIds, canEditAvail, canEditVol, canDelVol, eventName, onEditProfile, onDelete, onClose }) {
   const pre = getPreEvent(vol.id);
   const deptIds = getDeptIds(vol.id);
   return (
@@ -4405,11 +4548,7 @@ function VolunteerDetail({ vol, depts, eventDays, noDays, getAvail, getPreEvent,
                   {a.checked ? (
                     <div className="vd-times">
                       <label className="vd-full"><input type="checkbox" checked={!!a.fullDay} onChange={e => setFullDay(vol.id, day, e.target.checked)} />Full day</label>
-                      {!a.fullDay && <>
-                        <TimePicker value={a.start || ''} onChange={v => setDayAvail(vol.id, day, 'start', v)} />
-                        <span className="muted-sm">to</span>
-                        <TimePicker value={a.end || ''} onChange={v => setDayAvail(vol.id, day, 'end', v)} />
-                      </>}
+                      {!a.fullDay && <SlotEditor slots={rawSlots(a)} onChange={sl => setDaySlots(vol.id, day, sl)} />}
                       {a.fullDay && <span className="muted-sm">{a.start}–{a.end}</span>}
                     </div>
                   ) : <span className="muted-sm">Not available</span>}
@@ -4437,7 +4576,6 @@ function VolunteerDetail({ vol, depts, eventDays, noDays, getAvail, getPreEvent,
 }
 
 /* ── Add / edit availability: pick volunteers by city → area, then days, time and departments ── */
-const SHIFT_PRESETS = { morning: { start: '09:00', end: '13:00', label: 'Morning (9–1)' }, evening: { start: '17:00', end: '22:00', label: 'Evening (5–10)' } };
 function AvailabilityForm({ vols, depts, eventDays, activeEventId, fdConfig, editVol, getAvail, getPreEvent, getDeptIds, onClose, toast }) {
   const single = !!editVol;
   const norm = s => (s || '').trim().toLowerCase();
@@ -4449,12 +4587,25 @@ function AvailabilityForm({ vols, depts, eventDays, activeEventId, fdConfig, edi
   const [days, setDays] = useState(() => new Set(single ? eventDays.filter(d => getAvail(editVol.id, d).checked) : []));
   const [pre, setPre] = useState(() => single ? !!getPreEvent(editVol.id).checked : false);
   const [preRemark, setPreRemark] = useState(() => single ? (getPreEvent(editVol.id).remark || '') : '');
-  const first = single ? eventDays.map(d => getAvail(editVol.id, d)).find(a => a.checked) : null;
-  const [shift, setShift] = useState(() => !first ? 'full' : first.fullDay ? 'full'
-    : (first.start === SHIFT_PRESETS.morning.start && first.end === SHIFT_PRESETS.morning.end) ? 'morning'
-    : (first.start === SHIFT_PRESETS.evening.start && first.end === SHIFT_PRESETS.evening.end) ? 'evening' : 'custom');
-  const [start, setStart] = useState(first?.start || '09:00');
-  const [end, setEnd] = useState(first?.end || '18:00');
+  /* Time per day. `common` is used while "Same time for all days" is on; `perDay[day]` otherwise.
+     Editing one volunteer loads each day's own saved slots. */
+  const [init] = useState(() => {
+    const perDay = {};
+    if (single) eventDays.forEach(d => { const c = choiceFromRecord(getAvail(editVol.id, d)); if (c) perDay[d] = c; });
+    const vals = Object.values(perDay);
+    return { perDay, common: vals[0] || { shift: 'full', slots: [] }, same: vals.every(c => sameChoice(c, vals[0], fdConfig)) };
+  });
+  const [common, setCommon] = useState(init.common);
+  const [perDay, setPerDay] = useState(init.perDay);
+  const [sameAll, setSameAll] = useState(init.same);
+  const choiceFor = d => (sameAll ? common : (perDay[d] || common));
+  const tickedDays = eventDays.filter(d => days.has(d));
+  function toggleSame(on) {
+    // Turning it off starts every day from the shared time, so only the days that differ need changing
+    if (!on) setPerDay(Object.fromEntries(eventDays.map(d => [d, common])));
+    else if (tickedDays.length) setCommon(choiceFor(tickedDays[0]));
+    setSameAll(on);
+  }
   const [deptIds, setDeptIds] = useState(() => new Set(single ? getDeptIds(editVol.id) : []));
   const [deptMode, setDeptMode] = useState(single ? 'replace' : 'add');
   const [err, setErr] = useState('');
@@ -4469,9 +4620,13 @@ function AvailabilityForm({ vols, depts, eventDays, activeEventId, fdConfig, edi
   async function save() {
     setErr('');
     if (!picked.size) { setErr('Choose at least one volunteer.'); return; }
-    if (mode === 'available' && shift === 'custom' && (!start || !end || end <= start)) { setErr('End time must be after start time.'); return; }
-    const times = shift === 'full' ? { start: fdConfig.start || '09:00', end: fdConfig.end || '22:00' }
-                : shift === 'custom' ? { start, end } : { start: SHIFT_PRESETS[shift].start, end: SHIFT_PRESETS[shift].end };
+    if (single || mode === 'available') {
+      const checkDays = sameAll ? (tickedDays.length ? [tickedDays[0]] : []) : tickedDays;
+      for (const d of checkDays) {
+        const e = slotsError(choiceSlots(choiceFor(d), fdConfig));
+        if (e) { setErr(sameAll ? e : `${shortDate(d)}: ${e}`); return; }
+      }
+    }
     const rows = [];
     for (const volId of picked) {
       // In single-volunteer edit, the day chips are the full picture: unticked days become unavailable
@@ -4480,8 +4635,9 @@ function AvailabilityForm({ vols, depts, eventDays, activeEventId, fdConfig, edi
         const on = single ? days.has(day) : mode === 'available';
         const ex = getAvail(volId, day);
         if (single && !on && !ex.checked) continue;
+        const ch = choiceFor(day);
         rows.push({ ...ex, id: ex.id || `${volId}_${day}_${activeEventId}`, volId, day, eventId: activeEventId,
-          checked: on, fullDay: on && shift === 'full', ...(on ? times : {}) });
+          checked: on, fullDay: on && ch.shift === 'full', ...(on ? slotFields(choiceSlots(ch, fdConfig)) : {}) });
       }
       if (single || pre) {
         const ex = getPreEvent(volId);
@@ -4567,15 +4723,21 @@ function AvailabilityForm({ vols, depts, eventDays, activeEventId, fdConfig, edi
 
       {(mode === 'available' || single) && <>
         <div className="av-step">{single ? 'Time' : '3. Time'}</div>
-        <div className="av-chips">
-          {[['full', `Full day (${fdConfig.start || '09:00'}–${fdConfig.end || '22:00'})`], ['morning', SHIFT_PRESETS.morning.label], ['evening', SHIFT_PRESETS.evening.label], ['custom', 'Custom']].map(([k, l]) => (
-            <button type="button" key={k} className={'av-chip' + (shift === k ? ' on' : '')} onClick={() => setShift(k)}>{l}</button>
-          ))}
-        </div>
-        {shift === 'custom' && (
-          <div className="av-custom"><TimePicker value={start} onChange={setStart} /><span>to</span><TimePicker value={end} onChange={setEnd} /></div>
+        <label className="chk" style={{ marginBottom: 8 }}>
+          <input type="checkbox" checked={sameAll} onChange={e => toggleSame(e.target.checked)} />Same time for all days
+        </label>
+        {sameAll ? <TimeChoice value={common} onChange={setCommon} fd={fdConfig} /> : (
+          <div>
+            {tickedDays.map(d => (
+              <div key={d} style={{ padding: '8px 0', borderTop: '1px solid var(--line)' }}>
+                <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 4 }}>{shortDate(d)}</div>
+                <TimeChoice value={choiceFor(d)} onChange={c => setPerDay(p => ({ ...p, [d]: c }))} fd={fdConfig} />
+              </div>
+            ))}
+            {!tickedDays.length && <div className="muted-sm">Tick the days above to set a time for each.</div>}
+          </div>
         )}
-        {single && <p className="muted-sm" style={{ margin: '4px 0 0' }}>This time applies to every ticked day. For different times on different days, use the Grid view on desktop.</p>}
+        <p className="muted-sm" style={{ margin: '6px 0 0' }}>Two separate times on one day? Pick Morning + Evening, or Custom → “+ Add slot”.</p>
       </>}
 
       <div className="av-step">{single ? 'Departments' : '4. Departments (optional)'}</div>
@@ -4649,11 +4811,16 @@ export function POCAllocation({ store, activeEventId }) {
   const toMins = t => { if(!t) return 0; const [h,m]=(t||'00:00').split(':'); return parseInt(h)*60+parseInt(m||0); };
   const fromMins = m => `${String(Math.floor(m/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')}`;
 
+  /* A volunteer's slots for a day, plus start/end of the whole span (used only to scale the timeline bar).
+     A day can have two separate slots — the gap between them is NOT available. */
   const getVolAvail = (volId, day) => {
     const a = avail.find(x=>x.volId===volId&&x.day===day&&x.eventId===activeEventId);
-    if (!a?.checked) return null;
-    return { start: a.start||'09:00', end: a.end||'22:00' };
+    const slots = availSlots(a, { start:'09:00', end:'22:00' });
+    if (!slots.length) return null;
+    return { slots, start: slots[0].start, end: slots[slots.length-1].end };
   };
+  // True if from–to (minutes) sits entirely inside ONE of the volunteer's slots
+  const withinSlots = (va, from, to) => va.slots.some(x => toMins(x.start) <= from && toMins(x.end) >= to);
 
   const getVolAssignments = (volId, day) =>
     poc.filter(p=>p.volunteerId===volId&&p.day===day&&p.eventId===activeEventId&&p.fromTime&&p.toTime)
@@ -4662,12 +4829,14 @@ export function POCAllocation({ store, activeEventId }) {
   const getFreeSlots = (volId, day) => {
     const va = getVolAvail(volId, day);
     if (!va) return [];
-    const start = toMins(va.start), end = toMins(va.end);
     const assigned = getVolAssignments(volId, day).sort((a,b)=>a.from-b.from);
     const free = [];
-    let cur = start;
-    assigned.forEach(a=>{ if(a.from>cur) free.push({from:cur,to:a.from}); cur=Math.max(cur,a.to); });
-    if (cur<end) free.push({from:cur,to:end});
+    va.slots.forEach(sl => {
+      const start = toMins(sl.start), end = toMins(sl.end);
+      let cur = start;
+      assigned.forEach(a=>{ if (a.to<=start || a.from>=end) return; if(a.from>cur) free.push({from:cur,to:a.from}); cur=Math.max(cur,a.to); });
+      if (cur<end) free.push({from:cur,to:end});
+    });
     return free;
   };
 
@@ -4784,7 +4953,7 @@ export function POCAllocation({ store, activeEventId }) {
     if (vol) {
       const va = getVolAvail(vol.id, p.day);
       if (!va) addIssue(p.day, p.contactId, 'bad', `${vol.name} is not available on this day`);
-      else if (p.fromTime && (toMins(p.fromTime) < toMins(va.start) || toMins(p.toTime) > toMins(va.end))) addIssue(p.day, p.contactId, 'warn', `Outside ${vol.name}'s hours (${va.start}–${va.end})`);
+      else if (p.fromTime && p.toTime && !withinSlots(va, toMins(p.fromTime), toMins(p.toTime))) addIssue(p.day, p.contactId, 'warn', `Outside ${vol.name}'s hours (${slotsText(va.slots)})`);
     }
     const L = logiAll.find(l=>l.contactId===p.contactId) || {};
     if ((L.arrivalDate && p.day < L.arrivalDate) || (L.departureDate && p.day > L.departureDate))
@@ -4818,7 +4987,7 @@ export function POCAllocation({ store, activeEventId }) {
     eventPoc.forEach(p => { (chosen[p.contactId] = chosen[p.contactId] || new Set()).add(p.volunteerId); });
     const candidates = r => pocVols.filter(v => {
       const va = getVolAvail(v.id, r.date); if (!va) return false;
-      if (toMins(va.start) > toMins(r.fromTime) || toMins(va.end) < toMins(r.toTime)) return false;
+      if (!withinSlots(va, toMins(r.fromTime), toMins(r.toTime))) return false;
       const k = v.id+'|'+r.date;
       if ((busy[k]||[]).some(w => overlaps(w, r))) return false;
       return (count[k]||0) < maxPerDay;
@@ -5060,12 +5229,18 @@ export function POCAllocation({ store, activeEventId }) {
                                             </div>
                                             <div style={{flex:1,minWidth:0}}>
                                               <div style={{fontSize:12,fontWeight:500,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{v.name}</div>
-                                              <div style={{fontSize:10,color:'var(--muted)'}}>{va.start}–{va.end}</div>
+                                              <div style={{fontSize:10,color:'var(--muted)'}}>{slotsText(va.slots)}</div>
                                             </div>
                                             {isCurrentlyAssigned&&<span style={{fontSize:10,color:'var(--teal)',fontWeight:700}}>✓</span>}
                                           </div>
                                           {/* Mini timeline bar */}
                                           <div style={{position:'relative',height:5,background:'#E8E8E8',borderRadius:3,overflow:'hidden',marginBottom:3}}>
+                                            {/* Gaps between slots = not available (shown as a hole in the bar) */}
+                                            {va.slots.slice(1).map((sl,i)=>{
+                                              const gs=toMins(va.slots[i].end), ge=toMins(sl.start);
+                                              if (ge<=gs) return null;
+                                              return <div key={'gap'+i} title="Not available" style={{position:'absolute',left:`${((gs-toMins(va.start))/totalMins)*100}%`,width:`${((ge-gs)/totalMins)*100}%`,height:'100%',background:'#fff'}}/>;
+                                            })}
                                             {getVolAssignments(v.id,day).map((a,i)=>{
                                               const left=((a.from-toMins(va.start))/totalMins)*100;
                                               const width=((a.to-a.from)/totalMins)*100;
