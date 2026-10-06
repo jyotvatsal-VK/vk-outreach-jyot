@@ -928,7 +928,7 @@ export function CarVendorMaster({ store }) {
                   </td>
                   <td style={{ padding: '8px 12px', textAlign: 'right' }}>
                     <div className="rowacts">
-                      <button className="btn ghost xs" onClick={() => setModal({ type: 'edit', item: v })}>{ICON.edit}</button>
+                      <button className="btn ghost xs" onClick={() => setModal({ type: 'edit', id: v.id })}>{ICON.edit}</button>
                       <button className="btn ghost xs" onClick={() => setModal({ type: 'del', id: v.id })}>{ICON.trash}</button>
                     </div>
                   </td>
@@ -1528,7 +1528,7 @@ function OverallDayTable({ daySessions, store, setModal }) {
             <td style={{ padding:'8px 12px', textAlign:'right' }}>
               <div className="rowacts">
                 {can('schedule.minutemin') && <button className="btn ghost xs" onClick={()=>setModal({type:'minsched',id:s.id})} title="Minute-to-minute">📋</button>}
-                {can('schedule.edit') && <button className="btn ghost xs" onClick={()=>setModal({type:'edit',item:s})}>{ICON.edit}</button>}
+                {can('schedule.edit') && <button className="btn ghost xs" onClick={()=>setModal({type:'edit',id:s.id})}>{ICON.edit}</button>}
                 {can('schedule.edit') && <button className="btn ghost xs" onClick={()=>setModal({type:'del',id:s.id})}>{ICON.trash}</button>}
               </div>
             </td>
@@ -1590,7 +1590,7 @@ export function OverallSchedule({ store, activeEventId }) {
 
       {/* ── Overlay / Grid view ──────────────────────────────── */}
       {viewMode === 'overlay' && Object.keys(byDate).length > 0 && (
-        <OverlaySchedule byDate={byDate} onEdit={s=>can('schedule.edit')&&setModal({type:'edit',item:s})}
+        <OverlaySchedule byDate={byDate} onEdit={s=>can('schedule.edit')&&setModal({type:'edit',id:s.id})}
           onDelete={s=>can('schedule.edit')&&setModal({type:'del',id:s.id})} onMinSched={s=>can('schedule.minutemin')&&setModal({type:'minsched',id:s.id})}/>
       )}
 
