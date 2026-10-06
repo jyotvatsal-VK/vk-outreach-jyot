@@ -5267,15 +5267,15 @@ export function POCAllocation({ store, activeEventId }) {
             <button className="btn sm" disabled={fixBusy} onClick={()=>setFixPreview({ title:'Fix all issues', rows: planFixes(issues) })}>⚡ Fix everything</button>
           )}
         </div>
+        {lastFix && (
+          <div className="poc-undo">
+            <span style={{flex:1}}>✓ {lastFix.text}</span>
+            <button className="btn sm" disabled={fixBusy} onClick={async()=>{ setFixBusy(true); await undoFix(lastFix.snap); setLastFix(null); setFixBusy(false); toast('Undone — previous POC assignments restored.'); }}>↶ Undo</button>
+            <button className="btn ghost xs" onClick={()=>setLastFix(null)} aria-label="Dismiss">✕</button>
+          </div>
+        )}
         {showIssues && (
           <div className="poc-issues-body">
-            {lastFix && (
-              <div className="poc-undo">
-                <span style={{flex:1}}>✓ {lastFix.text}</span>
-                <button className="btn xs" disabled={fixBusy} onClick={async()=>{ setFixBusy(true); await undoFix(lastFix.snap); setLastFix(null); setFixBusy(false); toast('Undone.'); }}>Undo</button>
-                <button className="btn ghost xs" onClick={()=>setLastFix(null)} aria-label="Dismiss">✕</button>
-              </div>
-            )}
             {POC_ISSUE_TYPES.map(([type, label, hint]) => {
               const list = issues.filter(i=>i.type===type).sort((a,b)=> a.day!==b.day ? (a.day>b.day?1:-1) : cName(a.contactId).localeCompare(cName(b.contactId)));
               if (!list.length) return null;
@@ -5617,7 +5617,7 @@ export function POCAllocation({ store, activeEventId }) {
         onApply={applyPlan} onClose={()=>setAutoOpen(false)} />}
       {fixPreview && <PocFixPreviewModal title={fixPreview.title} rows={fixPreview.rows} vols={vols} cName={cName} describe={describeFix}
         onClose={()=>setFixPreview(null)}
-        onApply={async rows=>{ const { n } = await applyFixRows(rows); setLastFix(null); toast(n ? `Fixed ${n} item${n>1?'s':''}.` : 'Nothing changed.'); setFixPreview(null); }} />}
+        onApply={async rows=>{ const { n, snap } = await applyFixRows(rows); setLastFix(n ? { text:`Fixed ${n} item${n>1?'s':''}`, snap } : null); setShowIssues(true); toast(n ? `Fixed ${n} item${n>1?'s':''}.` : 'Nothing changed.'); setFixPreview(null); }} />}
     </>
   );
 }
