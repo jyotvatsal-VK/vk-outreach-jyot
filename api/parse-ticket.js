@@ -111,7 +111,9 @@ export default async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
   if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST' });
 
-  const key = process.env.GEMINI_API_KEY;
+  // Accept the usual spellings of the variable name (Vercel names are case-sensitive)
+  const keyName = Object.keys(process.env).find(k => /^gemini(_api)?_key$/i.test(k));   // Gemini_key, GEMINI_API_KEY, gemini_key …
+  const key = keyName ? process.env[keyName] : '';
   if (!key) return res.status(503).json({ error: 'Ticket reading isn’t switched on yet — add GEMINI_API_KEY in Vercel and redeploy.' });
   if (!(await signedIn(req))) return res.status(401).json({ error: 'Please sign in again, then retry.' });
 
