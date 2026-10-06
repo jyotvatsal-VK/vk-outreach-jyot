@@ -1927,7 +1927,7 @@ async function autoAssignSlots(contacts, slots, existingMeetings, activeEventId,
   contacts.forEach(c => {
     const mine = existingMeetings.filter(m => m.contactId === c.id);
     if (!mine.length) todo.push({ contact: c, meeting: null });
-    else mine.filter(m => !isScheduled(m) && m.durationReq !== 'not_required').forEach(m => todo.push({ contact: c, meeting: m }));
+    else mine.filter(m => !isScheduled(m) && !m.frozen && m.durationReq !== 'not_required').forEach(m => todo.push({ contact: c, meeting: m }));
   });
   if (!todo.length) { toast('Everyone already has a meeting scheduled.'); return; }
 
@@ -1971,6 +1971,48 @@ export function SahebjiSchedule({ store, activeEventId }) {
   const [modal, setModal] = useState(null);
 
   const setViewSaved = v => { setView(v); try { localStorage.setItem('vk_meet_view', v); } catch {} };
+
+  /* Cards view: dates are collapsed; the ones you open are remembered on this device.
+     Today opens by itself unless you closed it ('!date' marker). */
+  const [openDates, setOpenDates] = useState(() => {
+    let saved = [];
+    try { const v = JSON.parse(localStorage.getItem('vk_meet_open') || '[]'); if (Array.isArray(v)) saved = v; } catch {}
+    const set = new Set(saved);
+    const t = todayISO();
+    if (!set.has('!' + t)) set.add(t);
+    return set;
+  });
+  const toggleDate = d => setOpenDates(prev => {
+    const n = new Set(prev);
+    if (n.has(d)) { n.delete(d); if (d === todayISO()) n.add('!' + d); }
+    else { n.add(d); n.delete('!' + d); }
+    try { localStorage.setItem('vk_meet_open', JSON.stringify([...n])); } catch {}
+    return n;
+  });
+
+  /* Table view: filters + print */
+  const [tq, setTq] = useState('');
+  const [tDate, setTDate] = useState('');
+  const [tStatus, setTStatus] = useState('');
+  const [tFrozen, setTFrozen] = useState('');
+  const [tIssues, setTIssues] = useState(false);
+  const [printTable, setPrintTable] = useState(false);
+  useEffect(() => {
+    if (!printTable) return;
+    const t = setTimeout(() => { window.print(); setPrintTable(false); }, 80);
+    return () => clearTimeout(t);
+  }, [printTable]);
+
+  /* Freeze: a frozen meeting can't be edited, deleted, moved by auto-assign or by slot changes */
+  async function toggleFreeze(m) {
+    await saveItem('founder', { id: m.id, frozen: !m.frozen });
+    toast(m.frozen ? `${nameOf(m)} unfrozen.` : `🔒 ${nameOf(m)} frozen.`);
+  }
+  async function freezeDay(date, on) {
+    const list = meetings.filter(m => isScheduled(m) && m.date === date && !!m.frozen !== on);
+    for (const m of list) await saveItem('founder', { id: m.id, frozen: on });
+    toast(on ? `🔒 Froze ${list.length} meeting${list.length === 1 ? '' : 's'} on ${fmtDate(date)}.` : `Unfroze ${list.length} meeting${list.length === 1 ? '' : 's'} on ${fmtDate(date)}.`);
+  }
   useEffect(() => {
     if (!printDate) return;
     const t = setTimeout(() => { window.print(); setPrintDate(null); }, 80);
@@ -1999,20 +2041,26 @@ export function SahebjiSchedule({ store, activeEventId }) {
   const MeetingCard = ({ m }) => {
     const flags = flagsOf(m);
     const c = allContacts.find(x => x.id === m.contactId);
-    const cls = 'mtg-card' + (flags.some(f => f.bad) ? ' bad' : (flags.length || !isScheduled(m)) ? ' warn' : '');
+    const cls = 'mtg-card' + (flags.some(f => f.bad) ? ' bad' : (flags.length || !isScheduled(m)) ? ' warn' : '') + (m.frozen ? ' frozen' : '');
     return (
       <div className={cls} role="button" tabIndex={0}
         onClick={() => canEdit && setModal({ type: 'edit-meeting', id: m.id })}
         onKeyDown={e => { if (e.key === 'Enter' && canEdit) setModal({ type: 'edit-meeting', id: m.id }); }}>
         <div className="mtg-time">{isScheduled(m) ? <>{m.time}<span>{hhmm(mtgEnd(m))}</span></> : <span>—</span>}</div>
         <div className="mtg-body">
-          <div className="nm">{nameOf(m)}</div>
+          <div className="nm">{m.frozen && <span title="Frozen" style={{ marginRight: 4 }}>🔒</span>}{nameOf(m)}</div>
           {c && (c.desig || c.org) && <div className="role">{[c.desig, c.org].filter(Boolean).join(' · ')}</div>}
           <div className="mtg-meta">{m.durationReq === 'not_required' ? 'No meeting needed' : `${m.duration || 30} min`} · {m.venue || 'VIP Lounge'}</div>
           {flags.map((f, i) => <span key={i} className={'mtg-flag' + (f.bad ? ' bad' : '')}>⚠ {f.t}</span>)}
         </div>
-        {canEdit && <button className="btn ghost xs mtg-del" title="Delete meeting" aria-label="Delete meeting"
-          onClick={e => { e.stopPropagation(); setModal({ type: 'del-meeting', id: m.id }); }}>{ICON.trash}</button>}
+        {canEdit && (
+          <div className="mtg-acts no-print">
+            <button className={'btn xs ' + (m.frozen ? 'primary' : 'ghost')} title={m.frozen ? 'Unfreeze meeting' : 'Freeze meeting'} aria-label={m.frozen ? 'Unfreeze meeting' : 'Freeze meeting'}
+              onClick={e => { e.stopPropagation(); toggleFreeze(m); }}>{m.frozen ? '🔒' : '🔓'}</button>
+            {!m.frozen && <button className="btn ghost xs" title="Delete meeting" aria-label="Delete meeting"
+              onClick={e => { e.stopPropagation(); setModal({ type: 'del-meeting', id: m.id }); }}>{ICON.trash}</button>}
+          </div>
+        )}
       </div>
     );
   };
@@ -2125,56 +2173,115 @@ export function SahebjiSchedule({ store, activeEventId }) {
           {view === 'cards' && dates.map(date => {
             const daySlots = slots.filter(s => s.date === date);
             const outside = scheduledMeetings.filter(m => m.date === date && !slotOfMeeting(m, slots));
-            const count = scheduledMeetings.filter(m => m.date === date).length;
+            const dayMeetings = scheduledMeetings.filter(m => m.date === date);
+            const count = dayMeetings.length;
+            const frozenN = dayMeetings.filter(m => m.frozen).length;
+            const issueN = dayMeetings.filter(m => flagsOf(m).length).length;
+            const freeMin = daySlots.reduce((sum, sl) => {
+              const used = meetingsInSlot(sl, scheduledMeetings, slots).reduce((a, m) => a + (parseInt(m.duration) || 30), 0);
+              return sum + Math.max(0, toMin(sl.endTime) - toMin(sl.startTime) - used);
+            }, 0);
+            const open = openDates.has(date) || printDate === date;
+            const allFrozen = count > 0 && frozenN === count;
             return (
-              <section key={date} className={'mtg-day' + (printDate === date ? ' print-target' : '')}>
-                <div className="mtg-day-head">
+              <section key={date} className={'mtg-day' + (open ? ' open' : ' closed') + (printDate === date ? ' print-target' : '')}>
+                <div className="mtg-day-head mtg-day-toggle" role="button" tabIndex={0} aria-expanded={open}
+                  onClick={() => toggleDate(date)} onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleDate(date); } }}>
+                  <span className="mtg-caret no-print">{open ? '▾' : '▸'}</span>
                   <h3>{fmtDate(date)}</h3>
-                  <span className="muted-sm">{count} meeting{count === 1 ? '' : 's'}</span>
-                  <button className="btn ghost xs no-print" style={{ marginLeft: 'auto' }} onClick={() => setPrintDate(date)}>{ICON.print}Print day</button>
+                  <span className="muted-sm">{count} meeting{count === 1 ? '' : 's'}{daySlots.length ? ` · ${freeMin} min free` : ''}</span>
+                  {issueN > 0 && <span className="mtg-flag bad no-print">⚠ {issueN}</span>}
+                  {frozenN > 0 && <span className="mtg-flag no-print" title="Frozen meetings">🔒 {frozenN}</span>}
+                  <span style={{ marginLeft: 'auto' }} />
+                  {canEdit && count > 0 && (
+                    <button className="btn ghost xs no-print" onClick={e => { e.stopPropagation(); freezeDay(date, !allFrozen); }}>
+                      {allFrozen ? '🔓 Unfreeze day' : '🔒 Freeze day'}
+                    </button>
+                  )}
+                  <button className="btn ghost xs no-print" onClick={e => { e.stopPropagation(); setPrintDate(date); }}>{ICON.print}Print day</button>
                 </div>
-                {daySlots.map(renderSlotBlock)}
-                {outside.length > 0 && (
-                  <div className="mtg-slot mtg-slot-out">
-                    <div className="mtg-slot-head"><b>Outside Sahebji's slots</b><span>{outside.length}</span></div>
-                    <div className="mtg-list">{outside.map(m => <MeetingCard key={m.id} m={m} />)}</div>
-                  </div>
-                )}
+                {open && <>
+                  {daySlots.map(renderSlotBlock)}
+                  {outside.length > 0 && (
+                    <div className="mtg-slot mtg-slot-out">
+                      <div className="mtg-slot-head"><b>Outside Sahebji's slots</b><span>{outside.length}</span></div>
+                      <div className="mtg-list">{outside.map(m => <MeetingCard key={m.id} m={m} />)}</div>
+                    </div>
+                  )}
+                </>}
               </section>
             );
           })}
           {view === 'cards' && !dates.length && !unscheduled.length && !noMeeting.length &&
             <div className="panel"><Empty title="No meetings yet" sub="Add slots, then schedule or auto-assign meetings." /></div>}
 
-          {view === 'table' && (
-            <div className="panel">
-              <div className="panel-body">
-                <table>
-                  <thead><tr><th>Name</th><th>Duration</th><th>Date</th><th>Start</th><th>End</th><th>Venue</th><th></th></tr></thead>
-                  <tbody>
-                    {meetings.map(m => {
-                      const flags = flagsOf(m);
-                      return (
-                        <tr key={m.id} style={flags.length ? { background: '#FFF8F0' } : {}}>
-                          <td><div className="nm">{nameOf(m)}</div>{flags.map((f,i) => <div key={i} className={'mtg-flag' + (f.bad ? ' bad' : '')}>⚠ {f.t}</div>)}</td>
-                          <td>{m.durationReq === 'not_required' ? <span className="badge b-declined">Not required</span> : <span className="muted-sm">{m.duration || 30} min</span>}</td>
-                          <td className="muted-sm">{m.date ? fmtDate(m.date) : 'Not scheduled'}</td>
-                          <td className="muted-sm">{m.time || '—'}</td>
-                          <td className="muted-sm">{isScheduled(m) ? hhmm(mtgEnd(m)) : '—'}</td>
-                          <td className="muted-sm">{m.venue || 'VIP Lounge'}</td>
-                          <td><div className="rowacts">
-                            {canEdit && <button className="btn ghost xs" onClick={() => setModal({ type: 'edit-meeting', id: m.id })}>{ICON.edit}</button>}
-                            {canEdit && <button className="btn ghost xs" onClick={() => setModal({ type: 'del-meeting', id: m.id })}>{ICON.trash}</button>}
-                          </div></td>
-                        </tr>
-                      );
-                    })}
-                    {!meetings.length && <tr><td colSpan={7}><Empty title="No meetings yet" sub="Schedule or auto-assign meetings above." /></td></tr>}
-                  </tbody>
-                </table>
+          {view === 'table' && (() => {
+            const statusOf = m => m.durationReq === 'not_required' ? 'notreq' : isScheduled(m) ? 'scheduled' : 'unscheduled';
+            const STATUS_LABEL = { scheduled: 'Scheduled', unscheduled: 'Needs a time', notreq: 'Not required' };
+            const tDates = [...new Set(meetings.filter(m => m.date).map(m => m.date))].sort();
+            const q = tq.trim().toLowerCase();
+            const rows = meetings.filter(m =>
+              (!q || nameOf(m).toLowerCase().includes(q) || (m.venue || '').toLowerCase().includes(q)) &&
+              (!tDate || m.date === tDate) &&
+              (!tStatus || statusOf(m) === tStatus) &&
+              (!tFrozen || (tFrozen === 'frozen' ? !!m.frozen : !m.frozen)) &&
+              (!tIssues || flagsOf(m).length > 0));
+            const anyF = q || tDate || tStatus || tFrozen || tIssues;
+            const printTitle = ['Sahebji one-on-one meetings', tDate ? fmtDate(tDate) : 'All dates',
+              tStatus ? STATUS_LABEL[tStatus] : '', tFrozen === 'frozen' ? 'Frozen' : tFrozen === 'open' ? 'Not frozen' : '',
+              tIssues ? 'With issues' : '', q ? `"${tq.trim()}"` : ''].filter(Boolean).join(' · ');
+            return (
+              <div className={'panel' + (printTable ? ' print-target' : '')}>
+                <div className="mtg-filters no-print">
+                  <input className="input" placeholder="Search name or venue…" value={tq} onChange={e => setTq(e.target.value)} />
+                  <select className="statsel" value={tDate} onChange={e => setTDate(e.target.value)} aria-label="Date">
+                    <option value="">All dates</option>{tDates.map(d => <option key={d} value={d}>{fmtDate(d)}</option>)}
+                  </select>
+                  <select className="statsel" value={tStatus} onChange={e => setTStatus(e.target.value)} aria-label="Status">
+                    <option value="">Any status</option><option value="scheduled">Scheduled</option><option value="unscheduled">Needs a time</option><option value="notreq">Not required</option>
+                  </select>
+                  <select className="statsel" value={tFrozen} onChange={e => setTFrozen(e.target.value)} aria-label="Frozen">
+                    <option value="">Frozen + not frozen</option><option value="frozen">🔒 Frozen only</option><option value="open">Not frozen only</option>
+                  </select>
+                  <label className="chk" style={{ margin: 0 }}><input type="checkbox" checked={tIssues} onChange={e => setTIssues(e.target.checked)} />Issues only</label>
+                  {anyF && <button className="btn ghost xs" onClick={() => { setTq(''); setTDate(''); setTStatus(''); setTFrozen(''); setTIssues(false); }}>Clear</button>}
+                  <span style={{ flex: 1 }} />
+                  <span className="muted-sm">{rows.length} of {meetings.length}</span>
+                  <button className="btn sm" disabled={!rows.length} onClick={() => setPrintTable(true)}>{ICON.print}Print</button>
+                </div>
+                <div className="print-only mtg-print-title">{printTitle}<span>{rows.length} meeting{rows.length === 1 ? '' : 's'}</span></div>
+                <div className="panel-body">
+                  <table>
+                    <thead><tr><th>Name</th><th>Duration</th><th>Date</th><th>Start</th><th>End</th><th>Venue</th><th title="Frozen">🔒</th><th className="no-print"></th></tr></thead>
+                    <tbody>
+                      {rows.map(m => {
+                        const flags = flagsOf(m);
+                        return (
+                          <tr key={m.id} style={flags.length ? { background: '#FFF8F0' } : {}}>
+                            <td><div className="nm">{nameOf(m)}</div>{flags.map((f,i) => <div key={i} className={'mtg-flag' + (f.bad ? ' bad' : '')}>⚠ {f.t}</div>)}</td>
+                            <td>{m.durationReq === 'not_required' ? <span className="badge b-declined">Not required</span> : <span className="muted-sm">{m.duration || 30} min</span>}</td>
+                            <td className="muted-sm">{m.date ? fmtDate(m.date) : 'Not scheduled'}</td>
+                            <td className="muted-sm">{m.time || '—'}</td>
+                            <td className="muted-sm">{isScheduled(m) ? hhmm(mtgEnd(m)) : '—'}</td>
+                            <td className="muted-sm">{m.venue || 'VIP Lounge'}</td>
+                            <td>{m.frozen ? '🔒' : ''}</td>
+                            <td className="no-print"><div className="rowacts" style={{ opacity: 1 }}>
+                              {canEdit && <button className={'btn xs ' + (m.frozen ? 'primary' : 'ghost')} title={m.frozen ? 'Unfreeze' : 'Freeze'} onClick={() => toggleFreeze(m)}>{m.frozen ? '🔒' : '🔓'}</button>}
+                              {canEdit && !m.frozen && <button className="btn ghost xs" aria-label="Edit meeting" onClick={() => setModal({ type: 'edit-meeting', id: m.id })}>{ICON.edit}</button>}
+                              {canEdit && !m.frozen && <button className="btn ghost xs" aria-label="Delete meeting" onClick={() => setModal({ type: 'del-meeting', id: m.id })}>{ICON.trash}</button>}
+                            </div></td>
+                          </tr>
+                        );
+                      })}
+                      {!rows.length && <tr><td colSpan={8}>{meetings.length
+                        ? <Empty title="No meetings match" sub="Change or clear the filters." />
+                        : <Empty title="No meetings yet" sub="Schedule or auto-assign meetings above." />}</td></tr>}
+                    </tbody>
+                  </table>
+                </div>
               </div>
-            </div>
-          )}
+            );
+          })()}
         </>
       )}
 
@@ -2186,8 +2293,10 @@ export function SahebjiSchedule({ store, activeEventId }) {
       {modal?.type === 'del-slot' && (() => {
         const slot = slots.find(s => s.id === modal.id);
         if (!slot) return null;
-        const affected = meetingsInSlot(slot, scheduledMeetings, slots);
-        return <SlotDeleteModal slot={slot} affected={affected} nameOf={nameOf} onClose={() => setModal(null)}
+        const inSlot = meetingsInSlot(slot, scheduledMeetings, slots);
+        const affected = inSlot.filter(m => !m.frozen);
+        const kept = inSlot.filter(m => m.frozen);   // frozen meetings stay exactly where they are
+        return <SlotDeleteModal slot={slot} affected={affected} kept={kept} nameOf={nameOf} onClose={() => setModal(null)}
           onConfirm={async (mode) => {
             setModal(null);
             const linked = affected.map(m => ({ collection: 'founder', data: m }));
@@ -2208,6 +2317,7 @@ export function SahebjiSchedule({ store, activeEventId }) {
       )}
       {modal?.type === 'del-meeting' && (() => {
         const mtg = meetings.find(m => m.id === modal.id);
+        if (mtg?.frozen) { setTimeout(() => { setModal(null); toast('Frozen — unfreeze first.'); }, 0); return null; }
         return mtg ? <DeleteModal label={nameOf(mtg)} onClose={() => setModal(null)}
           onConfirm={async () => { setModal(null); await trashItem('founder', mtg, [], profile?.email || ''); await removeItem('founder', mtg.id); toast('Meeting moved to trash.'); }} /> : null;
       })()}
@@ -2216,7 +2326,7 @@ export function SahebjiSchedule({ store, activeEventId }) {
 }
 
 /* Deleting a slot: the meetings inside it are handled explicitly, never left orphaned */
-function SlotDeleteModal({ slot, affected, nameOf, onClose, onConfirm }) {
+function SlotDeleteModal({ slot, affected, kept = [], nameOf, onClose, onConfirm }) {
   const [busy, setBusy] = useState(false);
   const go = async mode => { setBusy(true); await onConfirm(mode); };
   return (
@@ -2224,6 +2334,11 @@ function SlotDeleteModal({ slot, affected, nameOf, onClose, onConfirm }) {
       <p style={{ fontSize: 13.5, marginTop: 0 }}>
         <b>{fmtDate(slot.date)}, {slot.startTime}–{slot.endTime}</b> will move to trash (restorable for 30 days, together with anything below).
       </p>
+      {kept.length > 0 && (
+        <div className="mtg-note" style={{ marginBottom: 10 }}>
+          🔒 {kept.length} frozen meeting{kept.length > 1 ? 's' : ''} will be kept as {kept.length > 1 ? 'they are' : 'it is'}: {kept.map(m => `${nameOf(m)} (${m.time})`).join(', ')}.
+        </div>
+      )}
       {affected.length > 0 ? (
         <>
           <p style={{ fontSize: 13.5 }}>{affected.length} meeting{affected.length > 1 ? 's are' : ' is'} booked in this slot:</p>
@@ -2316,7 +2431,9 @@ function SahebjiMeetingModal({ item, prefill, store, activeEventId, onClose, toa
     ? (() => { const m = toMin(f.time) + parseInt(f.duration); return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`; })()
     : '—';
 
+  const frozen = !!item?.frozen;
   async function save() {
+    if (frozen) return;
     if (!f.contactId || !f.date || !f.time) { return; }
 
     // Slot boundary check — meeting must fall within a defined slot on that date
@@ -2363,7 +2480,9 @@ function SahebjiMeetingModal({ item, prefill, store, activeEventId, onClose, toa
   }
 
   return (
-    <Modal title={item ? 'Edit Sahebji meeting' : 'Schedule Sahebji one-on-one'} onClose={onClose} onSave={save} saveLabel={item ? 'Save' : 'Schedule'}>
+    <Modal title={frozen ? 'Sahebji meeting (frozen)' : item ? 'Edit Sahebji meeting' : 'Schedule Sahebji one-on-one'} onClose={onClose} onSave={frozen ? null : save} saveLabel={item ? 'Save' : 'Schedule'}>
+      {frozen && <div className="mtg-note" style={{ marginBottom: 10 }}>🔒 This meeting is frozen. Unfreeze it (🔒 button on the card or row) to make changes.</div>}
+      <fieldset disabled={frozen} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
       <Field label="Guest">
         <select className="input" value={f.contactId} onChange={set('contactId')}>
           {contacts.map(c => <option key={c.id} value={c.id}>{displayName(c)}</option>)}
@@ -2399,6 +2518,7 @@ function SahebjiMeetingModal({ item, prefill, store, activeEventId, onClose, toa
         <Field label="Venue"><input className="input" value={f.venue} onChange={set('venue')} /></Field>
       </div>
       <Field label="Notes"><input className="input" value={f.notes} onChange={set('notes')} /></Field>
+      </fieldset>
     </Modal>
   );
 }
@@ -3273,6 +3393,7 @@ export function Reports({ store, activeEventId }) {
         } else if (row.source === 'Sahebji') {
           const m = founder.find(f=>f.id===row.founderId);
           if (!m) continue;
+          if (m.frozen) { report.push('Sahebji meeting is frozen — not moved (unfreeze it in Scheduling first)'); continue; }
           const slot = slotContaining(newDate, newTime, m.duration, store.sahebjiSlots||[]);
           if (!slot && !window.confirm(`${newDate} ${newTime} is outside Sahebji's available slots. Save anyway?`)) continue;
           await saveItem('founder',{ ...m, date:newDate, time:newTime, slotId:slot?.id||null });
