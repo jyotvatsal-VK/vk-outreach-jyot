@@ -4779,6 +4779,12 @@ export function POCAllocation({ store, activeEventId }) {
   const [openDropdown, setOpenDropdown] = useState(null); // req.key
   const [autoOpen, setAutoOpen] = useState(false);
   const [showIssues, setShowIssues] = useState(false);
+  const [openGroups, setOpenGroups] = useState(() => new Set());
+  const [manualFor, setManualFor] = useState(null);      // issue id with the manual picker open
+  const [fixPreview, setFixPreview] = useState(null);    // { title, rows } for Fix all / Fix everything
+  const [showIgnored, setShowIgnored] = useState(false);
+  const [lastFix, setLastFix] = useState(null);          // { text, snap } — single fix that can be undone
+  const [fixBusy, setFixBusy] = useState(false);
 
   const vols         = store.volunteers || [];
   const avail        = store.availability || [];
@@ -4893,11 +4899,12 @@ export function POCAllocation({ store, activeEventId }) {
 
   async function writeAssignment(req, volId) {
     const existing = getAssignment(req.contactId, req.date);
-    if (existing?.frozen) return;
+    if (existing?.frozen) return null;
     const vol = vols.find(v=>v.id===volId);
     const contact = contacts.find(c=>c.id===req.contactId);
+    const id = existing?.id||crypto.randomUUID();
     await saveItem('poc',{
-      id: existing?.id||crypto.randomUUID(),
+      id,
       contactId:req.contactId, volunteerId:volId,
       day:req.date, fromTime:req.fromTime, toTime:req.toTime,
       slot:`${req.fromTime}–${req.toTime}`, status:'Active',
@@ -4912,6 +4919,7 @@ export function POCAllocation({ store, activeEventId }) {
         pocRequired:false, auto:true,
       });
     }
+    return id;
   }
 
   async function unassignPOC(req) {
@@ -4937,27 +4945,40 @@ export function POCAllocation({ store, activeEventId }) {
   const logiAll = store.logistics || [];
   const eventPoc = poc.filter(p=>p.eventId===activeEventId);
   const overlaps = (a,b) => toMins(a.fromTime) < toMins(b.toTime) && toMins(b.fromTime) < toMins(a.toTime);
-  const issues = [];
-  const addIssue = (day, contactId, sev, text) => issues.push({ day, contactId, key:`${contactId}_${day}`, sev, text });
+  /* Each issue has a type (decides the automatic fix), the assignment it is about (pocId) and a signature.
+     "Ignore" saves the signature on that assignment; if the assignment, the guest's timing or the
+     message changes (e.g. the volunteer's hours), the signature no longer matches and the issue comes back. */
+  const reqFor = (contactId, d) => requirements.find(r=>r.contactId===contactId && r.date===d) || null;
+  const pocById = id => eventPoc.find(p=>p.id===id);
+  const allIssues = [];
+  const addIssue = (type, day, contactId, text, extra = {}) => {
+    const p = extra.pocId ? pocById(extra.pocId) : null;
+    const req = reqFor(contactId, day);
+    const id = `${type}|${extra.pocId || contactId+'_'+day}|${extra.otherId || ''}`;
+    const sig = [text, p?.volunteerId||'', p?.fromTime||'', p?.toTime||'', req?.fromTime||'', req?.toTime||''].join('|');
+    allIssues.push({ id, type, sev: POC_ISSUE_SEV[type], day, contactId, key:`${contactId}_${day}`, text,
+      pocId: extra.pocId || null, otherId: extra.otherId || null, sig, ignored: !!p && p.ignored?.[id] === sig });
+  };
   const cName = id => { const c = allContacts.find(x=>x.id===id); return c ? displayName(c) : 'Unknown guest'; };
-  requirements.forEach(r => { if (!getAssignment(r.contactId, r.date)) addIssue(r.date, r.contactId, 'bad', 'No POC assigned'); });
+  requirements.forEach(r => { if (!getAssignment(r.contactId, r.date)) addIssue('unassigned', r.date, r.contactId, 'No POC assigned'); });
   eventPoc.forEach(p => {
     const vol = vols.find(v=>v.id===p.volunteerId);
     const c = allContacts.find(x=>x.id===p.contactId);
-    if (!vol) addIssue(p.day, p.contactId, 'bad', 'Assigned volunteer no longer exists');
-    if (!c) addIssue(p.day, p.contactId, 'bad', 'Guest has been deleted');
-    else if (c.status !== 'Confirmed') addIssue(p.day, p.contactId, 'bad', `Guest is now ${c.status}`);
-    const req = requirements.find(r=>r.contactId===p.contactId && r.date===p.day);
-    if (!req) addIssue(p.day, p.contactId, 'warn', 'POC is no longer required for this day');
-    else if (p.fromTime && (p.fromTime !== req.fromTime || p.toTime !== req.toTime)) addIssue(p.day, p.contactId, 'warn', `Timing changed — now needed ${req.fromTime}–${req.toTime} (assigned ${p.fromTime}–${p.toTime})`);
+    const at = { pocId: p.id };
+    if (!vol) addIssue('vol-missing', p.day, p.contactId, 'Assigned volunteer no longer exists', at);
+    if (!c) addIssue('guest-deleted', p.day, p.contactId, 'Guest has been deleted', at);
+    else if (c.status !== 'Confirmed') addIssue('guest-status', p.day, p.contactId, `Guest is now ${c.status}`, at);
+    const req = reqFor(p.contactId, p.day);
+    if (!req) addIssue('not-required', p.day, p.contactId, 'POC is no longer required for this day', at);
+    else if (p.fromTime && (p.fromTime !== req.fromTime || p.toTime !== req.toTime)) addIssue('timing', p.day, p.contactId, `Timing changed — now needed ${req.fromTime}–${req.toTime} (assigned ${p.fromTime}–${p.toTime})`, at);
     if (vol) {
       const va = getVolAvail(vol.id, p.day);
-      if (!va) addIssue(p.day, p.contactId, 'bad', `${vol.name} is not available on this day`);
-      else if (p.fromTime && p.toTime && !withinSlots(va, toMins(p.fromTime), toMins(p.toTime))) addIssue(p.day, p.contactId, 'warn', `Outside ${vol.name}'s hours (${slotsText(va.slots)})`);
+      if (!va) addIssue('vol-unavailable', p.day, p.contactId, `${vol.name} is not available on this day`, at);
+      else if (p.fromTime && p.toTime && !withinSlots(va, toMins(p.fromTime), toMins(p.toTime))) addIssue('outside-hours', p.day, p.contactId, `Outside ${vol.name}'s hours (${slotsText(va.slots)})`, at);
     }
     const L = logiAll.find(l=>l.contactId===p.contactId) || {};
     if ((L.arrivalDate && p.day < L.arrivalDate) || (L.departureDate && p.day > L.departureDate))
-      addIssue(p.day, p.contactId, 'bad', `Outside guest's stay (${L.arrivalDate||'?'} to ${L.departureDate||'?'})`);
+      addIssue('outside-stay', p.day, p.contactId, `Outside guest's stay (${L.arrivalDate||'?'} to ${L.departureDate||'?'})`, at);
   });
   // Double-booking and overload, per volunteer per day
   const byVolDay = {};
@@ -4966,14 +4987,203 @@ export function POCAllocation({ store, activeEventId }) {
     const vol = vols.find(v=>v.id===list[0].volunteerId);
     list.forEach((a,i) => list.slice(i+1).forEach(b => {
       if (overlaps(a,b)) {
-        addIssue(a.day, a.contactId, 'bad', `${vol?.name||'Volunteer'} double-booked with ${cName(b.contactId)}`);
-        addIssue(b.day, b.contactId, 'bad', `${vol?.name||'Volunteer'} double-booked with ${cName(a.contactId)}`);
+        addIssue('double', a.day, a.contactId, `${vol?.name||'Volunteer'} double-booked with ${cName(b.contactId)}`, { pocId:a.id, otherId:b.id });
+        addIssue('double', b.day, b.contactId, `${vol?.name||'Volunteer'} double-booked with ${cName(a.contactId)}`, { pocId:b.id, otherId:a.id });
       }
     }));
-    if (list.length > maxPerDay) list.forEach(p => addIssue(p.day, p.contactId, 'warn', `${vol?.name||'Volunteer'} has ${list.length} guests this day (limit ${maxPerDay})`));
+    if (list.length > maxPerDay) list.forEach(p => addIssue('over-limit', p.day, p.contactId, `${vol?.name||'Volunteer'} has ${list.length} guests this day (limit ${maxPerDay})`, { pocId:p.id }));
   });
+  const issues = allIssues.filter(i=>!i.ignored);
+  const ignoredIssues = allIssues.filter(i=>i.ignored);
   const issuesFor = key => issues.filter(i=>i.key===key);
   const badCount = issues.filter(i=>i.sev==='bad').length;
+
+  /* ══ Fixing issues ═══════════════════════════════════════════════
+     intentsFor(issue) → what has to change (assign / reassign / retime / remove).
+     planFixes(issues) → merges intents per assignment and picks volunteers with the same rules as
+     Auto-assign: POC department, free for the whole window inside one slot, not double-booked,
+     under the daily limit; prefers the guest's POC from other days, then the least busy.
+     Frozen assignments are never changed. */
+  function makeLoad(skip) {
+    const L = { busy:{}, count:{}, total:{}, chosen:{} };
+    eventPoc.forEach(p => {
+      if (skip.has(p.id)) return;
+      const k = p.volunteerId+'|'+p.day;
+      if (p.fromTime&&p.toTime) (L.busy[k] = L.busy[k] || []).push({ fromTime:p.fromTime, toTime:p.toTime });
+      L.count[k] = (L.count[k]||0) + 1; L.total[p.volunteerId] = (L.total[p.volunteerId]||0) + 1;
+      (L.chosen[p.contactId] = L.chosen[p.contactId] || new Set()).add(p.volunteerId);
+    });
+    return L;
+  }
+  // '' if the volunteer can take this window, otherwise why not
+  const volBlock = (L, v, r) => {
+    const va = getVolAvail(v.id, r.date);
+    if (!va) return 'Not available this day';
+    if (!withinSlots(va, toMins(r.fromTime), toMins(r.toTime))) return `Hours ${slotsText(va.slots)}`;
+    const k = v.id+'|'+r.date;
+    if ((L.busy[k]||[]).some(w => overlaps(w, r))) return 'Busy at this time';
+    if ((L.count[k]||0) >= maxPerDay) return `Already has ${L.count[k]} guest${L.count[k]>1?'s':''}`;
+    return '';
+  };
+  const bookLoad = (L, volId, r) => {
+    const k = volId+'|'+r.date;
+    (L.busy[k] = L.busy[k] || []).push({ fromTime:r.fromTime, toTime:r.toTime });
+    L.count[k] = (L.count[k]||0) + 1; L.total[volId] = (L.total[volId]||0) + 1;
+    (L.chosen[r.contactId] = L.chosen[r.contactId] || new Set()).add(volId);
+  };
+  function pickVol(L, r, avoidId) {
+    const cs = pocVols.filter(v => v.id !== avoidId && !volBlock(L, v, r));
+    if (!cs.length) return { volId:'', options:[] };
+    const score = v => ((L.chosen[r.contactId]?.has(v.id)) ? 1000 : 0) - 10*(L.count[v.id+'|'+r.date]||0) - (L.total[v.id]||0);
+    const best = [...cs].sort((a,b) => score(b) - score(a))[0];
+    bookLoad(L, best.id, r);
+    return { volId: best.id, options: cs.map(v=>v.id) };
+  }
+  const moveOrRemove = x => { const r = reqFor(x.contactId, x.day); return r ? { kind:'reassign', target:x.id, p:x, req:r } : { kind:'remove', target:x.id, p:x }; };
+  function intentsFor(i) {
+    const p = i.pocId ? pocById(i.pocId) : null;
+    switch (i.type) {
+      case 'unassigned': { const r = reqFor(i.contactId, i.day); return r ? [{ kind:'assign', target:i.key, req:r }] : []; }
+      case 'guest-deleted': case 'guest-status': case 'not-required': case 'outside-stay':
+        return p ? [{ kind:'remove', target:p.id, p }] : [];
+      case 'vol-missing': case 'vol-unavailable': case 'outside-hours':
+        return p ? [moveOrRemove(p)] : [];
+      case 'timing': { const r = p && reqFor(p.contactId, p.day); return r ? [{ kind:'retime', target:p.id, p, req:r }] : []; }
+      case 'double': {
+        const o = pocById(i.otherId);
+        if (!p) return [];
+        if (!o) return [moveOrRemove(p)];
+        if (p.frozen && o.frozen) return [{ kind:'blocked', target:p.id, p, reason:'Both guests are frozen on this volunteer — unfreeze one to fix' }];
+        // Keep a frozen one; otherwise keep the earlier window and move the later one
+        const later = (toMins(p.fromTime) > toMins(o.fromTime) || (p.fromTime === o.fromTime && p.contactId > o.contactId)) ? p : o;
+        const move = p.frozen ? o : o.frozen ? p : later;
+        return [moveOrRemove(move)];
+      }
+      case 'over-limit': {
+        if (!p) return [];
+        const list = eventPoc.filter(x => x.volunteerId===p.volunteerId && x.day===p.day && x.fromTime && x.toTime)
+          .sort((a,b) => toMins(a.fromTime) - toMins(b.fromTime));
+        const extra = list.length - maxPerDay;
+        if (extra <= 0) return [];
+        const movable = list.filter(x => !x.frozen).slice(-extra);   // the latest non-frozen guests move
+        return movable.length ? movable.map(moveOrRemove) : [{ kind:'blocked', target:p.id, p, reason:'All of this volunteer\'s guests are frozen' }];
+      }
+      default: return [];
+    }
+  }
+  const FIX_RANK = { remove:4, reassign:3, retime:2, assign:1, blocked:0 };
+  function planFixes(list) {
+    const byTarget = new Map();
+    list.forEach(i => intentsFor(i).forEach(t0 => {
+      const t = (t0.p?.frozen && t0.kind !== 'blocked') ? { ...t0, kind:'blocked', reason:'Frozen — unfreeze to fix' } : t0;
+      const cur = byTarget.get(t.target);
+      if (!cur) byTarget.set(t.target, { ...t, issueIds:[i.id] });
+      else if (FIX_RANK[t.kind] > FIX_RANK[cur.kind]) byTarget.set(t.target, { ...t, issueIds:[...cur.issueIds, i.id] });
+      else cur.issueIds.push(i.id);
+    }));
+    const intents = [...byTarget.values()];
+    const L = makeLoad(new Set(intents.filter(t => t.kind !== 'assign' && t.kind !== 'blocked').map(t => t.target)));
+    const rows = [];
+    const add = (t, extra) => rows.push({ key:t.target, kind:t.kind, req:t.req||null, p:t.p||null,
+      day:t.req?.date || t.p?.day, contactId:t.req?.contactId || t.p?.contactId, issueIds:t.issueIds, volId:'', options:[], reason:'', ...extra });
+    intents.filter(t => t.kind === 'blocked').forEach(t => add(t, { reason:t.reason }));
+    intents.filter(t => t.kind === 'remove').forEach(t => add(t, {}));
+    const pending = intents.filter(t => t.kind === 'assign' || t.kind === 'reassign');
+    intents.filter(t => t.kind === 'retime').forEach(t => {
+      const v = vols.find(x => x.id === t.p.volunteerId);
+      if (v && !volBlock(L, v, t.req)) { bookLoad(L, v.id, t.req); add(t, { volId:v.id, options:[v.id] }); }
+      else pending.push({ ...t, kind:'reassign' });      // same volunteer can't do the new time → move
+    });
+    pending.map(t => ({ t, n: pocVols.filter(v => !volBlock(L, v, t.req)).length }))
+      .sort((a,b) => a.n - b.n)
+      .forEach(({ t }) => {
+        const pk = pickVol(L, t.req, t.kind === 'reassign' ? t.p?.volunteerId : null);
+        if (pk.volId) add(t, pk);
+        else add(t, { kind:'blocked', reason:'Nobody in the POC team is free for this whole window — use Manual' });
+      });
+    return rows.sort((a,b) => (a.day||'') !== (b.day||'') ? ((a.day||'') > (b.day||'') ? 1 : -1) : ((a.req?.fromTime||'') > (b.req?.fromTime||'') ? 1 : -1));
+  }
+  const vNm = id => vols.find(v => v.id === id)?.name || 'volunteer';
+  const describeFix = r =>
+    r.kind === 'blocked'  ? r.reason
+    : r.kind === 'remove' ? `Remove ${vNm(r.p?.volunteerId)} as POC for ${cName(r.contactId)}`
+    : r.kind === 'retime' ? `Keep ${vNm(r.volId)}, change time to ${r.req.fromTime}–${r.req.toTime}`
+    : r.kind === 'assign' ? `Assign ${vNm(r.volId)} (${r.req.fromTime}–${r.req.toTime})`
+    : `Move ${cName(r.contactId)} from ${vNm(r.p?.volunteerId)} to ${vNm(r.volId)}`;
+
+  const psKey = (contactId, d) => `poc_auto_${contactId}_${d}`;
+  // Apply fix rows. Returns a snapshot of what was there before, so it can be undone.
+  async function applyFixRows(rows) {
+    const snap = []; let n = 0;
+    for (const r of rows) {
+      if (r.kind === 'blocked' || (r.kind !== 'remove' && !r.volId)) continue;
+      const prevPoc = r.p ? (pocById(r.p.id) || r.p) : (getAssignment(r.contactId, r.day) || null);
+      if (prevPoc?.frozen) continue;
+      const prevPs = personalised.find(x => x.id === psKey(r.contactId, r.day)) || null;
+      let newId = null;
+      if (r.kind === 'remove') {
+        await removeItem('poc', r.p.id);
+        if (prevPs) await removeItem('personalisedSchedule', prevPs.id);
+      } else {
+        newId = await writeAssignment(r.req, r.volId);
+      }
+      snap.push({ kind:r.kind, prevPoc, prevPs, newId, ps: psKey(r.contactId, r.day) });
+      n++;
+    }
+    return { n, snap };
+  }
+  async function undoFix(snap) {
+    for (const x of [...snap].reverse()) {
+      if (x.prevPoc) { const { _updated, ...rest } = x.prevPoc; await saveItem('poc', rest); }
+      else if (x.newId) await removeItem('poc', x.newId);
+      if (x.prevPs) { const { _updated, ...rest } = x.prevPs; await saveItem('personalisedSchedule', rest); }
+      else if (x.kind !== 'remove') await removeItem('personalisedSchedule', x.ps);
+    }
+  }
+  async function runFix(rows, label) {
+    setFixBusy(true);
+    try {
+      const { n, snap } = await applyFixRows(rows);
+      if (n) { setLastFix({ text: label, snap }); toast(label); } else toast('Nothing changed.');
+      setManualFor(null);
+    } catch (e) { toast('Could not fix: ' + (e.code || e.message)); }
+    setFixBusy(false);
+  }
+  async function takeAction(i) {
+    const rows = planFixes([i]).filter(r => r.kind !== 'blocked');
+    if (!rows.length) return;
+    await runFix(rows, rows.map(describeFix).join(' · '));
+  }
+  async function manualAssign(i, volId) {
+    const p = i.pocId ? pocById(i.pocId) : getAssignment(i.contactId, i.day);
+    const r = reqFor(i.contactId, i.day);
+    if (!r) return;
+    await runFix([{ kind: p ? 'reassign' : 'assign', p, req:r, day:r.date, contactId:r.contactId, volId }], `${vNm(volId)} assigned to ${cName(r.contactId)} (${r.fromTime}–${r.toTime})`);
+  }
+  async function manualRemove(i) {
+    const p = i.pocId ? pocById(i.pocId) : null;
+    if (!p) return;
+    await runFix([{ kind:'remove', p, day:p.day, contactId:p.contactId }], `Removed ${vNm(p.volunteerId)} as POC for ${cName(p.contactId)}`);
+  }
+  async function setIgnored(i, on) {
+    const p = pocById(i.pocId);
+    if (!p) return;
+    // '' instead of deleting the key: a merge write can't remove map keys, and '' never matches a signature
+    await saveItem('poc', { id:p.id, ignored: { ...(p.ignored||{}), [i.id]: on ? i.sig : '' } });
+    toast(on ? 'Issue ignored. It will come back if anything about it changes.' : 'Issue restored.');
+  }
+  // Manual picker: every POC-team volunteer, free ones first, with the reason the others can't take it
+  function manualOptions(i) {
+    const r = reqFor(i.contactId, i.day);
+    if (!r) return [];
+    const own = i.pocId ? pocById(i.pocId) : getAssignment(i.contactId, i.day);
+    const L = makeLoad(new Set(own ? [own.id] : []));
+    return pocVols.map(v => {
+      const why = volBlock(L, v, r);
+      const k = v.id+'|'+r.date;
+      return { v, why, n:L.count[k]||0, overLimitOnly: why.startsWith('Already has'), current: own?.volunteerId === v.id };
+    }).sort((a,b) => (!a.why ? 0 : a.overLimitOnly ? 1 : 2) - (!b.why ? 0 : b.overLimitOnly ? 1 : 2) || a.n - b.n || (a.v.name||'').localeCompare(b.v.name||''));
+  }
 
   /* ══ Auto-assign: rule-based, most-constrained guest first, never touches frozen/existing ══ */
   function planAuto(scopeDays) {
@@ -5047,17 +5257,112 @@ export function POCAllocation({ store, activeEventId }) {
       </div>
 
       <div className={'poc-issues' + (issues.length ? (badCount ? ' bad' : ' warn') : ' ok')}>
-        <button className="poc-issues-head" onClick={()=>setShowIssues(v=>!v)} disabled={!issues.length}>
-          {issues.length ? <>⚠ {issues.length} issue{issues.length>1?'s':''}{badCount ? ` · ${badCount} need action` : ''}</> : <>✓ No issues — every POC need is covered and consistent</>}
-          {issues.length > 0 && <span style={{marginLeft:'auto'}}>{showIssues ? 'Hide' : 'Show'}</span>}
-        </button>
-        {showIssues && issues.length > 0 && (
-          <div className="poc-issues-list">
-            {[...issues].sort((a,b)=> (a.sev===b.sev?0:a.sev==='bad'?-1:1) || (a.day>b.day?1:-1)).map((i,idx)=>(
-              <button key={idx} className={'poc-issue ' + i.sev} onClick={()=>{ setSelectedDay(i.day); setShowIssues(false); }}>
-                <span className="mono">{shortDate(i.day)}</span><b>{cName(i.contactId)}</b><span>{i.text}</span>
-              </button>
-            ))}
+        <div className="poc-issues-bar">
+          <button className="poc-issues-head" onClick={()=>setShowIssues(v=>!v)} disabled={!issues.length && !ignoredIssues.length}>
+            {issues.length ? <>⚠ {issues.length} issue{issues.length>1?'s':''}{badCount ? ` · ${badCount} need action` : ''}</> : <>✓ No issues — every POC need is covered and consistent</>}
+            {ignoredIssues.length > 0 && <span style={{fontWeight:400,opacity:.8}}> · {ignoredIssues.length} ignored</span>}
+            {(issues.length > 0 || ignoredIssues.length > 0) && <span style={{marginLeft:'auto'}}>{showIssues ? '▾ Hide' : '▸ Show'}</span>}
+          </button>
+          {can('poc.assign') && issues.length > 0 && (
+            <button className="btn sm" disabled={fixBusy} onClick={()=>setFixPreview({ title:'Fix all issues', rows: planFixes(issues) })}>⚡ Fix everything</button>
+          )}
+        </div>
+        {showIssues && (
+          <div className="poc-issues-body">
+            {lastFix && (
+              <div className="poc-undo">
+                <span style={{flex:1}}>✓ {lastFix.text}</span>
+                <button className="btn xs" disabled={fixBusy} onClick={async()=>{ setFixBusy(true); await undoFix(lastFix.snap); setLastFix(null); setFixBusy(false); toast('Undone.'); }}>Undo</button>
+                <button className="btn ghost xs" onClick={()=>setLastFix(null)} aria-label="Dismiss">✕</button>
+              </div>
+            )}
+            {POC_ISSUE_TYPES.map(([type, label, hint]) => {
+              const list = issues.filter(i=>i.type===type).sort((a,b)=> a.day!==b.day ? (a.day>b.day?1:-1) : cName(a.contactId).localeCompare(cName(b.contactId)));
+              if (!list.length) return null;
+              const open = openGroups.has(type);
+              const sev = POC_ISSUE_SEV[type];
+              return (
+                <div key={type} className={'poc-grp ' + sev}>
+                  <div className="poc-grp-head">
+                    <button className="poc-grp-toggle" onClick={()=>setOpenGroups(p=>{ const n=new Set(p); n.has(type)?n.delete(type):n.add(type); return n; })}>
+                      <span style={{width:12}}>{open ? '▾' : '▸'}</span>{label}<span className="poc-grp-n">{list.length}</span>
+                      <span className="poc-grp-hint">{sev==='bad' ? 'Needs action' : 'Warning'} · Fix: {hint}</span>
+                    </button>
+                    {can('poc.assign') && <button className="btn xs" disabled={fixBusy} onClick={()=>setFixPreview({ title:`Fix all — ${label}`, rows: planFixes(list) })}>Fix all ({list.length})</button>}
+                  </div>
+                  {open && list.map(i => {
+                    const plan = planFixes([i]);
+                    const doable = plan.filter(r=>r.kind!=='blocked');
+                    const p = i.pocId ? pocById(i.pocId) : null;
+                    return (
+                      <div key={i.id} className="poc-irow">
+                        <div className="poc-irow-main">
+                          <button className="linkbtn" style={{fontWeight:600,color:'var(--ink)'}} title="Open this day" onClick={()=>setSelectedDay(i.day)}>
+                            <span className="mono" style={{color:'var(--muted)',marginRight:8}}>{shortDate(i.day)}</span>{cName(i.contactId)}
+                          </button>
+                          <div className={i.sev==='bad'?'poc-irow-txt bad':'poc-irow-txt warn'}>{i.text}{p?.frozen ? ' · 🔒 frozen' : ''}</div>
+                          <div className={'poc-irow-fix' + (doable.length ? '' : ' blocked')}>
+                            {doable.length ? '→ ' + doable.map(describeFix).join(' · ') : '✕ ' + (plan[0]?.reason || 'No automatic fix — use Manual')}
+                          </div>
+                        </div>
+                        {can('poc.assign') && (
+                          <div className="poc-irow-acts">
+                            <button className="btn primary xs" disabled={fixBusy || !doable.length} title={doable.length ? '' : (plan[0]?.reason || '')} onClick={()=>takeAction(i)}>Take action</button>
+                            <button className={'btn xs' + (manualFor===i.id ? ' primary' : '')} onClick={()=>setManualFor(m=>m===i.id?null:i.id)}>Manual</button>
+                            {i.pocId && <button className="btn ghost xs" onClick={()=>setIgnored(i, true)} title="Hide this issue until something about it changes">Ignore</button>}
+                          </div>
+                        )}
+                        {manualFor===i.id && (() => {
+                          const r = reqFor(i.contactId, i.day);
+                          const opts = manualOptions(i);
+                          return (
+                            <div className="poc-manual">
+                              {r ? <div className="muted-sm">Choose a POC for <b>{cName(i.contactId)}</b>, {shortDate(r.date)} {r.fromTime}–{r.toTime}{p?.frozen ? ' — frozen, unfreeze first' : ''}</div>
+                                 : <div className="muted-sm">POC is no longer needed for this guest on this day.</div>}
+                              {r && <div className="poc-manual-list">
+                                {opts.map(o => (
+                                  <button key={o.v.id} type="button" className={'poc-manual-opt' + (o.current ? ' on' : '')}
+                                    disabled={fixBusy || p?.frozen || o.current || (!!o.why && !o.overLimitOnly)}
+                                    title={o.why || 'Free for this window'} onClick={()=>manualAssign(i, o.v.id)}>
+                                    {o.v.name}{o.current ? ' (current)' : ''}
+                                    <small>{o.why ? (o.overLimitOnly ? `${o.why} — over limit` : o.why) : `Free · ${o.n} other guest${o.n===1?'':'s'} that day`}</small>
+                                  </button>
+                                ))}
+                                {!opts.length && <span className="muted-sm">No volunteers in the POC department.</span>}
+                              </div>}
+                              <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+                                {p && !p.frozen && <button className="btn danger xs" disabled={fixBusy} onClick={()=>manualRemove(i)}>Remove assignment</button>}
+                                <button className="btn xs" onClick={()=>{ setSelectedDay(i.day); setManualFor(null); }}>Go to day</button>
+                                <button className="btn ghost xs" onClick={()=>setManualFor(null)}>Close</button>
+                              </div>
+                            </div>
+                          );
+                        })()}
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })}
+            {ignoredIssues.length > 0 && (
+              <div className="poc-grp">
+                <div className="poc-grp-head">
+                  <button className="poc-grp-toggle" onClick={()=>setShowIgnored(v=>!v)}>
+                    <span style={{width:12}}>{showIgnored ? '▾' : '▸'}</span>Ignored<span className="poc-grp-n">{ignoredIssues.length}</span>
+                    <span className="poc-grp-hint">Hidden until something about them changes</span>
+                  </button>
+                </div>
+                {showIgnored && ignoredIssues.map(i => (
+                  <div key={i.id} className="poc-irow">
+                    <div className="poc-irow-main">
+                      <span className="mono" style={{color:'var(--muted)',marginRight:8}}>{shortDate(i.day)}</span><b>{cName(i.contactId)}</b>
+                      <div className="poc-irow-txt">{i.text}</div>
+                    </div>
+                    {can('poc.assign') && <div className="poc-irow-acts"><button className="btn xs" onClick={()=>setIgnored(i, false)}>Restore</button></div>}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -5310,7 +5615,79 @@ export function POCAllocation({ store, activeEventId }) {
 
       {autoOpen && <PocAutoAssignModal plan={planAuto} days={reqDays} day={day} vols={vols} cName={cName}
         onApply={applyPlan} onClose={()=>setAutoOpen(false)} />}
+      {fixPreview && <PocFixPreviewModal title={fixPreview.title} rows={fixPreview.rows} vols={vols} cName={cName} describe={describeFix}
+        onClose={()=>setFixPreview(null)}
+        onApply={async rows=>{ const { n } = await applyFixRows(rows); setLastFix(null); toast(n ? `Fixed ${n} item${n>1?'s':''}.` : 'Nothing changed.'); setFixPreview(null); }} />}
     </>
+  );
+}
+
+/* ── POC issue types: [type, group label, what the automatic fix does] — order = display order ── */
+const POC_ISSUE_TYPES = [
+  ['unassigned',      'No POC assigned',                  'assign the best free POC volunteer'],
+  ['double',          'Double-booked',                    'keep one guest, move the other to a free volunteer'],
+  ['vol-unavailable', 'Volunteer not available that day', 'move to a volunteer who is free'],
+  ['vol-missing',     'Volunteer deleted',                'move to a volunteer who is free'],
+  ['guest-deleted',   'Guest deleted',                    'remove the POC assignment'],
+  ['guest-status',    'Guest no longer confirmed',        'remove the POC assignment'],
+  ['outside-stay',    "Outside guest's stay",             'remove the POC assignment'],
+  ['timing',          'Timing changed',                   'update the time, or move if the volunteer isn\'t free'],
+  ['outside-hours',   "Outside volunteer's hours",        'move to a volunteer who is free'],
+  ['not-required',    'POC no longer required',           'remove the POC assignment'],
+  ['over-limit',      'Over daily limit',                 'move the extra guests to other volunteers'],
+];
+const POC_ISSUE_SEV = {
+  'unassigned':'bad', 'double':'bad', 'vol-unavailable':'bad', 'vol-missing':'bad', 'guest-deleted':'bad', 'guest-status':'bad', 'outside-stay':'bad',
+  'timing':'warn', 'outside-hours':'warn', 'not-required':'warn', 'over-limit':'warn',
+};
+
+/* ── Fix all / Fix everything preview: tick what to apply, change any volunteer, then Apply ── */
+function PocFixPreviewModal({ title, rows: initial, vols, cName, describe, onApply, onClose }) {
+  const [rows, setRows] = useState(() => initial.map(r => ({ ...r, on: r.kind !== 'blocked' })));
+  const [busy, setBusy] = useState(false);
+  const vName = id => vols.find(v => v.id === id)?.name || '—';
+  const picked = rows.filter(r => r.on && r.kind !== 'blocked' && (r.kind === 'remove' || r.volId));
+  const blocked = rows.filter(r => r.kind === 'blocked').length;
+  const upd = (i, patch) => setRows(p => p.map((x, j) => j === i ? { ...x, ...patch } : x));
+  return (
+    <Modal title={title} onClose={onClose} footer={null}>
+      <p className="muted-sm" style={{ margin: '0 0 10px' }}>
+        Nothing is saved until you click Apply. Untick anything you want to handle yourself, or pick a different volunteer.
+        Frozen assignments are never changed.
+      </p>
+      {!rows.length ? <Empty title="Nothing to fix" sub="These issues have no automatic fix." /> : (
+        <div style={{ maxHeight: '50vh', overflow: 'auto', border: '1px solid var(--line)', borderRadius: 8 }}>
+          <table className="import-tbl"><thead><tr><th></th><th>Guest</th><th>Change</th></tr></thead><tbody>
+            {rows.map((r, i) => (
+              <tr key={r.key} style={r.kind === 'blocked' ? { opacity: .6 } : {}}>
+                <td><input type="checkbox" checked={r.on} disabled={r.kind === 'blocked'} onChange={e => upd(i, { on: e.target.checked })} style={{ accentColor: 'var(--teal)' }} /></td>
+                <td><b>{cName(r.contactId)}</b><div className="muted-sm">{r.day ? shortDate(r.day) : ''}{r.req ? ` · ${r.req.fromTime}–${r.req.toTime}` : ''}</div></td>
+                <td>
+                  {r.kind === 'blocked' ? <span className="mtg-flag bad">⚠ {r.reason}</span>
+                  : r.kind === 'remove' ? <span>{describe(r)}</span>
+                  : <>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                        <span className="muted-sm">{r.kind === 'assign' ? 'Assign' : r.kind === 'retime' ? 'Keep / change time' : `Move from ${vName(r.p?.volunteerId)} to`}</span>
+                        <select className="input" style={{ padding: '4px 6px', fontSize: 12.5, width: 'auto' }} value={r.volId}
+                          onChange={e => upd(i, { volId: e.target.value, kind: r.kind === 'retime' && e.target.value !== r.p?.volunteerId ? 'reassign' : r.kind })}>
+                          {r.options.map(id => <option key={id} value={id}>{vName(id)}</option>)}
+                        </select>
+                      </div>
+                    </>}
+                </td>
+              </tr>
+            ))}
+          </tbody></table>
+        </div>
+      )}
+      {blocked > 0 && <div className="mtg-note" style={{ marginTop: 10 }}>⚠ {blocked} item{blocked > 1 ? 's' : ''} can't be fixed automatically — use Manual on those issues.</div>}
+      <div className="modal-foot" style={{ padding: '12px 0 0' }}>
+        <button className="btn" onClick={onClose}>Cancel</button>
+        <button className="btn primary" disabled={busy || !picked.length} onClick={async () => { setBusy(true); await onApply(picked); }}>
+          {busy ? 'Applying…' : `Apply ${picked.length} change${picked.length === 1 ? '' : 's'}`}
+        </button>
+      </div>
+    </Modal>
   );
 }
 
