@@ -538,3 +538,32 @@ tr:hover .rowacts{opacity:1}
 @media(max-width:900px){
   .mtg-filters .input{width:100%}
 }
+
+/* ── Logistics: booking-linked Arrival / Departure, travel plan, ticket reading, travel times ── */
+.src-tag{display:inline-block;font-size:10.5px;font-weight:600;padding:1px 7px;border-radius:9px;margin-top:3px;white-space:nowrap}
+.src-tag.flight{background:var(--teal-wash);color:var(--teal)}
+.src-tag.car{background:var(--blue-wash);color:var(--blue)}
+.src-tag.planned{background:#F1F1EC;color:var(--muted)}
+.src-tag.manual{background:var(--amber-wash);color:var(--amber)}
+.src-warn{font-size:11px;color:var(--rose);margin-top:3px;max-width:210px;line-height:1.3}
+.logi-fs{border:0;padding:0;margin:0;min-width:0}
+.logi-fs:disabled .input,.logi-fs:disabled select{background:var(--paper);color:var(--ink)}
+.travel-plan{display:flex;flex-direction:column;border:1px solid var(--line);border-radius:8px;background:#fff;overflow:hidden}
+.tp-step{display:flex;gap:10px;padding:6px 10px;font-size:12.5px;border-top:1px solid var(--line)}
+.tp-step:first-child{border-top:none}
+.tp-step .mono{color:var(--muted);min-width:96px;white-space:nowrap}
+.tp-step.land,.tp-step.depart{font-weight:600}
+.ticket-scan{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 12px;border:1px dashed var(--teal-line);border-radius:10px;background:var(--teal-wash);margin-bottom:12px}
+.ticket-scan .btn.disabled{opacity:.6}
+.ticket-preview{border:1px solid var(--teal-line);border-radius:10px;padding:10px 12px;margin-bottom:14px;background:#fff}
+.tp-journey{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 0;border-top:1px solid var(--line);font-size:13px}
+.tp-journey:first-of-type{border-top:none}
+.car-suggest{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;background:var(--teal-wash);color:var(--teal);border-radius:8px;padding:7px 10px;font-size:12.5px;margin-bottom:8px}
+.tt-routes{display:flex;flex-direction:column;gap:6px}
+.tt-row{display:grid;grid-template-columns:1.4fr 1.4fr .8fr .8fr auto;gap:6px;align-items:center}
+.tt-row .input{padding:6px 8px;font-size:13px;min-width:0}
+.tt-head{font-size:11.5px;font-weight:600;color:var(--muted)}
+@media(max-width:900px){
+  .tt-row{grid-template-columns:1fr 1fr;padding-bottom:8px;border-bottom:1px solid var(--line)}
+  .tt-head{display:none}
+}

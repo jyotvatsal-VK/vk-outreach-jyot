@@ -10,6 +10,11 @@ import {
   localISO, todayISO, tomorrowISO,
 } from './schedule';
 import { ICON, Modal, Field, Empty, SearchBox, useToast } from './ui';
+import { auth } from './firebase';
+import {
+  TRAVEL_CFG_ID, getTravelCfg, travelPlan, bookedMain, syncPatch, needsSync, travelWarnings, sourceLabel,
+  knownPlaces, carIsTravel, samePlace, journeysFromLegs, passengerMatches,
+} from './travel';
 
 /* ── DeleteModal — reusable confirm-delete dialog ── */
 function DeleteModal({ label, onClose, onConfirm }) {
@@ -1054,6 +1059,10 @@ export function Logistics({ store, activeEventId }) {
   const [subModal, setSubModal] = useState(null);
   const [importOpen, setImportOpen] = useState(false);
   const [logiShowFilter, setLogiShowFilter] = useState(false);
+  const [ttOpen, setTtOpen] = useState(false);
+  const [syncBusy, setSyncBusy] = useState(false);
+  const cfg = getTravelCfg(store);
+  const places = knownPlaces(cfg, logi);
 
   // getL must be defined before logiWithNames uses it
   // If multiple docs exist for same contact, pick the most complete one
@@ -1087,7 +1096,8 @@ export function Logistics({ store, activeEventId }) {
   // Toggle a top-level requirement field
   async function toggleReq(cid, field, val) {
     const L = getL(cid);
-    await saveItem('logistics', { ...L, [field]: val, eventId: activeEventId });
+    const next = { ...L, [field]: val, eventId: activeEventId };
+    await saveItem('logistics', { ...next, ...syncPatch(next, cfg) });   // main Arrival/Departure follow the bookings
     if (val === 'required') {
       const typeMap = { flightReq:'flight', carReq:'car', accomReq:'accommodation' };
       setSubModal({ type: typeMap[field] || field.replace('Req','').toLowerCase(), contactId: cid, item: L });
@@ -1133,7 +1143,24 @@ export function Logistics({ store, activeEventId }) {
           ['hotelName','Hotel'],['checkinDate','Check-in'],['checkoutDate','Check-out'],
           ['flightReq','Flight'],['carReq','Car'],['accomReq','Accommodation']])}>⬇ Export</button>
         <button className="btn sm" onClick={() => setImportOpen(true)}>{ICON.upload} Import</button>
+        <button className="btn sm" onClick={() => setTtOpen(true)} title="Travel times between airport, hotels and venue">🕒 Travel times</button>
       </div>
+
+      {/* Records whose main Arrival / Departure don't yet match their flight / car booking */}
+      {(() => {
+        const stale = contacts.map(c => getL(c.id)).filter(L => L.id && needsSync(L, cfg));
+        if (!stale.length || !can('logistics.edit')) return null;
+        return (
+          <div className="mtg-note" style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
+            <span style={{ flex:1 }}>↻ <b>{stale.length} guest{stale.length>1?'s':''}</b> have flight / car details that aren't in their main Arrival / Departure yet.</span>
+            <button className="btn sm" disabled={syncBusy} onClick={async () => {
+              setSyncBusy(true);
+              for (const L of stale) await saveItem('logistics', { ...L, ...syncPatch(L, cfg) });
+              setSyncBusy(false); toast(`Updated ${stale.length} guest${stale.length>1?'s':''} from their bookings.`);
+            }}>{syncBusy ? 'Updating…' : 'Update from bookings'}</button>
+          </div>
+        );
+      })()}
 
       {/* Pending flag banner */}
       {(() => {
@@ -1200,6 +1227,8 @@ export function Logistics({ store, activeEventId }) {
                           <div>{L.arrivalDate ? `${L.arrivalDate}` : <span style={{ color: 'var(--faint)' }}>No date</span>}</div>
                           {L.arrivalTime && <div style={{ color: 'var(--muted)' }}>{L.arrivalTime}</div>}
                           {L.arrivalLocation && <div style={{ color: 'var(--muted)' }}>{L.arrivalLocation}</div>}
+                          {L.arrivalDate && <span className={'src-tag ' + sourceLabel(L, 'arrival').cls}>{sourceLabel(L, 'arrival').t}</span>}
+                          {travelWarnings(L).filter(w => w.key !== 'departure' && w.key !== 'checkout').map(w => <div key={w.key} className="src-warn">⚠ {w.text}</div>)}
                         </div>
                       </td>
                       <td>
@@ -1207,6 +1236,8 @@ export function Logistics({ store, activeEventId }) {
                           <div>{L.departureDate ? `${L.departureDate}` : <span style={{ color: 'var(--faint)' }}>No date</span>}</div>
                           {L.departureTime && <div style={{ color: 'var(--muted)' }}>{L.departureTime}</div>}
                           {L.departureLocation && <div style={{ color: 'var(--muted)' }}>{L.departureLocation}</div>}
+                          {L.departureDate && <span className={'src-tag ' + sourceLabel(L, 'departure').cls}>{sourceLabel(L, 'departure').t}</span>}
+                          {travelWarnings(L).filter(w => w.key === 'departure' || w.key === 'checkout').map(w => <div key={w.key} className="src-warn">⚠ {w.text}</div>)}
                         </div>
                       </td>
                       <td onClick={e => e.stopPropagation()}>{can('logistics.flight') ? <LogisticsReqToggle cid={c.id} field="flightReq" getL={getL} toggleReq={toggleReq} setSubModal={setSubModal}/> : <span className="muted-sm">{getL(c.id).flightReq||'required'}</span>}</td>
@@ -1218,7 +1249,7 @@ export function Logistics({ store, activeEventId }) {
                     {isExpanded && (
                       <tr key={c.id + '_exp'}>
                         <td colSpan={11} style={{ background: 'var(--paper)', padding: '16px 20px', borderBottom: '2px solid var(--teal)' }}>
-                          <LogisticsExpandedRow c={c} L={L} store={store} setField={setField} vendors={vendors} vols={vols} toast={toast} />
+                          <LogisticsExpandedRow c={c} L={L} store={store} setField={setField} vendors={vendors} vols={vols} toast={toast} cfg={cfg} />
                         </td>
                       </tr>
                     )}
@@ -1232,67 +1263,100 @@ export function Logistics({ store, activeEventId }) {
 
       {/* Sub-modals for Flight / Car / Accommodation */}
       {subModal?.type === 'flight' && (
-        <FlightModal contactId={subModal.contactId} item={getL(subModal.contactId)}
+        <FlightModal contactId={subModal.contactId} item={getL(subModal.contactId)} cfg={cfg} places={places}
+          guestName={(() => { const c = contacts.find(x => x.id === subModal.contactId); return c ? displayName(c) : ''; })()}
           onClose={() => setSubModal(null)} toast={toast} activeEventId={activeEventId} />
       )}
       {subModal?.type === 'car' && (
-        <CarModal contactId={subModal.contactId} item={getL(subModal.contactId)}
+        <CarModal contactId={subModal.contactId} item={getL(subModal.contactId)} cfg={cfg} places={places}
           vendors={vendors} onClose={() => setSubModal(null)} toast={toast} activeEventId={activeEventId} />
       )}
       {subModal?.type === 'accommodation' && (
-        <AccommodationModal contactId={subModal.contactId} item={getL(subModal.contactId)}
+        <AccommodationModal contactId={subModal.contactId} item={getL(subModal.contactId)} cfg={cfg} places={places}
           onClose={() => setSubModal(null)} toast={toast} activeEventId={activeEventId} />
       )}
       {importOpen && <LogisticsImportModal store={store} activeEventId={activeEventId}
         onClose={() => setImportOpen(false)} toast={toast} />}
+      {ttOpen && <TravelTimesModal cfg={cfg} places={places} canEdit={can('settings.config')} onClose={() => setTtOpen(false)} toast={toast} />}
     </>
   );
 }
 
 /* ── Expanded inline row — memoized to prevent remount on Firestore updates ── */
-const LogisticsExpandedRow = React.memo(function LogisticsExpandedRow({ c, L, store, setField, vendors, vols, toast }) {
+const LogisticsExpandedRow = React.memo(function LogisticsExpandedRow({ c, L, store, setField, vendors, vols, toast, cfg }) {
   const { can } = usePerm();
-  const [local, setLocal] = useState({
-    arrivalDate: L.arrivalDate||'', arrivalTime: L.arrivalTime||'', arrivalLocation: L.arrivalLocation||'',
-    departureDate: L.departureDate||'', departureTime: L.departureTime||'', departureLocation: L.departureLocation||'',
-    remarks: L.remarks||'',
+  const pick = X => ({
+    arrivalDate: X.arrivalDate||'', arrivalTime: X.arrivalTime||'', arrivalLocation: X.arrivalLocation||'',
+    departureDate: X.departureDate||'', departureTime: X.departureTime||'', departureLocation: X.departureLocation||'',
+    remarks: X.remarks||'',
   });
+  const [local, setLocal] = useState(() => pick(L));
   // Sync from Firestore ONLY when the row is first opened (not on every re-render)
   const initialised = React.useRef(false);
   React.useEffect(() => {
-    if (!initialised.current) {
-      setLocal({
-        arrivalDate: L.arrivalDate||'', arrivalTime: L.arrivalTime||'', arrivalLocation: L.arrivalLocation||'',
-        departureDate: L.departureDate||'', departureTime: L.departureTime||'', departureLocation: L.departureLocation||'',
-        remarks: L.remarks||'',
-      });
-      initialised.current = true;
-    }
+    if (!initialised.current) { setLocal(pick(L)); initialised.current = true; }
   }, [c.id]);
   const set = k => val => setLocal(p => ({...p, [k]: val}));
   const setE = k => e => setLocal(p => ({...p, [k]: e.target.value}));
 
+  /* Arrival / Departure follow the flight or car booking unless overridden by hand */
+  const [ov, setOv] = useState({ arrival: !!L.arrivalOverride, departure: !!L.departureOverride });
+  const bm = bookedMain(L, cfg);
+  const bookedFor = k => k === 'arrival' ? bm.arr : bm.dep;
+  const follows = k => !ov[k] && !!bookedFor(k);
+  const shown = (k, fld) => follows(k) ? (bookedFor(k)[fld.toLowerCase()] || '') : local[k + fld];
+  const fresh = () => (store?.logistics || []).find(x => x.contactId === c.id) || { contactId: c.id };
+  const canEdit = can('logistics.edit');
+
+  function startOverride(k) {
+    const b = bookedFor(k);
+    setLocal(p => ({ ...p, [k+'Date']: b?.date || p[k+'Date'], [k+'Time']: b?.time || p[k+'Time'], [k+'Location']: b?.location || p[k+'Location'] }));
+    setOv(p => ({ ...p, [k]: true }));
+  }
+  async function useBooking(k) {
+    const next = { ...fresh(), [k+'Override']: false };
+    await saveItem('logistics', { ...next, ...syncPatch(next, cfg) });
+    setOv(p => ({ ...p, [k]: false }));
+    toast(`${k === 'arrival' ? 'Arrival' : 'Departure'} now follows the booking.`);
+  }
   async function save() {
-    const L = (store?.logistics || []).find(x => x.contactId === c.id) || { contactId: c.id };
-    await saveItem('logistics', {
-      ...L,
-      arrivalDate:       local.arrivalDate,
-      arrivalTime:       local.arrivalTime,
-      arrivalLocation:   local.arrivalLocation,
-      departureDate:     local.departureDate,
-      departureTime:     local.departureTime,
-      departureLocation: local.departureLocation,
-      remarks:           local.remarks,
+    const next = { ...fresh(), remarks: local.remarks };
+    ['arrival', 'departure'].forEach(k => {
+      if (follows(k)) return;                       // filled from the booking — nothing typed
+      const K = k[0].toUpperCase() + k.slice(1);
+      Object.assign(next, { [k+'Date']: local[k+'Date'], [k+'Time']: local[k+'Time'], [k+'Location']: local[k+'Location'] });
+      if (ov[k]) next[k+'Override'] = true;
+      else { next[k+'Source'] = 'manual'; next['planned'+K+'Date'] = local[k+'Date']; next[k+'Override'] = false; }
     });
+    await saveItem('logistics', { ...next, ...syncPatch(next, cfg) });
     toast('Logistics details saved.');
+  }
+  async function acceptWarning(w) {
+    await saveItem('logistics', { ...fresh(), ...w.accept });
+    toast('Planned dates updated to the booking.');
   }
 
   // Missing field detection
   const missing = [];
-  if (!local.arrivalDate)     missing.push('Arrival date');
-  if (!local.arrivalTime)     missing.push('Arrival time');
-  if (!local.arrivalLocation) missing.push('Arrival location');
-  if (!local.departureDate)   missing.push('Departure date');
+  if (!shown('arrival','Date'))     missing.push('Arrival date');
+  if (!shown('arrival','Time'))     missing.push('Arrival time');
+  if (!shown('arrival','Location')) missing.push('Arrival location');
+  if (!shown('departure','Date'))   missing.push('Departure date');
+
+  const plan = travelPlan(L, cfg);
+  const warns = travelWarnings(L);
+  const sideHead = (k, title) => {
+    const b = bookedFor(k);
+    const lbl = follows(k) ? { t: b.source === 'flight' ? `✈ From flight${b.ref ? ' ' + b.ref : ''}` : '🚗 From car', cls: b.source } : ov[k] ? { t: 'Manual override', cls: 'manual' } : { t: 'Planned (typed by you)', cls: 'planned' };
+    return (
+      <div style={{ display:'flex', alignItems:'center', gap:8, flexWrap:'wrap', marginBottom: 10, marginTop: k === 'departure' ? 12 : 0 }}>
+        <span style={{ fontWeight: 600, fontSize: 13, color: 'var(--teal)' }}>{title}</span>
+        <span className={'src-tag ' + lbl.cls}>{lbl.t}</span>
+        {canEdit && follows(k) && <button className="linkbtn" style={{ fontSize: 12 }} onClick={() => startOverride(k)}>✎ Change by hand</button>}
+        {canEdit && ov[k] && b && <button className="linkbtn" style={{ fontSize: 12 }} onClick={() => useBooking(k)}>↺ Use {b.source} details</button>}
+      </div>
+    );
+  };
 
   return (
     <div>
@@ -1302,6 +1366,16 @@ const LogisticsExpandedRow = React.memo(function LogisticsExpandedRow({ c, L, st
           ⚠ Missing: {missing.join(' · ')}
         </div>
       )}
+      {warns.length > 0 && (
+        <div style={{background:'var(--rose-wash)',border:'1px solid #E9C9D2',borderRadius:8,padding:'8px 14px',marginBottom:10,fontSize:12.5,color:'var(--rose)'}}>
+          {warns.map(w => (
+            <div key={w.key} style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap',padding:'2px 0'}}>
+              <span style={{flex:1}}>⚠ {w.text}</span>
+              {w.accept && canEdit && <button className="btn xs" onClick={() => acceptWarning(w)}>Accept booking dates</button>}
+            </div>
+          ))}
+        </div>
+      )}
       <div style={{marginBottom:14}}>
         <label style={{fontSize:12,fontWeight:600,display:'block',marginBottom:4,color:'var(--teal)'}}>Remarks</label>
         <textarea className="input" rows={2} value={local.remarks} onChange={setE('remarks')}
@@ -1309,38 +1383,57 @@ const LogisticsExpandedRow = React.memo(function LogisticsExpandedRow({ c, L, st
           style={{resize:'vertical',fontFamily:'var(--sans)',width:'100%'}}/>
       </div>
     <div className="split-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
-      {/* Left: Arrival / Departure basics */}
+      {/* Left: Arrival / Departure — follow the booking, or typed by hand */}
       <div>
-        <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--teal)', marginBottom: 10 }}>Arrival details</div>
+        {sideHead('arrival', 'Arrival details')}
+        <fieldset disabled={follows('arrival')} className="logi-fs">
         <div className="grid2" style={{ gap: 8 }}>
-          <Field label="Arrival date"><input className="input" type="date" value={local.arrivalDate} onChange={setE('arrivalDate')} style={!local.arrivalDate?{borderColor:'var(--amber)'}:{}}/></Field>
-          <Field label="Arrival time"><TimePicker value={local.arrivalTime} onChange={set('arrivalTime')}/></Field>
-          <Field label="Arrival location" style={{ gridColumn: '1/-1' }}><input className="input" value={local.arrivalLocation} onChange={setE('arrivalLocation')} placeholder="Airport / station / venue" style={!local.arrivalLocation?{borderColor:'var(--amber)'}:{}}/></Field>
+          <Field label="Arrival date"><input className="input" type="date" value={shown('arrival','Date')} onChange={setE('arrivalDate')} style={!shown('arrival','Date')?{borderColor:'var(--amber)'}:{}}/></Field>
+          <Field label="Arrival time"><TimePicker value={shown('arrival','Time')} onChange={set('arrivalTime')}/></Field>
+          <Field label="Arrival location" style={{ gridColumn: '1/-1' }}><input className="input" value={shown('arrival','Location')} onChange={setE('arrivalLocation')} placeholder="Airport / station / venue" style={!shown('arrival','Location')?{borderColor:'var(--amber)'}:{}}/></Field>
         </div>
-        <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--teal)', margin: '12px 0 10px' }}>Departure details</div>
+        </fieldset>
+        {sideHead('departure', 'Departure details')}
+        <fieldset disabled={follows('departure')} className="logi-fs">
         <div className="grid2" style={{ gap: 8 }}>
-          <Field label="Departure date"><input className="input" type="date" value={local.departureDate} onChange={setE('departureDate')} style={!local.departureDate?{borderColor:'var(--amber)'}:{}}/></Field>
-          <Field label="Departure from"><input className="input" value={local.departureLocation} onChange={setE('departureLocation')} placeholder="Airport / station" /></Field>
-          <Field label="Departure time" style={{ gridColumn: '1/-1' }}><TimePicker value={local.departureTime} onChange={set('departureTime')}/></Field>
+          <Field label="Departure date"><input className="input" type="date" value={shown('departure','Date')} onChange={setE('departureDate')} style={!shown('departure','Date')?{borderColor:'var(--amber)'}:{}}/></Field>
+          <Field label="Departure from"><input className="input" value={shown('departure','Location')} onChange={setE('departureLocation')} placeholder="Airport / station" /></Field>
+          <Field label="Departure time" style={{ gridColumn: '1/-1' }}><TimePicker value={shown('departure','Time')} onChange={set('departureTime')}/></Field>
         </div>
+        </fieldset>
+        {(!bm.arr || !bm.dep) && <p className="muted-sm" style={{ margin: '8px 0 0' }}>Enter the planned dates now. Once the flight or car is added, these fill in from the booking automatically.</p>}
       </div>
-      {/* Right: sub-form summaries only */}
+      {/* Right: sub-form summaries + travel plan */}
       <div>
         <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--teal)', marginBottom: 10 }}>Arrangements summary</div>
         {/* Summary of sub-form data */}
-        {L.flightReq !== 'not_required' && L.arrivalFlightNo && (
+        {L.flightReq !== 'not_required' && (L.arrivalFlightNo || L.departureFlightNo) && (
           <div style={{ marginTop: 10, padding: '8px 12px', background: 'var(--teal-wash)', borderRadius: 8, fontSize: 12 }}>
-            ✈️ Flight booked — {L.arrivalFlightNo} arriving {L.arrivalFlightDate} at {L.arrivalFlightTime}
+            ✈️ {L.arrivalFlightNo ? <>Arrives {L.arrivalFlightNo} · {L.arrivalFlightDate} {L.arrivalFlightTime}</> : 'Arrival flight not added'}
+            {L.departureFlightNo && <><br/>✈️ Departs {L.departureFlightNo} · {L.departureFlightDate} {L.departureFlightTime}{L.departureIntl ? ' · international' : ''}</>}
           </div>
         )}
         {L.carReq !== 'not_required' && L.carVendorId && (
           <div style={{ marginTop: 6, padding: '8px 12px', background: 'var(--teal-wash)', borderRadius: 8, fontSize: 12 }}>
-            🚗 Car booked — {(vendors.find(v => v.id === L.carVendorId) || {}).name}
+            🚗 Car booked — {(vendors.find(v => v.id === L.carVendorId) || {}).name}{carIsTravel(L) && L.carPickupFrom ? ` · from ${L.carPickupFrom}` : ''}
           </div>
         )}
         {L.accomReq !== 'not_required' && L.hotelName && (
           <div style={{ marginTop: 6, padding: '8px 12px', background: 'var(--teal-wash)', borderRadius: 8, fontSize: 12 }}>
             🏨 {L.hotelName} — {L.checkinDate} to {L.checkoutDate}
+          </div>
+        )}
+        <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--teal)', margin: '14px 0 6px' }}>Travel plan</div>
+        {plan.steps.length ? (
+          <div className="travel-plan">
+            {plan.steps.map(st => (
+              <div key={st.key} className={'tp-step ' + st.key}><span className="mono">{shortDate(st.date)} {st.time}</span><span>{st.label}</span></div>
+            ))}
+          </div>
+        ) : <div className="muted-sm">Appears once the flight or car details are added.</div>}
+        {plan.missing.length > 0 && (
+          <div className="muted-sm" style={{ marginTop: 6, color: 'var(--amber)' }}>
+            Add a travel time for {plan.missing.join(' and ')} (🕒 Travel times at the top) to work out the {plan.missing.length > 1 ? 'pickup and leave times' : 'remaining time'}.
           </div>
         )}
       </div>
@@ -1355,43 +1448,147 @@ const LogisticsExpandedRow = React.memo(function LogisticsExpandedRow({ c, L, st
   );
 });
 
-/* ── Flight modal ────────────────────────────────────────────────── */
-function FlightModal({ contactId, item, onClose, toast, activeEventId }) {
+/* ── Flight modal ──────────────────────────────────────────────────
+   "Upload ticket" sends the PDF / photo to /api/parse-ticket (Vercel function → Gemini),
+   shows what it found, and fills the form only when you click "Fill the form". You still Save. */
+const PLACES_LIST_ID = 'vk-travel-places';
+function PlacesDatalist({ places }) {
+  return <datalist id={PLACES_LIST_ID}>{(places || []).map(p => <option key={p} value={p} />)}</datalist>;
+}
+// Read a ticket file as base64. Large photos are scaled down so the upload stays under Vercel's limit.
+async function ticketToPayload(file) {
+  let blob = file, mimeType = file.type || (/\.pdf$/i.test(file.name) ? 'application/pdf' : '');
+  if (!/^(application\/pdf|image\/)/.test(mimeType)) throw new Error('Please upload a PDF or a photo / screenshot of the ticket.');
+  if (mimeType.startsWith('image/') && file.size > 1.5e6 && typeof createImageBitmap === 'function' && !/hei[cf]/.test(mimeType)) {
+    try {
+      const bmp = await createImageBitmap(file);
+      const k = Math.min(1, 2000 / Math.max(bmp.width, bmp.height));
+      const cv = document.createElement('canvas');
+      cv.width = Math.round(bmp.width * k); cv.height = Math.round(bmp.height * k);
+      cv.getContext('2d').drawImage(bmp, 0, 0, cv.width, cv.height);
+      blob = await new Promise(res => cv.toBlob(res, 'image/jpeg', 0.85));
+      mimeType = 'image/jpeg';
+    } catch { /* send the original */ }
+  }
+  if (blob.size > 3.2e6) throw new Error('This file is too large (max about 3 MB). Try a screenshot of the ticket instead.');
+  const dataUrl = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(new Error('Could not read the file.')); r.readAsDataURL(blob); });
+  return { data: String(dataUrl).split(',')[1] || '', mimeType };
+}
+
+function FlightModal({ contactId, item, onClose, toast, activeEventId, cfg, places = [], guestName = '' }) {
   const [f, setF] = useState(() => ({
     arrivalFrom: '', arrivalTo: '', arrivalFlightNo: '', arrivalFlightDate: '', arrivalFlightTime: '',
-    departureFrom: '', departureTo: '', departureFlightNo: '', departureFlightDate: '', departureFlightTime: '',
+    departureFrom: '', departureTo: '', departureFlightNo: '', departureFlightDate: '', departureFlightTime: '', departureIntl: false,
     ...item,
   }));
   const set = k => e => setF(p => ({ ...p, [k]: e.target.value }));
+  const [scan, setScan] = useState(null);   // { busy } | { error } | { journeys, use, passengers, pnr, airline, intl, nameOk }
+  const canon = name => places.find(pl => samePlace(pl, name)) || name;   // use the Travel-times spelling when it's the same place
+
+  async function readTicket(file) {
+    if (!file) return;
+    setScan({ busy: true });
+    try {
+      const payload = await ticketToPayload(file);
+      const token = await auth?.currentUser?.getIdToken?.();
+      const res = await fetch('/api/parse-ticket', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({ ...payload, guestName }),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(out.error || (res.status === 404 ? 'Ticket reading isn’t set up on the server yet.' : `Server error (${res.status})`));
+      const journeys = journeysFromLegs(out.legs || []);
+      if (!journeys.length) throw new Error('No flights found on this ticket. Check it is a flight ticket, or fill the form by hand.');
+      // First journey = arrival, last = departure; a one-way ticket fills whichever side is still empty
+      const use = journeys.map((j, i) => journeys.length >= 2
+        ? (i === 0 ? 'arrival' : i === journeys.length - 1 ? 'departure' : 'skip')
+        : (f.arrivalFlightNo && !f.departureFlightNo ? 'departure' : 'arrival'));
+      setScan({ journeys, use, passengers: out.passengers || [], pnr: out.pnr || '', airline: out.airline || '', intl: !!out.isInternational,
+        nameOk: passengerMatches(out.passengers || [], guestName) });
+    } catch (e) { setScan({ error: e.message || String(e) }); }
+  }
+  function fillFromScan() {
+    const p = {};
+    scan.journeys.forEach((j, i) => {
+      if (scan.use[i] === 'arrival') Object.assign(p, { arrivalFrom: j.from, arrivalTo: canon(j.to), arrivalFlightNo: j.flightNo,
+        arrivalFlightDate: j.arriveDate, arrivalFlightTime: j.arriveTime, arrivalPnr: scan.pnr });
+      if (scan.use[i] === 'departure') Object.assign(p, { departureFrom: canon(j.from), departureTo: j.to, departureFlightNo: j.flightNo,
+        departureFlightDate: j.departDate, departureFlightTime: j.departTime, departureIntl: scan.intl, departurePnr: scan.pnr });
+    });
+    setF(prev => ({ ...prev, ...p }));
+    setScan(null);
+    toast('Ticket details filled in — check them, then click Save.');
+  }
   async function save() {
     const existing = item?.id ? { id: item.id } : {};
-    await saveItem('logistics', { ...f, ...existing, contactId, eventId: activeEventId });
-    onClose(); toast('Flight details saved.');
+    const next = { ...f, ...existing, contactId, eventId: activeEventId };
+    await saveItem('logistics', { ...next, ...syncPatch(next, cfg) });   // main Arrival / Departure follow the flight
+    onClose(); toast('Flight details saved. Arrival / Departure updated from the flight.');
   }
   return (
-    <Modal title="✈️ Flight details" onClose={onClose} onSave={save} saveLabel="Save flight details">
+    <Modal title="✈️ Flight details" onClose={onClose} onSave={scan?.busy ? null : save} saveLabel="Save flight details">
+      <PlacesDatalist places={places} />
+      <div className="ticket-scan">
+        <label className={'btn sm' + (scan?.busy ? ' disabled' : '')} style={{ cursor: scan?.busy ? 'wait' : 'pointer' }}>
+          📎 {scan?.busy ? 'Reading ticket…' : 'Upload ticket'}
+          <input type="file" accept="application/pdf,image/*" style={{ display: 'none' }} disabled={!!scan?.busy}
+            onChange={e => { readTicket(e.target.files?.[0]); e.target.value = ''; }} />
+        </label>
+        <span className="muted-sm">PDF, photo or screenshot. AI reads it and fills the form for you to check.</span>
+      </div>
+      {scan?.error && <div className="av-err" style={{ marginBottom: 10 }}>{scan.error}</div>}
+      {scan?.journeys && (
+        <div className="ticket-preview">
+          <div className="muted-sm" style={{ marginBottom: 6 }}>
+            Found{scan.airline ? ` · ${scan.airline}` : ''}{scan.pnr ? ` · PNR ${scan.pnr}` : ''}{scan.passengers.length ? ` · ${scan.passengers.join(', ')}` : ''}
+          </div>
+          {scan.nameOk === false && <div className="av-err" style={{ marginBottom: 8 }}>⚠ The passenger name doesn't look like {guestName}. Check this is the right ticket.</div>}
+          {scan.journeys.map((j, i) => (
+            <div key={i} className="tp-journey">
+              <div style={{ flex: 1, minWidth: 200 }}>
+                <b>{j.flightNo || 'Flight'}</b> · {j.from} → {j.to}
+                <div className="muted-sm">Departs {j.departDate} {j.departTime} · Lands {j.arriveDate} {j.arriveTime}{j.legs.length > 1 ? ` · ${j.legs.length} flights (connection)` : ''}</div>
+              </div>
+              <select className="statsel" value={scan.use[i]} onChange={e => setScan(sc => ({ ...sc, use: sc.use.map((u, k) => k === i ? e.target.value : u) }))}>
+                <option value="arrival">Use as arrival</option>
+                <option value="departure">Use as departure</option>
+                <option value="skip">Ignore</option>
+              </select>
+            </div>
+          ))}
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+            <button className="btn primary sm" onClick={fillFromScan} disabled={scan.use.every(u => u === 'skip')}>Fill the form</button>
+            <button className="btn ghost sm" onClick={() => setScan(null)}>Discard</button>
+          </div>
+        </div>
+      )}
       <div style={{ fontWeight: 600, fontSize: 12, color: 'var(--teal)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '.05em' }}>Arrival flight</div>
       <div className="grid2">
         <Field label="From"><input className="input" value={f.arrivalFrom} onChange={set('arrivalFrom')} placeholder="City or airport" /></Field>
-        <Field label="To"><input className="input" value={f.arrivalTo} onChange={set('arrivalTo')} placeholder="City or airport" /></Field>
+        <Field label="To (airport / terminal)"><input className="input" list={PLACES_LIST_ID} value={f.arrivalTo} onChange={set('arrivalTo')} placeholder="e.g. Mumbai T2" /></Field>
         <Field label="Flight number"><input className="input" value={f.arrivalFlightNo} onChange={set('arrivalFlightNo')} placeholder="e.g. AI 631" /></Field>
         <Field label="Arrival date"><input className="input" type="date" value={f.arrivalFlightDate} onChange={set('arrivalFlightDate')} /></Field>
         <Field label="Arrival time"><TimePicker value={f.arrivalFlightTime} onChange={v => setF(p => ({...p, arrivalFlightTime:v}))}/></Field>
       </div>
       <div style={{ fontWeight: 600, fontSize: 12, color: 'var(--teal)', margin: '14px 0 8px', textTransform: 'uppercase', letterSpacing: '.05em' }}>Departure flight</div>
       <div className="grid2">
-        <Field label="From"><input className="input" value={f.departureFrom} onChange={set('departureFrom')} placeholder="City or airport" /></Field>
+        <Field label="From (airport / terminal)"><input className="input" list={PLACES_LIST_ID} value={f.departureFrom} onChange={set('departureFrom')} placeholder="e.g. Mumbai T2" /></Field>
         <Field label="To"><input className="input" value={f.departureTo} onChange={set('departureTo')} placeholder="City or airport" /></Field>
         <Field label="Flight number"><input className="input" value={f.departureFlightNo} onChange={set('departureFlightNo')} placeholder="e.g. AI 632" /></Field>
         <Field label="Departure date"><input className="input" type="date" value={f.departureFlightDate} onChange={set('departureFlightDate')} /></Field>
         <Field label="Flight Departure Time"><TimePicker value={f.departureFlightTime} onChange={v => setF(p => ({...p, departureFlightTime:v}))}/></Field>
+        <Field label="Flight type">
+          <label className="chk" style={{ margin: '6px 0 0' }}><input type="checkbox" checked={!!f.departureIntl} onChange={e => setF(p => ({ ...p, departureIntl: e.target.checked }))} />
+            International (reach airport {cfg.intlReport} min before, else {cfg.domesticReport})</label>
+        </Field>
       </div>
     </Modal>
   );
 }
 
 /* ── Car modal ───────────────────────────────────────────────────── */
-function CarModal({ contactId, item, vendors, onClose, toast, activeEventId }) {
+function CarModal({ contactId, item, vendors, onClose, toast, activeEventId, cfg, places = [] }) {
   const [f, setF] = useState(() => ({
     carVendorId: '', carDriverId: '', carType: 'SUV',
     carPickupDate: '', carPickupTime: '', carDepartureDate: '', carDepartureTime: '',
@@ -1406,9 +1603,18 @@ function CarModal({ contactId, item, vendors, onClose, toast, activeEventId }) {
   async function save() {
     if (!f.carVendorId) { setErrs({ vendor: 'Select a vendor' }); return; }
     const existing = item?.id ? { id: item.id } : {};
-    await saveItem('logistics', { ...f, ...existing, contactId, eventId: activeEventId });
+    const next = { ...f, ...existing, contactId, eventId: activeEventId };
+    await saveItem('logistics', { ...next, ...syncPatch(next, cfg) });
     onClose(); toast('Car details saved.');
   }
+  const byCar = carIsTravel(f);               // Flight = Not required → the guest travels by car
+  const plan = travelPlan(f, cfg);
+  const Suggest = ({ s, onUse }) => s ? (
+    <div className="car-suggest">
+      <span>Suggested: <b>{shortDate(s.date)} {s.time}</b> <span className="muted-sm">({s.note})</span></span>
+      <button type="button" className="btn xs" onClick={onUse}>Use</button>
+    </div>
+  ) : null;
 
   return (
     <Modal title="🚗 Car details" onClose={onClose} onSave={save} saveLabel="Save car details">
@@ -1439,12 +1645,22 @@ function CarModal({ contactId, item, vendors, onClose, toast, activeEventId }) {
           </select>
         </Field>
       </div>
-      <div style={{ fontWeight: 600, fontSize: 12, color: 'var(--teal)', margin: '14px 0 8px', textTransform: 'uppercase', letterSpacing: '.05em' }}>Pickup</div>
+      <PlacesDatalist places={places} />
+      <div style={{ fontWeight: 600, fontSize: 12, color: 'var(--teal)', margin: '14px 0 8px', textTransform: 'uppercase', letterSpacing: '.05em' }}>
+        {byCar ? 'Pickup — guest travels to the event by car' : 'Pickup at airport'}
+      </div>
+      {!byCar && <Suggest s={plan.carPickup} onUse={() => setF(p => ({ ...p, carPickupDate: plan.carPickup.date, carPickupTime: plan.carPickup.time }))} />}
       <div className="grid2">
+        {byCar && <Field label="Pickup from (city / address)" style={{ gridColumn: '1/-1' }}>
+          <input className="input" list={PLACES_LIST_ID} value={f.carPickupFrom || ''} onChange={set('carPickupFrom')} placeholder="e.g. Pune — used with Travel times to work out arrival" />
+        </Field>}
         <Field label="Pickup date"><input className="input" type="date" value={f.carPickupDate} onChange={set('carPickupDate')} /></Field>
         <Field label="Pickup time"><TimePicker value={f.carPickupTime} onChange={v => setF(p => ({...p, carPickupTime:v}))}/></Field>
       </div>
-      <div style={{ fontWeight: 600, fontSize: 12, color: 'var(--teal)', margin: '14px 0 8px', textTransform: 'uppercase', letterSpacing: '.05em' }}>Departure by car</div>
+      <div style={{ fontWeight: 600, fontSize: 12, color: 'var(--teal)', margin: '14px 0 8px', textTransform: 'uppercase', letterSpacing: '.05em' }}>
+        {byCar ? 'Departure by car' : 'Drop to airport — pickup time'}
+      </div>
+      {!byCar && <Suggest s={plan.carDeparture} onUse={() => setF(p => ({ ...p, carDepartureDate: plan.carDeparture.date, carDepartureTime: plan.carDeparture.time }))} />}
       <div className="grid2">
         <Field label="Departure date"><input className="input" type="date" value={f.carDepartureDate} onChange={set('carDepartureDate')} /></Field>
         <Field label="Departure time"><TimePicker value={f.carDepartureTime} onChange={v => setF(p => ({...p, carDepartureTime:v}))}/></Field>
@@ -1454,7 +1670,7 @@ function CarModal({ contactId, item, vendors, onClose, toast, activeEventId }) {
 }
 
 /* ── Accommodation modal ─────────────────────────────────────────── */
-function AccommodationModal({ contactId, item, onClose, toast, activeEventId }) {
+function AccommodationModal({ contactId, item, onClose, toast, activeEventId, cfg, places = [] }) {
   const [f, setF] = useState(() => ({
     hotelName: '', checkinDate: '', checkinTime: '', checkoutDate: '', checkoutTime: '',
     ...item,
@@ -1468,14 +1684,16 @@ function AccommodationModal({ contactId, item, onClose, toast, activeEventId }) 
   async function save() {
     // Always save into existing logistics record if one exists
     const existing = item?.id ? { id: item.id } : {};
-    await saveItem('logistics', { ...f, ...existing, contactId, eventId: activeEventId });
+    const next = { ...f, ...existing, contactId, eventId: activeEventId };
+    await saveItem('logistics', { ...next, ...syncPatch(next, cfg) });   // hotel changes the car arrival point
     onClose(); toast('Accommodation details saved.');
   }
 
   return (
     <Modal title="🏨 Accommodation details" onClose={onClose} onSave={save} saveLabel="Save accommodation">
       <Field label="Hotel name">
-        <input className="input" value={f.hotelName} onChange={set('hotelName')} placeholder="Hotel name" />
+        <PlacesDatalist places={places} />
+        <input className="input" list={PLACES_LIST_ID} value={f.hotelName} onChange={set('hotelName')} placeholder="Hotel name" />
       </Field>
       <div className="grid2">
         <Field label="Check-in date"><input className="input" type="date" value={f.checkinDate} onChange={set('checkinDate')} /></Field>
@@ -1492,6 +1710,71 @@ function AccommodationModal({ contactId, item, onClose, toast, activeEventId }) 
   );
 }
 
+
+/* ── Travel times: minutes between places (both directions), buffers and peak hours ── */
+function TravelTimesModal({ cfg, places, canEdit, onClose, toast }) {
+  const rid = () => Math.random().toString(36).slice(2, 9);
+  const [f, setF] = useState(() => ({
+    venueName: cfg.venueName, landingBuffer: String(cfg.landingBuffer), domesticReport: String(cfg.domesticReport),
+    intlReport: String(cfg.intlReport), peak: cfg.peak,
+    routes: cfg.routes.length ? cfg.routes.map(r => ({ id: r.id || rid(), from: r.from || '', to: r.to || '', normal: r.normal ?? '', peak: r.peak ?? '' }))
+                              : [{ id: rid(), from: '', to: cfg.venueName, normal: '', peak: '' }],
+  }));
+  const [err, setErr] = useState('');
+  const setV = k => e => setF(p => ({ ...p, [k]: e.target.value }));
+  const setR = (i, k, v) => setF(p => ({ ...p, routes: p.routes.map((r, j) => j === i ? { ...r, [k]: v } : r) }));
+  async function save() {
+    setErr('');
+    const routes = f.routes.filter(r => r.from.trim() || r.to.trim());
+    for (const r of routes) {
+      if (!r.from.trim() || !r.to.trim()) { setErr('Every route needs both From and To.'); return; }
+      if (r.normal === '' || isNaN(parseInt(r.normal, 10))) { setErr(`Add the normal minutes for ${r.from} → ${r.to}.`); return; }
+    }
+    const bad = f.peak.split(',').map(x => x.trim()).filter(Boolean).find(x => !/^\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2}$/.test(x));
+    if (bad) { setErr(`Peak hours: "${bad}" isn't like 08:00-11:00.`); return; }
+    await saveItem('appConfig', {
+      id: TRAVEL_CFG_ID, venueName: f.venueName.trim() || 'Venue', peak: f.peak.trim(),
+      landingBuffer: parseInt(f.landingBuffer, 10) || 0, domesticReport: parseInt(f.domesticReport, 10) || 0, intlReport: parseInt(f.intlReport, 10) || 0,
+      routes: routes.map(r => ({ id: r.id, from: r.from.trim(), to: r.to.trim(), normal: parseInt(r.normal, 10), peak: r.peak === '' ? '' : parseInt(r.peak, 10) })),
+    });
+    toast('Travel times saved. Use "Update from bookings" if car arrival times need refreshing.');
+    onClose();
+  }
+  return (
+    <Modal title="🕒 Travel times" onClose={onClose} onSave={canEdit ? save : null} saveLabel="Save travel times">
+      <PlacesDatalist places={places} />
+      {!canEdit && <div className="mtg-note">View only — editing needs the "Edit configurations" permission.</div>}
+      {err && <div className="av-err">{err}</div>}
+      <fieldset disabled={!canEdit} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
+        <p className="muted-sm" style={{ marginTop: 0 }}>
+          Used to work out airport pickup times, arrival at the hotel and when to leave for the airport.
+          A route works both ways. Place names should match what you type in Flight / Hotel / Car (suggestions appear as you type).
+        </p>
+        <div className="grid2">
+          <Field label="Venue name"><input className="input" list={PLACES_LIST_ID} value={f.venueName} onChange={setV('venueName')} placeholder="e.g. NESCO" /></Field>
+          <Field label="Peak hours (comma-separated)"><input className="input" value={f.peak} onChange={setV('peak')} placeholder="08:00-11:00, 17:00-21:00" /></Field>
+          <Field label="Landing → car ready (min)"><input className="input" type="number" min={0} value={f.landingBuffer} onChange={setV('landingBuffer')} /></Field>
+          <Field label="Reach airport before domestic flight (min)"><input className="input" type="number" min={0} value={f.domesticReport} onChange={setV('domesticReport')} /></Field>
+          <Field label="Reach airport before international flight (min)"><input className="input" type="number" min={0} value={f.intlReport} onChange={setV('intlReport')} /></Field>
+        </div>
+        <div className="av-step" style={{ marginTop: 10 }}>Routes</div>
+        <div className="tt-routes">
+          <div className="tt-row tt-head"><span>From</span><span>To</span><span>Normal (min)</span><span>Peak (min)</span><span /></div>
+          {f.routes.map((r, i) => (
+            <div key={r.id} className="tt-row">
+              <input className="input" list={PLACES_LIST_ID} value={r.from} onChange={e => setR(i, 'from', e.target.value)} placeholder="Mumbai T2" aria-label="From" />
+              <input className="input" list={PLACES_LIST_ID} value={r.to} onChange={e => setR(i, 'to', e.target.value)} placeholder="Hotel / Venue" aria-label="To" />
+              <input className="input" type="number" min={0} value={r.normal} onChange={e => setR(i, 'normal', e.target.value)} placeholder="45" aria-label="Normal minutes" />
+              <input className="input" type="number" min={0} value={r.peak} onChange={e => setR(i, 'peak', e.target.value)} placeholder="optional" aria-label="Peak minutes" />
+              <button type="button" className="btn ghost xs" aria-label="Remove route" onClick={() => setF(p => ({ ...p, routes: p.routes.filter((_, j) => j !== i) }))}>✕</button>
+            </div>
+          ))}
+        </div>
+        <button type="button" className="linkbtn" style={{ marginTop: 8 }} onClick={() => setF(p => ({ ...p, routes: [...p.routes, { id: rid(), from: '', to: '', normal: '', peak: '' }] }))}>+ Add route</button>
+      </fieldset>
+    </Modal>
+  );
+}
 
 const SESSION_TYPES_NEW = ['Panel', 'Meal', 'Ceremony', 'Exhibition', 'Drone Show',
   'Media Bytes', 'Podcast', 'Hospitality', 'Miscellaneous'];
@@ -3190,12 +3473,29 @@ export function Reports({ store, activeEventId }) {
   const hasManualSahebji = cid => savedRows.some(r=>r.contactId===cid && !r.auto && /sahebji|one-on-one|one on one/i.test(r.event||''));
   const EDITABLE_SOURCES = ['Scheduling','Logistics','Sahebji'];
 
+  const travelCfg = getTravelCfg(store);
   const getAutoRows = (cid, deletedIds) => {
     const L = getL(cid);
     const autos = [];
+    const arrSrc = L.arrivalOverride ? 'manual' : (L.arrivalSource || 'manual');
     if (L.arrivalDate && L.arrivalTime) {
+      const event = arrSrc === 'flight' ? `Arrival at ${L.arrivalLocation || 'the Airport'}${L.arrivalFlightNo ? ` (${L.arrivalFlightNo})` : ''}`
+        : arrSrc === 'car' ? `Arrival at ${L.arrivalLocation || 'the venue'} by car`
+        : 'Arrival at the Airport';
       autos.push({ id:`auto_arrival_${cid}`, contactId:cid, date:L.arrivalDate, time:L.arrivalTime, srcDate:L.arrivalDate, srcTime:L.arrivalTime,
-        event:'Arrival at the Airport', pocRequired:false, auto:true, source:'Logistics' });
+        event, pocRequired:false, auto:true, source:'Logistics' });
+    }
+    /* Travel steps worked out from the flight / car + Travel times (edit them in Logistics) */
+    const plan = travelPlan(L, travelCfg);
+    plan.steps.forEach(st => {
+      if (st.key === 'land') return;                          // the arrival row above covers it
+      if (st.key === 'reach' && arrSrc === 'car') return;       // car arrival row already is "arrive at hotel"
+      autos.push({ id:`auto_travel_${st.key}_${cid}`, contactId:cid, date:st.date, time:st.time, srcDate:st.date, srcTime:st.time,
+        event:st.label, pocRequired:false, auto:true, source:'Travel' });
+    });
+    if (!plan.steps.some(st => st.key === 'depart') && L.departureDate && L.departureTime) {
+      autos.push({ id:`auto_travel_depart_${cid}`, contactId:cid, date:L.departureDate, time:L.departureTime, srcDate:L.departureDate, srcTime:L.departureTime,
+        event:`Departure${L.departureLocation ? ' from ' + L.departureLocation : ''}`, pocRequired:false, auto:true, source:'Travel' });
     }
     getContactSessions(cid).forEach(s => {
       const id = `auto_session_${s.id}__${cid}`;
@@ -3386,7 +3686,10 @@ export function Reports({ store, activeEventId }) {
           }
         } else if (row.source === 'Logistics') {
           const L = logistics.find(l=>l.contactId===cid) || { contactId:cid, eventId:activeEventId };
-          await saveItem('logistics',{ ...L, arrivalDate:newDate, arrivalTime:newTime });
+          // Changing a booked arrival here = a manual override; a planned one updates the plan
+          const booked = L.arrivalSource && L.arrivalSource !== 'manual';
+          await saveItem('logistics',{ ...L, arrivalDate:newDate, arrivalTime:newTime,
+            ...(booked ? { arrivalOverride:true } : { arrivalSource:'manual', plannedArrivalDate:newDate }) });
           const copy = savedRows.find(r=>r.id===autoId);
           if (copy) await saveItem('personalisedSchedule',{ ...copy, date:newDate, time:newTime });
           report.push('arrival updated in Logistics');
