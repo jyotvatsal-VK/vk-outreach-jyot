@@ -44,11 +44,27 @@ const TASK_MAP = [
 ];
 
 const norm = s => String(s||'').trim().toLowerCase().replace(/\s+/g,' ');
+// Header normalisation: punctuation → spaces, so "Contact No." == "contact no", "E-mail" == "e mail"
+const htok = s => String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+/* Header → field.
+   1. Exact match on normalised text.
+   2. Otherwise a key matches only if ALL its words appear as whole words in the header
+      ("Mobile Number" → 'mobile'). Short keys (≤3 chars, e.g. "to", "org") only match exactly,
+      so they can't hijack unrelated columns. The most specific (most words) match wins. */
 function fieldFor(header, map) {
-  const h = norm(header);
-  for (const m of map) if (m.keys.some(k=>h===k)) return m.field;
-  for (const m of map) if (m.keys.some(k=>h.includes(k)||k.includes(h))) return m.field;
-  return null;
+  const h = htok(header);
+  if (!h) return null;
+  for (const m of map) if (m.keys.some(k=>htok(k)===h)) return m.field;
+  const words = new Set(h.split(' '));
+  let best = null, bestLen = 0;
+  for (const m of map) for (const k of m.keys) {
+    const kt = htok(k);
+    if (kt.length <= 3) continue;
+    const kw = kt.split(' ');
+    const score = kw.length * 100 + kt.length; // more words first, then longer (more specific) words
+    if (kw.every(w => words.has(w)) && score > bestLen) { best = m.field; bestLen = score; }
+  }
+  return best;
 }
 
 /* find header row even if there are blank/logo rows at top */
@@ -191,65 +207,93 @@ export function downloadTemplate(type='contacts') {
 
 /* ---- Logistics import ---- */
 const LOGISTICS_MAP = [
+  // Field names match what the Logistics screen reads/saves (arrivalDate etc.).
+  // The old inbDate/inbTime names were never displayed anywhere, so imports looked empty.
   { keys: ['name','delegate name','guest name','full name','name of delegate'], field:'_matchName' },
   { keys: ['phone','mobile','contact','number'], field:'_matchPhone' },
-  { keys: ['arrival mode','mode','travel mode','inbound mode','flight/train/car'], field:'inbMode' },
-  { keys: ['arrival date','inbound date','date of arrival','arriving on'], field:'inbDate' },
-  { keys: ['arrival time','inbound time','time of arrival','arriving at'], field:'inbTime' },
-  { keys: ['arrival location','pickup location','airport','station','arriving at'], field:'inbLoc' },
-  { keys: ['hotel','accommodation','stay','hotel name'], field:'hotel' },
-  { keys: ['check in','checkin','check-in time'], field:'checkin' },
-  { keys: ['departure date','outbound date','date of departure','departing on'], field:'outDate' },
-  { keys: ['departure time','departs for airport','checkout time','departing at'], field:'outDepart' },
-  { keys: ['flight time','outbound flight','return flight'], field:'outFlight' },
-  { keys: ['special','dietary','requirements','special requirements','diet'], field:'special' },
+  { keys: ['arrival mode','mode','travel mode','inbound mode','flight/train/car'], field:'arrivalMode' },
+  { keys: ['arrival date','inbound date','date of arrival','arriving on'], field:'arrivalDate' },
+  { keys: ['arrival time','inbound time','time of arrival'], field:'arrivalTime' },
+  { keys: ['arrival location','pickup location','airport','station','arriving at'], field:'arrivalLocation' },
+  { keys: ['arrival flight','arrival flight no','inbound flight','flight no','flight number'], field:'arrivalFlightNo' },
+  { keys: ['hotel','accommodation','stay','hotel name'], field:'hotelName' },
+  { keys: ['check in','checkin','check-in time','check in time'], field:'checkinTime' },
+  { keys: ['departure date','outbound date','date of departure','departing on'], field:'departureDate' },
+  { keys: ['departure time','departs for airport','checkout time','departing at'], field:'departureTime' },
+  { keys: ['departure flight','departure flight no','return flight','outbound flight'], field:'departureFlightNo' },
+  { keys: ['flight time','departure flight time','return flight time'], field:'departureFlightTime' },
+  { keys: ['special','dietary','requirements','special requirements','diet','remarks'], field:'remarks' },
 ];
 
 export async function parseLogisticsFile(file) {
   return await parseFile(file, LOGISTICS_MAP, '_matchName');
 }
 
+/* Build the logistics item for one sheet row once its contact is known */
+export function resolveLogisticsRow(row, contact, existingLogistics) {
+  const { _matchName, _matchPhone, ...fields } = row;
+  const existing = existingLogistics.find(l => l.contactId === contact.id || l.id === contact.id);
+  return {
+    mode: existing ? 'update' : 'new',
+    contactId: contact.id,
+    contactName: contact.name,
+    sheetName: _matchName || '',
+    item: existing ? { ...existing, ...fields, contactId: contact.id } : { contactId: contact.id, ...fields },
+  };
+}
+
+/* Match each sheet row to a contact.
+   - Phone (last 10 digits) matching exactly one contact → matched
+   - Name matching exactly one contact (letters/digits only, case-insensitive) → matched
+   - Anything else that looks close (partial name, several equal names/phones) → 'ambiguous',
+     with candidates for the user to pick. Nothing is ever applied on a guess. */
 export function planLogisticsImport(parsedRows, existingContacts, existingLogistics) {
   const normPhone = p => String(p||'').replace(/[^\d]/g,'').slice(-10);
   const normName  = n => String(n||'').toLowerCase().replace(/[^a-z0-9]/g,'');
 
-  const plan = [];
-  for (const row of parsedRows) {
-    // Try to match a contact by phone first, then by name
-    let contact = null;
-    if (row._matchPhone) {
-      const ph = normPhone(row._matchPhone);
-      contact = existingContacts.find(c => normPhone(c.phone) === ph && ph.length >= 7);
+  const plan = parsedRows.map(row => {
+    const sheetName = row._matchName || '(no name)';
+    const ph = normPhone(row._matchPhone);
+    const nm = normName(row._matchName);
+
+    if (ph.length >= 7) {
+      const byPhone = existingContacts.filter(c => normPhone(c.phone) === ph);
+      if (byPhone.length === 1) return resolveLogisticsRow(row, byPhone[0], existingLogistics);
+      if (byPhone.length > 1) return { mode:'ambiguous', sheetName, row, reason:'Same phone on several contacts', candidates: byPhone.map(c=>({id:c.id,name:c.name,org:c.org})) };
     }
-    if (!contact && row._matchName) {
-      const nm = normName(row._matchName);
-      contact = existingContacts.find(c => {
+    if (nm) {
+      const exact = existingContacts.filter(c => normName(c.name) === nm);
+      if (exact.length === 1) return resolveLogisticsRow(row, exact[0], existingLogistics);
+      if (exact.length > 1) return { mode:'ambiguous', sheetName, row, reason:'Several contacts share this name', candidates: exact.map(c=>({id:c.id,name:c.name,org:c.org})) };
+      const partial = nm.length >= 4 ? existingContacts.filter(c => {
         const cn = normName(c.name);
-        return nm && cn && (nm === cn || nm.includes(cn) || cn.includes(nm));
-      });
+        return cn.length >= 4 && (cn.includes(nm) || nm.includes(cn));
+      }) : [];
+      if (partial.length) return { mode:'ambiguous', sheetName, row, reason:'Partial name match — please confirm', candidates: partial.map(c=>({id:c.id,name:c.name,org:c.org})) };
     }
+    return { mode:'unmatched', sheetName, contactName: sheetName, item:null };
+  });
 
-    // Strip the match helper fields
-    const { _matchName, _matchPhone, ...fields } = row;
-
-    if (contact) {
-      const existing = existingLogistics.find(l => l.contactId === contact.id || l.id === contact.id);
-      plan.push({
-        mode: existing ? 'update' : 'new',
-        contactId: contact.id,
-        contactName: contact.name,
-        item: existing
-          ? { ...existing, ...fields, contactId: contact.id }
-          : { contactId: contact.id, ...fields },
-      });
-    } else {
-      plan.push({ mode: 'unmatched', contactName: row._matchName || '(no name)', item: null });
-    }
-  }
   return {
     plan,
     newCount:       plan.filter(p => p.mode === 'new').length,
     updateCount:    plan.filter(p => p.mode === 'update').length,
+    ambiguousCount: plan.filter(p => p.mode === 'ambiguous').length,
     unmatchedCount: plan.filter(p => p.mode === 'unmatched').length,
   };
+}
+
+/* ---- Task import: turn Department / Owner text into real links ---- */
+export const nameKey = s => String(s||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+export function matchDept(name, depts) {
+  const k = nameKey(name); if (!k) return null;
+  return depts.find(d => nameKey(d.name) === k) || null;
+}
+export function matchVolunteer(name, vols) {
+  const k = nameKey(name); if (!k) return null;
+  const exact = vols.filter(v => nameKey(v.name) === k);
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1 || k.length < 3) return null;
+  const starts = vols.filter(v => nameKey(v.name).startsWith(k));   // "Jinal" → "Jinalben Mehta", only if unique
+  return starts.length === 1 ? starts[0] : null;
 }

@@ -1,22 +1,44 @@
 import { logAction } from "./activity";
+import { applyContactFilter } from './contactFilter';
 import { useEffect, useState } from 'react';
 import { db } from './firebase';
 import {
-  collection, doc, onSnapshot, setDoc, deleteDoc,
-  writeBatch, serverTimestamp, getDoc,
+  collection, doc, onSnapshot, setDoc, deleteDoc, updateDoc,
+  writeBatch, serverTimestamp, getDoc, getDocs, query, where, Timestamp,
 } from 'firebase/firestore';
 
 export const COLLECTIONS = [
   'events', 'contacts', 'logistics', 'sessions', 'assignments',
   'founder', 'volunteers', 'poc', 'departments', 'tasks', 'felicitation',
   'checklist', 'contact_notes', 'activity_log',
+  'personalisedSchedule', 'personalisedMandatory',
+  'availability', 'sahebjiSlots', 'appConfig', 'trash',
+  'carVendors', 'minuteItems',
 ];
+
+/* Collections whose rows carry an eventId and belong to one event */
+export const EVENT_SCOPED = [
+  'contacts', 'logistics', 'sessions', 'assignments', 'founder', 'poc', 'tasks',
+  'felicitation', 'checklist', 'contact_notes', 'personalisedSchedule',
+  'personalisedMandatory', 'availability', 'sahebjiSlots', 'minuteItems',
+];
+
+/* Audit context — set once by AuthProvider so every write is logged,
+   even when the caller doesn't pass a user context. */
+let auditCtx = null;
+export function setAuditContext(user, profile) { auditCtx = user ? { user, profile } : null; }
+const NO_LOG = new Set(['trash', 'activity_log']);
 
 export const FOUNDER_STRING =
   "One on One Meeting with His Holiness Spiritual Sovereign Jainacharya Yugbhushan Suri, 79th Successor to Tirthankar Shri Mahavir Swami at VIP Lounge";
 
-/* Active-event pointer stored in Firestore so all users share the same selection */
-const ACTIVE_DOC = 'app_state/activeEvent';
+/* Active event
+   - app_state/activeEvent  = org-wide DEFAULT (only Master / settings.config can change it)
+   - users/{uid}.activeEventId = each person's own selection (switching no longer affects others) */
+export async function setMyActiveEventId(uid, eventId) {
+  if (!db || !uid) return;
+  await updateDoc(doc(db, 'users', uid), { activeEventId: eventId || null });
+}
 
 export async function getActiveEventId() {
   try {
@@ -25,6 +47,7 @@ export async function getActiveEventId() {
   } catch { return null; }
 }
 export async function setActiveEventId(eventId) {
+  // Sets the org-wide default. Rules allow this only for Master / settings.config.
   await setDoc(doc(db, 'app_state', 'activeEvent'), { eventId }, { merge: true });
 }
 
@@ -36,7 +59,7 @@ export function useLiveData() {
   const [activeEventId, setActiveEventIdState] = useState(null);
 
   useEffect(() => {
-    if (!db) { setReady && setReady(true); return; }
+    if (!db) { setData(Object.fromEntries(COLLECTIONS.map((c) => [c, []]))); return; }
     // subscribe to app_state/activeEvent
     const unsubActive = onSnapshot(doc(db, 'app_state', 'activeEvent'), (snap) => {
       setActiveEventIdState(snap.exists() ? snap.data().eventId : null);
@@ -46,21 +69,27 @@ export function useLiveData() {
       onSnapshot(collection(db, name), (snap) => {
         const rows = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
         setData((prev) => ({ ...prev, [name]: rows }));
-      }, (err) => console.error('snapshot error', name, err))
+      }, (err) => {
+        // Permission denied (or offline failure) must not leave the app stuck on "Connecting…"
+        console.warn('snapshot error', name, err?.code || err);
+        setData((prev) => ({ ...prev, [name]: prev[name] || [] }));
+      })
     );
     return () => { unsubActive(); unsubs.forEach((u) => u()); };
   }, []);
 
-  return { ...data, activeEventId };
+  return { ...data, defaultEventId: activeEventId };
 }
 
-/* Filter store collections to the active event */
-export function scopedStore(store, eventId) {
+/* Filter store collections to the active event, and optionally apply a contact filter */
+export function scopedStore(store, eventId, contactFilter) {
   if (!eventId) return store;
   const scoped = (col) => (store[col] || []).filter((r) => r.eventId === eventId);
+  const scopedContacts = scoped('contacts');
+  const filteredContacts = contactFilter ? applyContactFilter(scopedContacts, contactFilter) : scopedContacts;
   return {
     ...store,
-    contacts: scoped('contacts'),
+    contacts: filteredContacts,
     logistics: scoped('logistics'),
     sessions: scoped('sessions'),
     assignments: scoped('assignments'),
@@ -74,6 +103,15 @@ export function scopedStore(store, eventId) {
     // volunteers and departments are shared across events
     volunteers: store.volunteers || [],
     departments: store.departments || [],
+    // these are event-scoped but keyed differently
+    personalisedSchedule: scoped('personalisedSchedule'),
+    personalisedMandatory: scoped('personalisedMandatory'),
+    availability: (store.availability || []).filter(r => r.eventId === eventId || r.day === 'depts' || r.day === 'pre-event'),
+    sahebjiSlots: scoped('sahebjiSlots'),
+    appConfig: store.appConfig || [],
+    trash: store.trash || [],
+    carVendors: store.carVendors || [],          // shared across events
+    minuteItems: scoped('minuteItems'),
   };
 }
 
@@ -83,13 +121,15 @@ export async function saveItem(name, item, userCtx) {
   const id = item.id || crypto.randomUUID();
   const { id: _omit, ...rest } = item;
   await setDoc(doc(db, name, id), { ...rest, _updated: serverTimestamp() }, { merge: true });
-  if (userCtx) logAction(userCtx.user, userCtx.profile, (item.id ? "Updated " : "Added ") + name, item.name || item.title || id);
+  const ctx = userCtx || auditCtx;
+  if (ctx && !NO_LOG.has(name)) logAction(ctx.user, ctx.profile, (item.id ? "Updated " : "Added ") + name, item.name || item.title || id);
   return id;
 }
 export async function removeItem(name, id, userCtx) {
   if (!db) return;
   await deleteDoc(doc(db, name, id));
-  if (userCtx) logAction(userCtx.user, userCtx.profile, "Deleted " + name, id);
+  const ctx = userCtx || auditCtx;
+  if (ctx && !NO_LOG.has(name)) logAction(ctx.user, ctx.profile, "Deleted " + name, id);
 }
 export async function batchUpsert(name, items) {
   for (let i = 0; i < items.length; i += 450) {
@@ -101,6 +141,43 @@ export async function batchUpsert(name, items) {
     });
     await batch.commit();
   }
+  if (auditCtx && items.length) logAction(auditCtx.user, auditCtx.profile, 'Bulk saved ' + name, items.length + ' rows');
+}
+
+/* Soft-delete an entire event: every event-scoped record goes to trash under one
+   bundleId (restorable together for 30 days), then originals are removed.
+   Done in batches so it is fast and never half-finished per chunk. */
+export async function softDeleteEvent(ev, deletedBy = '') {
+  if (!db || !ev?.id) return 0;
+  const now = Date.now();
+  const bundleId = `event_${ev.id}_${now}`;
+  const expiresAt = now + 30 * 24 * 60 * 60 * 1000;
+  const rows = [];
+  for (const col of EVENT_SCOPED) {
+    const snap = await getDocs(query(collection(db, col), where('eventId', '==', ev.id)));
+    snap.docs.forEach((d) => rows.push({ col, id: d.id, data: { id: d.id, ...d.data() } }));
+  }
+  rows.push({ col: 'events', id: ev.id, data: ev, head: true });
+
+  const trashDoc = (r) => ({
+    originalCollection: r.col, originalId: r.id, data: r.data, linked: [],
+    bundleId, bundleLabel: ev.name || ev.id, bundleHead: !!r.head,
+    bundleCount: r.head ? rows.length - 1 : undefined,
+    deletedAt: now, expiresAt, expireAt: Timestamp.fromMillis(expiresAt), deletedBy,
+  });
+  // 2 ops per record (trash write + delete) → 200 records per batch stays under the 500 limit
+  for (let i = 0; i < rows.length; i += 200) {
+    const batch = writeBatch(db);
+    rows.slice(i, i + 200).forEach((r) => {
+      const t = trashDoc(r);
+      if (t.bundleCount === undefined) delete t.bundleCount;
+      batch.set(doc(db, 'trash', `trash_${r.col}_${r.id}_${now}`), t);
+      batch.delete(doc(db, r.col, r.id));
+    });
+    await batch.commit();
+  }
+  if (auditCtx) logAction(auditCtx.user, auditCtx.profile, 'Deleted event', `${ev.name} (${rows.length - 1} records to trash)`);
+  return rows.length - 1;
 }
 
 /* seed — now everything gets an eventId */
@@ -114,8 +191,8 @@ export async function seedSampleData(eventId) {
     { id: 'c4', eventId: eid, name: 'Prashant Sharma', honor: '', suffix: 'Ji', desig: 'Economist', org: 'Policy Research Institute', field: 'Economics', phone: '+91 98xxx xxxxx', email: '', liaisonName: 'Mr. Nair', liaisonPhone: '', status: 'Pending', type: 'Panelist', remark: 'Follow up.', last: '2025-12-12' },
   ];
   const logistics = [
-    { id: 'c1_l', eventId: eid, contactId: 'c1', inbMode: 'Flight', inbDate: '2026-01-18', inbTime: '12:20', inbLoc: 'Mumbai Airport', hotel: 'Taj President, IHCL', checkin: '13:30', outDate: '2026-01-20', outDepart: '07:00', outFlight: '09:30', special: 'Vegetarian (Jain).' },
-    { id: 'c2_l', eventId: eid, contactId: 'c2', inbMode: 'Car', inbDate: '2026-01-18', inbTime: '09:10', inbLoc: 'Venue', hotel: '', checkin: '', outDate: '2026-01-18', outDepart: '12:15', outFlight: '', special: 'Day visitor.' },
+    { id: 'c1_l', eventId: eid, contactId: 'c1', arrivalMode: 'Flight', arrivalDate: '2026-01-18', arrivalTime: '12:20', arrivalLocation: 'Mumbai Airport', hotelName: 'Taj President, IHCL', checkinTime: '13:30', departureDate: '2026-01-20', departureTime: '07:00', departureFlightTime: '09:30', remarks: 'Vegetarian (Jain).' },
+    { id: 'c2_l', eventId: eid, contactId: 'c2', arrivalMode: 'Car', arrivalDate: '2026-01-18', arrivalTime: '09:10', arrivalLocation: 'Venue', hotelName: '', checkinTime: '', departureDate: '2026-01-18', departureTime: '12:15', remarks: 'Day visitor.' },
   ];
   const sessions = [
     { id: 's10', eventId: eid, date: '2026-01-17', start: '09:00', end: '21:00', title: 'Exhibition', topic: '', type: 'Exhibition' },
@@ -155,5 +232,6 @@ export async function seedSampleData(eventId) {
   ];
   const all = { events: event, contacts, logistics, sessions, assignments, founder, volunteers, poc, departments, tasks };
   for (const [name, rows] of Object.entries(all)) await batchUpsert(name, rows);
-  await setActiveEventId(eid);
+  if (auditCtx?.user?.uid) await setMyActiveEventId(auditCtx.user.uid, eid);
+  try { await setActiveEventId(eid); } catch { /* only Master / settings.config may set the org default */ }
 }

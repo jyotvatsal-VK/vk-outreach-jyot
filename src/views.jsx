@@ -1,12 +1,58 @@
-import { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { saveItem, removeItem, batchUpsert } from './data';
-import { useAuth } from './auth';
+import { trashItem, restoreTrashItem, purgeExpiredTrash, purgeTrashItem } from './trash_utils';
+import { hasPermission } from './permissions';
+import { useAuth, updateMyProfile } from './auth';
+import { hasActiveFilter, filterSummary } from './contactFilter';
 import {
   esc, initials, displayName, toMin, fmtDate, shortDate,
   buildPersonalSchedule, buildEventSchedule, buildFounderSchedule,
+  localISO, todayISO, tomorrowISO,
 } from './schedule';
 import { ICON, Modal, Field, Empty, SearchBox, useToast } from './ui';
-import { parseContactsFile, planImport, downloadTemplate, parseSessionsFile, planSessionsImport, parseVolunteersFile, planVolunteersImport, parseTasksFile, planTasksImport } from './excel';
+
+/* ── DeleteModal — reusable confirm-delete dialog ── */
+function DeleteModal({ label, onClose, onConfirm }) {
+  return (
+    <div className="scrim" onMouseDown={onClose}>
+      <div className="modal" onMouseDown={e=>e.stopPropagation()} style={{maxWidth:360}}>
+        <div className="modal-head">
+          <h2>Delete?</h2>
+          <button className="x" onClick={onClose}>✕</button>
+        </div>
+        <div className="modal-body">
+          <p style={{fontSize:13}}>
+            Are you sure you want to delete <strong>{label}</strong>?
+            This will be moved to trash and can be restored within 30 days from Settings.
+          </p>
+        </div>
+        <div className="modal-foot">
+          <button className="btn" onClick={onClose}>Cancel</button>
+          <button className="btn danger" onClick={onConfirm}>Delete</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Error boundary — catches render crashes, shows message instead of blank ── */
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(e) { return { error: e }; }
+  componentDidCatch(e, info) { console.error('JYOT render error:', e, info); }
+  render() {
+    if (this.state.error) return (
+      <div style={{padding:32,textAlign:'center'}}>
+        <div style={{fontSize:32,marginBottom:12}}>⚠️</div>
+        <div style={{fontWeight:600,fontSize:16,marginBottom:8}}>Something went wrong</div>
+        <div style={{color:'var(--muted)',fontSize:13,marginBottom:16}}>{String(this.state.error)}</div>
+        <button className="btn primary sm" onClick={()=>this.setState({error:null})}>Try again</button>
+      </div>
+    );
+    return this.props.children;
+  }
+}
+import { parseContactsFile, planImport, downloadTemplate, parseSessionsFile, planSessionsImport, parseVolunteersFile, planVolunteersImport, parseTasksFile, planTasksImport, matchDept, matchVolunteer } from './excel';
 
 const STATUSES = ['Pending', 'Contacted', 'Tentative', 'Confirmed', 'Declined'];
 const TYPES = ['Panelist', 'VIP', 'Podcast Guest', 'Guest'];
@@ -15,7 +61,124 @@ const SESSION_TYPES = ['Panel', 'Meal', 'Ceremony', 'Exhibition', 'Podcast', 'Co
 const SHIFTS = ['Full day', 'Morning', 'Afternoon', 'Evening'];
 
 const S = (store, n) => store[n] || [];
-const sbadge = (s) => <span className={'badge b-' + s.toLowerCase().replace(/ /g, '-')}>{s}</span>;
+const sbadge = (s) => <span className={'badge b-' + (s||'').toLowerCase().replace(/ /g, '-')}>{s}</span>;
+
+/* ══ Sorting & Filtering utilities ════════════════════════════════ */
+function useSortFilter(items, defaultSort) {
+  const [sortKey, setSortKey] = useState(defaultSort?.key || '');
+  const [sortDir, setSortDir] = useState(defaultSort?.dir || 'asc');
+  const [filters, setFilters] = useState({});
+
+  function toggleSort(key) {
+    if (sortKey === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    else { setSortKey(key); setSortDir('asc'); }
+  }
+
+  function setFilter(key, val) {
+    setFilters(prev => ({ ...prev, [key]: val }));
+  }
+
+  function clearFilters() { setFilters({}); }
+
+  const sorted = useMemo(() => {
+    let result = [...(items || [])];
+    // Apply filters
+    Object.entries(filters).forEach(([key, val]) => {
+      if (!val || val === 'all') return;
+      result = result.filter(item => {
+        const v = String(item[key] || '').toLowerCase();
+        return v.includes(val.toLowerCase());
+      });
+    });
+    // Apply sort
+    if (sortKey) {
+      result.sort((a, b) => {
+        const av = String(a[sortKey] || '').toLowerCase();
+        const bv = String(b[sortKey] || '').toLowerCase();
+        return sortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+      });
+    }
+    return result;
+  }, [items, sortKey, sortDir, filters]);
+
+  return { sorted, sortKey, sortDir, toggleSort, filters, setFilter, clearFilters };
+}
+
+function SortHeader({ label, sortKey, currentKey, dir, onSort, style }) {
+  const active = currentKey === sortKey;
+  return (
+    <th onClick={() => onSort(sortKey)}
+      style={{ cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap', ...style }}
+      title={`Sort by ${label}`}>
+      {label}
+      <span style={{ marginLeft: 4, fontSize: 10, color: active ? 'var(--teal)' : 'var(--faint)' }}>
+        {active ? (dir === 'asc' ? '▲' : '▼') : '⇅'}
+      </span>
+    </th>
+  );
+}
+
+function FilterBar({ filters, setFilter, clearFilters, fields }) {
+  const hasActive = fields.some(f => filters[f.key] && filters[f.key] !== 'all');
+  return (
+    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', padding: '8px 0', marginBottom: 4 }}>
+      {fields.map(f => f.options ? (
+        <select key={f.key} className="statsel"
+          style={{ fontSize: 12, color: filters[f.key] && filters[f.key] !== 'all' ? 'var(--teal)' : 'var(--muted)' }}
+          value={filters[f.key] || 'all'}
+          onChange={e => setFilter(f.key, e.target.value)}>
+          <option value="all">{f.label}: All</option>
+          {f.options.map(o => <option key={o} value={o}>{o}</option>)}
+        </select>
+      ) : (
+        <input key={f.key} className="input"
+          style={{ fontSize: 12, padding: '4px 10px', width: 140 }}
+          value={filters[f.key] || ''}
+          onChange={e => setFilter(f.key, e.target.value)}
+          placeholder={`Filter ${f.label}…`} />
+      ))}
+      {hasActive && (
+        <button className="btn ghost xs" onClick={clearFilters}
+          style={{ fontSize: 11.5, color: 'var(--rose)' }}>✕ Clear filters</button>
+      )}
+    </div>
+  );
+}
+
+/* ── Permission helper — reads from current user profile ─────────── */
+function usePerm() {
+  const { profile } = useAuth();
+  return {
+    can: (key) => hasPermission(profile, key),
+    isMaster: profile?.role === 'Master',
+  };
+}
+
+/* ── Lock icon shown when action is not permitted ────────────────── */
+function NoAccess({ label }) {
+  return (
+    <span title={`You don't have permission: ${label}`}
+      style={{ fontSize: 12, color: 'var(--faint)', cursor: 'not-allowed', padding: '4px 8px' }}>
+      🔒
+    </span>
+  );
+}
+
+
+/* ── Quick export helper — downloads current filtered list as Excel ── */
+async function quickExport(filename, rows, cols) {
+  const XLSX = await import('xlsx');
+  const data = rows.map(r => {
+    const o = {};
+    cols.forEach(([key, label]) => { o[label] = r[key] ?? ''; });
+    return o;
+  });
+  const ws = XLSX.utils.json_to_sheet(data);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Export');
+  XLSX.writeFile(wb, filename + '_' + todayISO() + '.xlsx');
+}
+
 
 /* ============================ DASHBOARD ============================ */
 export function Dashboard({ store, go }) {
@@ -24,7 +187,7 @@ export function Dashboard({ store, go }) {
   const conf = contacts.filter((c) => c.status === 'Confirmed');
   const pend = contacts.filter((c) => c.status === 'Pending' || c.status === 'Contacted');
   const logi = S(store, 'logistics');
-  const hasLogi = (id) => logi.some((x) => x.contactId === id && (x.hotel || x.inbTime));
+  const hasLogi = (id) => logi.some((x) => x.contactId === id && (x.hotelName || x.arrivalDate || x.arrivalTime || x.hotel || x.inbTime));
   const noLog = conf.filter((c) => !hasLogi(c.id));
   const vols = S(store, 'volunteers');
   const depts = S(store, 'departments');
@@ -83,33 +246,267 @@ export function Dashboard({ store, go }) {
     );
   }
 
-  // Master / default view
+  // Master / default view — built from widgets each user can customise
+  const sessions   = S(store,'sessions');
+  const assignments= S(store,'assignments');
+  const openTasks  = tasks.filter(t=>t.status!=='Done');
+  const blockedTasks = tasks.filter(t=>{
+    const bl=(t.blockedBy||[]).map(id=>tasks.find(x=>x.id===id)).filter(Boolean).filter(b=>b.status!=='Done');
+    return bl.length>0;
+  });
+
+  const statCards = [
+    { label:'Invitees',       val:contacts.length, sub:`${conf.length} confirmed · ${pend.length} pending`,  color:'#0F6E56', emoji:'👥', onClick:()=>go('outreach') },
+    { label:'Logistics',      val:conf.length,     sub:`${noLog.length} need travel details`,                color:'#1976D2', emoji:'🚌', onClick:()=>go('logistics') },
+    { label:'Sessions',       val:sessions.length, sub:`${assignments.length} panel assignments`,            color:'#7B1FA2', emoji:'📅', onClick:()=>go('schedule') },
+    { label:'Open tasks',     val:openTasks.length,sub:`${vols.length} volunteers · ${blockedTasks.length} blocked`, color:'#E65100', emoji:'✅', onClick:()=>go('depts') },
+  ];
+
+  const ctx = { store, go, statCards, pend, noLog, blockedTasks, conf };
+  return <CustomDashboard ctx={ctx} />;
+}
+
+/* ══ Dashboard widgets ═════════════════════════════════════════════
+   Each widget: id, title, perm (view permission needed), default visibility/size.
+   Layout per user is saved on users/{uid}.dashboard; Master can save a default
+   for everyone in appConfig/dashboardDefault. */
+const DASH_WIDGETS = [
+  { id:'stats',     title:'Key numbers',             perm:null,            on:true,  size:'full' },
+  { id:'arrivals',  title:'Arrival countdown',       perm:'logistics.view', on:true,  size:'full' },
+  { id:'followups', title:'Follow-ups due',          perm:'outreach.view', on:true,  size:'full' },
+  { id:'deptDone',  title:'Department completed',    perm:'depts.view',    on:true,  size:'full' },
+  { id:'attention', title:'Needs attention',         perm:null,            on:true,  size:'full' },
+  { id:'today',     title:'Today at the event',      perm:'logistics.view', on:false, size:'full' },
+  { id:'sahebji',   title:"Today's Sahebji meetings", perm:'schedule.view', on:false, size:'half' },
+  { id:'pocGaps',   title:'POC gaps',                perm:'poc.view',      on:false, size:'half' },
+  { id:'dueTasks',  title:'Tasks due soon',          perm:'depts.view',    on:false, size:'half' },
+  { id:'flow',      title:'How the app connects',    perm:null,            on:true,  size:'full' },
+];
+const builtinLayout = () => ({ order: DASH_WIDGETS.map(w => w.id), hidden: DASH_WIDGETS.filter(w => !w.on).map(w => w.id), size: Object.fromEntries(DASH_WIDGETS.map(w => [w.id, w.size])) });
+function normaliseLayout(l) {
+  const base = builtinLayout();
+  if (!l || !Array.isArray(l.order)) return base;
+  const known = new Set(DASH_WIDGETS.map(w => w.id));
+  const order = l.order.filter(id => known.has(id));
+  DASH_WIDGETS.forEach(w => { if (!order.includes(w.id)) order.push(w.id); });   // new widgets appear at the end
+  const newIds = DASH_WIDGETS.map(w => w.id).filter(id => !l.order.includes(id));
+  const hidden = [...(l.hidden || []).filter(id => known.has(id)), ...newIds.filter(id => base.hidden.includes(id))];
+  return { order, hidden, size: { ...base.size, ...(l.size || {}) } };
+}
+
+function CustomDashboard({ ctx }) {
+  const { store, go } = ctx;
+  const { user, profile } = useAuth();
+  const toast = useToast();
+  const isMaster = profile?.role === 'Master';
+  const orgDefault = (store.appConfig || []).find(c => c.id === 'dashboardDefault');
+  const saved = normaliseLayout(profile?.dashboard || (orgDefault && { order: orgDefault.order, hidden: orgDefault.hidden, size: orgDefault.size }));
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(saved);
+  const allowed = w => !w.perm || hasPermission(profile, w.perm);
+  const widgets = DASH_WIDGETS.filter(allowed);
+  const byId = Object.fromEntries(widgets.map(w => [w.id, w]));
+  const layout = editing ? draft : saved;
+
+  function startEdit() { setDraft(saved); setEditing(true); }
+  function move(id, dir) {
+    setDraft(d => { const o = [...d.order]; const i = o.indexOf(id), j = i + dir; if (j < 0 || j >= o.length) return d; [o[i], o[j]] = [o[j], o[i]]; return { ...d, order: o }; });
+  }
+  const toggleHidden = id => setDraft(d => ({ ...d, hidden: d.hidden.includes(id) ? d.hidden.filter(x => x !== id) : [...d.hidden, id] }));
+  const setSize = (id, sz) => setDraft(d => ({ ...d, size: { ...d.size, [id]: sz } }));
+  async function save() {
+    try { await updateMyProfile(user.uid, { dashboard: draft }); setEditing(false); toast('Dashboard saved.'); }
+    catch (e) { toast('Could not save: ' + (e.code || e.message)); }
+  }
+  async function resetToDefault() {
+    const def = normaliseLayout(orgDefault && { order: orgDefault.order, hidden: orgDefault.hidden, size: orgDefault.size });
+    try { await updateMyProfile(user.uid, { dashboard: null }); setDraft(def); setEditing(false); toast('Dashboard reset to the default.'); }
+    catch (e) { toast('Could not reset: ' + (e.code || e.message)); }
+  }
+  async function saveAsOrgDefault() {
+    try { await saveItem('appConfig', { id: 'dashboardDefault', ...draft }); toast('Saved as the default layout for everyone.'); }
+    catch (e) { toast('Could not save default: ' + (e.code || e.message)); }
+  }
+
+  const visible = layout.order.filter(id => byId[id] && !layout.hidden.includes(id));
+
   return (
     <>
-      <div className="page-head"><div className="ph-txt"><h1>Dashboard</h1><p>One connected view for this event. Every number reads from the same records each department works from.</p></div></div>
-      <div className="cards">
-        <Stat label="Invitees" icon={ICON.outreach} val={contacts.length} hint={`${conf.length} confirmed · ${pend.length} pending`} />
-        <Stat label="In logistics" icon={ICON.truck} val={conf.length} hint={`${noLog.length} need travel details`} />
-        <Stat label="Sessions" icon={ICON.cal} val={S(store, 'sessions').length} hint={`${S(store, 'assignments').length} panel assignments`} />
-        <Stat label="Open tasks" icon={ICON.dept} val={tasks.filter((t) => t.status !== 'Done').length} hint={`${S(store, 'volunteers').length} volunteers`} />
+      <div className="page-head">
+        <div className="ph-txt">
+          <h1>Dashboard</h1>
+          <p>One connected view for this event. Choose what you see with Customise.</p>
+        </div>
+        {!editing && <button className="btn sm" onClick={startEdit}>{ICON.edit}Customise</button>}
       </div>
-      <div className="flow-note">{ICON.info}<div><b>Core flow:</b> in <b>Outreach</b>, set a pending invitee to <b>Confirmed</b> and a logistics record appears automatically. In <b>Generate</b>, produce a personalised schedule assembled from every department. Use <b>Import from Excel</b> in Outreach to bulk-load your sheet.</div></div>
-      <div className="panel"><div className="panel-head"><h2>Needs attention</h2><div className="desc">Auto-flagged</div></div><div className="panel-body"><table><tbody>
-        {pend.map((c) => <AttnRow key={c.id} c={c} note={`${c.status} · last contacted ${fmtDate(c.last) || '—'}`} btn="Open Outreach" onClick={() => go('outreach')} />)}
-        {noLog.map((c) => <AttnRow key={'l' + c.id} c={c} note="Confirmed but no travel details" btn="Open Logistics" onClick={() => go('logistics')} />)}
-        {tasks.filter(t=>{const bl=(t.blockedBy||[]).map(id=>tasks.find(x=>x.id===id)).filter(Boolean).filter(b=>b.status!=='Done');return bl.length>0;}).map((t) => (
-          <tr key={t.id}><td><div className="person"><div className="avatar" style={{ background: 'var(--rose-wash)', color: 'var(--rose)' }}>!</div><div><div className="nm">{t.title}</div><div className="role">Blocked task</div></div></div></td><td style={{ textAlign: 'right' }}><button className="btn sm" onClick={() => go('depts')}>Open Tasks</button></td></tr>
-        ))}
-        {!pend.length && !noLog.length && <tr><td colSpan="2"><div className="empty">{ICON.check}<h3>All clear</h3><p>No pending follow-ups right now.</p></div></td></tr>}
-      </tbody></table></div></div>
+
+      {editing && (
+        <div className="panel dash-edit">
+          <div className="panel-head"><h2>Customise your dashboard</h2><div className="desc">Only you see these changes.</div></div>
+          <div className="dash-edit-list">
+            {draft.order.filter(id => byId[id]).map((id, i, arr) => (
+              <div key={id} className={'dash-edit-row' + (draft.hidden.includes(id) ? ' off' : '')}>
+                <label className="dash-edit-show">
+                  <input type="checkbox" checked={!draft.hidden.includes(id)} onChange={() => toggleHidden(id)} />
+                  <span>{byId[id].title}</span>
+                </label>
+                <div className="seg" role="group" aria-label="Width">
+                  <button type="button" className={draft.size[id] !== 'half' ? 'on' : ''} onClick={() => setSize(id, 'full')}>Full</button>
+                  <button type="button" className={draft.size[id] === 'half' ? 'on' : ''} onClick={() => setSize(id, 'half')}>Half</button>
+                </div>
+                <div className="dash-edit-move">
+                  <button type="button" className="btn ghost xs" disabled={i === 0} onClick={() => move(id, -1)} aria-label="Move up">▲</button>
+                  <button type="button" className="btn ghost xs" disabled={i === arr.length - 1} onClick={() => move(id, 1)} aria-label="Move down">▼</button>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="dash-edit-foot">
+            <button className="btn ghost sm" onClick={resetToDefault}>Reset to default</button>
+            {isMaster && <button className="btn sm" onClick={saveAsOrgDefault}>Save as default for everyone</button>}
+            <div style={{ flex: 1 }} />
+            <button className="btn sm" onClick={() => setEditing(false)}>Cancel</button>
+            <button className="btn primary sm" onClick={save}>Save</button>
+          </div>
+        </div>
+      )}
+
+      <div className="dash-grid">
+        {visible.map(id => {
+          const body = renderDashWidget(id, ctx);
+          if (!body) return null;
+          return <div key={id} className={'dash-w' + (layout.size[id] === 'half' ? ' half' : '')}>{body}</div>;
+        })}
+      </div>
+      {!visible.length && <div className="panel"><Empty title="Nothing to show" sub="Use Customise to turn widgets on." /></div>}
     </>
   );
 }
+
+function renderDashWidget(id, ctx) {
+  const { store, go, statCards, pend, noLog, blockedTasks } = ctx;
+  switch (id) {
+    case 'stats': return (
+      <div className="stat-grid-4" style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12}}>
+        {statCards.map(c=>(
+          <div key={c.label} onClick={c.onClick} className="dash-stat">
+            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:10}}>
+              <span style={{fontSize:11,fontWeight:600,color:'var(--muted)',textTransform:'uppercase',letterSpacing:'0.05em'}}>{c.label}</span>
+              <span style={{fontSize:18,lineHeight:1}}>{c.emoji}</span>
+            </div>
+            <div style={{fontSize:36,fontWeight:700,color:c.color,fontFamily:'var(--serif)',lineHeight:1,marginBottom:6}}>{c.val}</div>
+            <div style={{fontSize:11.5,color:'var(--muted)'}}>{c.sub}</div>
+          </div>
+        ))}
+      </div>);
+    case 'arrivals': return <ArrivalCountdown store={store} />;
+    case 'followups': return <FollowUpDueToday store={store} go={go} />;
+    case 'deptDone': return <DeptCompletionBanner store={store} />;
+    case 'flow': return (
+      <div className="flow-note" style={{marginBottom:0}}>{ICON.info}<div><b>Core flow:</b> in <b>Outreach</b>, set a pending invitee to <b>Confirmed</b> and a logistics record appears automatically. Build each guest's day in <b>Personalised Schedule</b> — session and arrival rows stay linked to <b>Scheduling</b> and <b>Logistics</b>. Use <b>Import from Excel</b> in Outreach to bulk-load your sheet.</div></div>);
+    case 'attention': return (
+      <div className="panel" style={{marginBottom:0}}>
+        <div className="panel-head"><h2>Needs attention</h2><div className="desc">Auto-flagged</div></div>
+        <div className="panel-body">
+          <table><tbody>
+            {pend.map(c=><AttnRow key={c.id} c={c} note={`${c.status} · last contacted ${fmtDate(c.last)||'—'}`} btn="Open Outreach" onClick={()=>go('outreach')}/>)}
+            {noLog.map(c=><AttnRow key={'l'+c.id} c={c} note="Confirmed but no travel details" btn="Open Logistics" onClick={()=>go('logistics')}/>)}
+            {blockedTasks.map(t=>(
+              <tr key={t.id}>
+                <td><div className="person"><div className="avatar" style={{background:'var(--rose-wash)',color:'var(--rose)'}}>!</div>
+                  <div><div className="nm">{t.title}</div><div className="role">Blocked task</div></div></div></td>
+                <td style={{textAlign:'right'}}><button className="btn sm" onClick={()=>go('depts')}>Open Tasks</button></td>
+              </tr>
+            ))}
+            {!pend.length&&!noLog.length&&!blockedTasks.length&&(
+              <tr><td colSpan="2"><div className="empty">{ICON.check}<h3>All clear</h3><p>No pending follow-ups right now.</p></div></td></tr>
+            )}
+          </tbody></table>
+        </div>
+      </div>);
+    case 'today': return <TodayWidget store={store} go={go} />;
+    case 'sahebji': return <SahebjiTodayWidget store={store} go={go} />;
+    case 'pocGaps': return <PocGapsWidget store={store} go={go} />;
+    case 'dueTasks': return <DueTasksWidget store={store} go={go} />;
+    default: return null;
+  }
+}
+
+function WidgetPanel({ title, action, onAction, children }) {
+  return (
+    <div className="panel" style={{marginBottom:0,height:'100%'}}>
+      <div className="panel-head"><h2>{title}</h2>{action && <div className="right"><button className="btn ghost sm" onClick={onAction}>{action}</button></div>}</div>
+      <div className="panel-pad" style={{paddingTop:12}}>{children}</div>
+    </div>
+  );
+}
+
+function TodayWidget({ store, go }) {
+  const today = todayISO();
+  const conf = (store.contacts||[]).filter(c=>c.status==='Confirmed');
+  const L = cid => (store.logistics||[]).find(l=>l.contactId===cid||l.id===cid)||{};
+  const arr = conf.filter(c=>L(c.id).arrivalDate===today).sort((a,b)=>(L(a.id).arrivalTime||'')>(L(b.id).arrivalTime||'')?1:-1);
+  const dep = conf.filter(c=>L(c.id).departureDate===today);
+  const onsite = conf.filter(c=>{const l=L(c.id);return l.arrivalDate&&l.departureDate&&l.arrivalDate<=today&&l.departureDate>=today;});
+  const sess = (store.sessions||[]).filter(s=>s.date===today).sort((a,b)=>toMin(a.start)-toMin(b.start));
+  return (
+    <WidgetPanel title="Today at the event" action="Logistics" onAction={()=>go('logistics')}>
+      <div className="dash-today">
+        <div><div className="dash-k">{arr.length}</div><div className="muted-sm">arriving</div></div>
+        <div><div className="dash-k">{onsite.length}</div><div className="muted-sm">on site</div></div>
+        <div><div className="dash-k">{dep.length}</div><div className="muted-sm">departing</div></div>
+        <div><div className="dash-k">{sess.length}</div><div className="muted-sm">sessions</div></div>
+      </div>
+      {arr.length>0 && <div className="dash-list">{arr.slice(0,8).map(c=><div key={c.id}><span className="mono">{L(c.id).arrivalTime||'—'}</span> {displayName(c)}{L(c.id).arrivalLocation?<span className="muted-sm"> · {L(c.id).arrivalLocation}</span>:null}</div>)}</div>}
+      {sess.length>0 && <div className="dash-list">{sess.map(s=><div key={s.id}><span className="mono">{s.start}</span> {s.title}</div>)}</div>}
+      {!arr.length && !sess.length && <div className="muted-sm">Nothing scheduled for today.</div>}
+    </WidgetPanel>
+  );
+}
+
+function SahebjiTodayWidget({ store, go }) {
+  const today = todayISO();
+  const ms = (store.founder||[]).filter(m=>m.date===today&&m.time).sort((a,b)=>toMin(a.time)-toMin(b.time));
+  const name = id => { const c=(store.contacts||[]).find(x=>x.id===id); return c?displayName(c):'—'; };
+  return (
+    <WidgetPanel title="Today's Sahebji meetings" action="Open" onAction={()=>go('schedule')}>
+      {ms.length ? <div className="dash-list">{ms.map(m=><div key={m.id}><span className="mono">{m.time}</span> {name(m.contactId)} <span className="muted-sm">· {m.duration||30} min</span></div>)}</div>
+                 : <div className="muted-sm">No meetings today.</div>}
+    </WidgetPanel>
+  );
+}
+
+function PocGapsWidget({ store, go }) {
+  const ps = (store.personalisedSchedule||[]).filter(r=>r.pocRequired&&r.date&&!r.deleted);
+  const need = [...new Set(ps.map(r=>r.contactId+'_'+r.date))];
+  const poc = store.poc||[];
+  const gaps = need.filter(k=>{ const [cid,day]=[k.slice(0,k.lastIndexOf('_')),k.slice(k.lastIndexOf('_')+1)]; return !poc.some(p=>p.contactId===cid&&p.day===day); });
+  return (
+    <WidgetPanel title="POC gaps" action="POC Allocation" onAction={()=>go('pocallocation')}>
+      <div className="dash-k" style={{color:gaps.length?'var(--rose)':'var(--teal)'}}>{gaps.length}</div>
+      <div className="muted-sm">{gaps.length ? `guest-day${gaps.length>1?'s':''} still need a POC (of ${need.length})` : `All ${need.length} POC needs are covered`}</div>
+    </WidgetPanel>
+  );
+}
+
+function DueTasksWidget({ store, go }) {
+  const today = todayISO();
+  const soon = new Date(); soon.setDate(soon.getDate()+3); const soonISO = localISO(soon);
+  const list = (store.tasks||[]).filter(t=>t.status!=='Done'&&t.due&&t.due<=soonISO).sort((a,b)=>a.due>b.due?1:-1);
+  return (
+    <WidgetPanel title="Tasks due soon" action="Tasks" onAction={()=>go('depts')}>
+      {list.length ? <div className="dash-list">{list.slice(0,8).map(t=><div key={t.id}><span className="mono" style={{color:t.due<today?'var(--rose)':undefined}}>{shortDate(t.due)}</span> {t.title}</div>)}</div>
+                   : <div className="muted-sm">Nothing due in the next 3 days.</div>}
+    </WidgetPanel>
+  );
+}
+
 const Stat = ({ label, icon, val, hint }) => <div className="stat"><div className="lab">{icon}{label}</div><div className="val">{val}</div><div className="hint">{hint}</div></div>;
 const AttnRow = ({ c, note, btn, onClick }) => <tr><td><div className="person"><div className="avatar">{initials(c.name)}</div><div><div className="nm">{displayName(c)}</div><div className="role">{note}</div></div></div></td><td style={{ textAlign: 'right' }}><button className="btn sm" onClick={onClick}>{btn}</button></td></tr>;
 
 /* ============================ OUTREACH ============================ */
 export function Outreach({ store, activeEventId }) {
+  const { profile } = useAuth();
   const toast = useToast();
   const contacts = S(store, 'contacts'), logi = S(store, 'logistics');
   const [q, setQ] = useState('');
@@ -117,13 +514,30 @@ export function Outreach({ store, activeEventId }) {
   const [selected, setSelected] = useState(new Set());
   const [selectMode, setSelectMode] = useState(false);
   const [bulkStatus, setBulkStatus] = useState('Confirmed');
+  const [showFilters, setShowFilters] = useState(false);
+  const { can, isMaster } = usePerm();
+  const { sorted: sortedContacts, sortKey: cSortKey, sortDir: cSortDir,
+    toggleSort: cToggleSort, filters: cFilters, setFilter: cSetFilter, clearFilters: cClearFilters
+  } = useSortFilter(contacts, { key: 'name', dir: 'asc' });
 
   const list = useMemo(() => {
     const t = q.toLowerCase();
-    return contacts.filter((c) => !t || displayName(c).toLowerCase().includes(t) || (c.org || '').toLowerCase().includes(t) || (c.field || '').toLowerCase().includes(t));
-  }, [contacts, q]);
+    return sortedContacts.filter((c) => !t || displayName(c).toLowerCase().includes(t) || (c.org || '').toLowerCase().includes(t) || (c.field || '').toLowerCase().includes(t));
+  }, [sortedContacts, q]);
+
+  const [downgradeModal, setDowngradeModal] = useState(null);
 
   async function setStatus(c, val) {
+    // Warn before downgrading a Confirmed VIP
+    if (c.status === 'Confirmed' && val !== 'Confirmed') {
+      const hasLogi = logi.some(x => x.contactId === c.id && (x.hotelName || x.arrivalDate || x.arrivalTime || x.hotel || x.inbTime));
+      setDowngradeModal({ contact: c, newStatus: val, hasLogi });
+      return;
+    }
+    await doSetStatus(c, val);
+  }
+
+  async function doSetStatus(c, val) {
     await saveItem('contacts', { ...c, status: val });
     if (val === 'Confirmed' && c.status !== 'Confirmed') {
       if (!logi.some((x) => x.contactId === c.id)) {
@@ -152,20 +566,49 @@ export function Outreach({ store, activeEventId }) {
   return (
     <>
       <div className="page-head"><div className="ph-txt"><h1>Delegate Outreach</h1><p>The expert directory for this event. Add contacts, follow up, or import your Excel sheet.</p></div></div>
+      {hasActiveFilter(profile?.contactFilter) && (
+        <div style={{background:'var(--amber-wash)',border:'1px solid #E8D5A3',borderRadius:10,padding:'10px 16px',fontSize:13,color:'var(--amber)',marginBottom:14,display:'flex',alignItems:'center',gap:8}}>
+          🔒 <span><b>Filtered view</b> — showing contacts matching: {filterSummary(profile?.contactFilter)}. You can still add any contact — new contacts are visible to everyone with the right access.</span>
+        </div>
+      )}
       <div className="panel">
         <div className="panel-head"><h2>Invitees</h2><div className="desc">{list.length} shown</div>
           <div className="right">
             <SearchBox value={q} onChange={setQ} />
-            <button className={'btn sm'+(selectMode?' primary':'')} onClick={()=>{setSelectMode(s=>!s);setSelected(new Set());}}>
+            <button className={'btn sm'+(showFilters?' primary':'')} onClick={()=>setShowFilters(f=>!f)} title="Filter">⚙ Filter</button>
+            {can('outreach.import') && <button className={'btn sm'+(selectMode?' primary':'')} onClick={()=>{setSelectMode(s=>!s);setSelected(new Set());}}>
               {selectMode?'Cancel select':'Select multiple'}
-            </button>
-            <button className="btn sm" onClick={() => setModal({ type: 'import' })}>{ICON.upload}Import</button>
-            <button className="btn primary sm" onClick={() => setModal({ type: 'add' })}>{ICON.plus}Add</button>
+            </button>}
+            {selectMode&&selected.size>0&&<button className="btn sm" onClick={()=>setModal({type:'broadcast'})}>📢 Broadcast</button>}
+            {can('outreach.import') && <button className="btn sm" onClick={() => setModal({ type: 'import' })}>{ICON.upload}Import</button>}
+            <button className="btn sm" title="Export current filtered list" onClick={()=>quickExport('Outreach_Contacts', list, [
+              ['name','Name'],['honor','Honorific'],['desig','Designation'],['org','Organisation'],
+              ['field','Field'],['phone','Phone'],['email','Email'],['type','Type'],
+              ['status','Status'],['eventRole','Event Role'],['eventNotes','Event Notes'],
+              ['liaisonName','Liaison'],['remark','Remarks'],
+            ])}>⬇ Export ({list.length})</button>
+            {can('outreach.add') && <button className="btn primary sm" onClick={() => setModal({ type: 'add' })}>{ICON.plus}Add</button>}
           </div></div>
+        {showFilters && <div style={{padding:'0 16px'}}><FilterBar
+          filters={cFilters} setFilter={cSetFilter} clearFilters={cClearFilters}
+          fields={[
+            { key:'field', label:'Field', options:['Geopolitics','Legal','Economics','Business','Media','Politics','Social'] },
+            { key:'status', label:'Status', options:['Pending','Contacted','Tentative','Confirmed','Declined'] },
+            { key:'type', label:'Type', options:['Panelist','VIP','Podcast Guest','Guest'] },
+          ]}
+        /></div>}
         <div className="panel-body"><table>
           <thead><tr>
             {selectMode&&<th><input type="checkbox" checked={selected.size===list.length&&list.length>0} onChange={toggleAll} style={{accentColor:'var(--teal)'}}/></th>}
-            <th>Name</th><th>Field</th><th>Type</th><th>Liaison</th><th>Status</th><th></th>
+            <SortHeader label="Name" sortKey="name" currentKey={cSortKey} dir={cSortDir} onSort={cToggleSort}/>
+            <SortHeader label="Field" sortKey="field" currentKey={cSortKey} dir={cSortDir} onSort={cToggleSort}/>
+            <SortHeader label="Type" sortKey="type" currentKey={cSortKey} dir={cSortDir} onSort={cToggleSort}/>
+            <th>Event info</th>
+            <th title="Editable — specific to this event">Event role ✎</th>
+            <th title="Editable — specific to this event">Event notes ✎</th>
+            <th>Liaison</th>
+            <SortHeader label="Status" sortKey="status" currentKey={cSortKey} dir={cSortDir} onSort={cToggleSort}/>
+            <th></th>
           </tr></thead>
           <tbody>
             {list.map((c) => (
@@ -174,25 +617,39 @@ export function Outreach({ store, activeEventId }) {
                 <td><div className="person"><div className="avatar">{initials(c.name)}</div><div><div className="nm">{displayName(c)}</div><div className="role">{c.desig}{c.org ? ' · ' + c.org : ''}</div></div></div></td>
                 <td><span className="muted-sm">{c.field}</span></td>
                 <td><span className="badge b-type">{c.type}</span></td>
+                <td>{(() => {
+                  const L = logi.find(x=>x.contactId===c.id)||{};
+                  const sCount = (store.assignments||[]).filter(a=>a.contactId===c.id).length;
+                  const ld = L.arrivalDate&&(L.flightReq==='not_required'||L.arrivalFlightNo)&&(L.carReq==='not_required'||L.carVendorId)&&(L.accomReq==='not_required'||L.hotelName);
+                  return (<div style={{fontSize:11.5}}><div style={{color:sCount?'var(--teal)':'var(--faint)',marginBottom:2}}>{sCount?`${sCount} session${sCount>1?'s':''}`:'No sessions'}</div><div style={{color:ld?'var(--teal)':L.arrivalDate?'var(--amber)':'var(--faint)'}}>{ld?'✓ Logistics':L.arrivalDate?'⚠ Partial':'—'}</div></div>);
+                })()}</td>
                 <td><span className="muted-sm">{c.liaisonName || '—'}</span></td>
-                <td><select className="statsel" value={c.status} onChange={(e) => setStatus(c, e.target.value)}>{STATUSES.map((s) => <option key={s}>{s}</option>)}</select></td>
+                <td>{can('outreach.status')
+                  ? <select className="statsel" value={c.status} onChange={(e) => setStatus(c, e.target.value)}>{STATUSES.map((s) => <option key={s}>{s}</option>)}</select>
+                  : <span className="badge b-type">{c.status}</span>}</td>
                 <td><div className="rowacts">
-                  <button className="btn ghost xs" onClick={() => setModal({ type: 'whatsapp', item: c })} title="WhatsApp">💬</button>
-                  <button className="btn ghost xs" onClick={() => setModal({ type: 'history', item: c })} title="Contact history">📅</button>
-                  <button className="btn ghost xs" onClick={() => setModal({ type: 'notes', item: c })} title="Follow-up log">
+                  {can('outreach.whatsapp') && <button className="btn ghost xs" onClick={() => setModal({ type: 'whatsapp', id: c.id })} title="WhatsApp">💬</button>}
+                  <button className="btn ghost xs" onClick={() => setModal({ type: 'sessions', id: c.id })} title="Assign sessions">🗓️
+                    {(store.assignments||[]).filter(a=>a.contactId===c.id).length > 0 &&
+                      <span style={{fontSize:9,background:'var(--teal)',color:'#fff',borderRadius:8,padding:'1px 4px',marginLeft:2}}>
+                        {(store.assignments||[]).filter(a=>a.contactId===c.id).length}
+                      </span>}
+                  </button>
+                  <button className="btn ghost xs" onClick={() => setModal({ type: 'history', id: c.id })} title="Contact history">📅</button>
+                  <button className="btn ghost xs" onClick={() => setModal({ type: 'notes', id: c.id })} title="Follow-up log">
                     📝{noteCount(c.id)>0&&<span style={{fontSize:10,marginLeft:2,color:'var(--teal)',fontWeight:700}}>{noteCount(c.id)}</span>}
                   </button>
-                  <button className="btn ghost xs" onClick={() => setModal({ type: 'edit', item: c })}>{ICON.edit}</button>
-                  <button className="btn ghost xs" onClick={() => setModal({ type: 'del', item: c })}>{ICON.trash}</button>
+                  {can('outreach.edit') && <button className="btn ghost xs" onClick={() => setModal({ type: 'edit', id: c.id })}>{ICON.edit}</button>}
+                  {can('outreach.delete') && <button className="btn ghost xs" onClick={() => setModal({ type: 'del', id: c.id })}>{ICON.trash}</button>}
                 </div></td>
               </tr>
             ))}
-            {!list.length && <tr><td colSpan={selectMode?7:6}><Empty title="No matches" sub="Try a different search, add a contact, or import from Excel." /></td></tr>}
+            {!list.length && <tr><td colSpan={selectMode?10:9}><Empty title="No matches" sub="Try a different search, add a contact, or import from Excel." /></td></tr>}
           </tbody></table></div>
       </div>
       {/* Bulk action bar */}
       {selectMode && selected.size>0 && (
-        <div style={{position:'fixed',bottom:20,left:'50%',transform:'translateX(-50%)',background:'var(--ink)',color:'#fff',padding:'12px 20px',borderRadius:12,display:'flex',alignItems:'center',gap:12,boxShadow:'0 8px 30px rgba(0,0,0,.3)',zIndex:50,flexWrap:'wrap'}}>
+        <div className="bulk-bar" style={{position:'fixed',bottom:20,left:'50%',transform:'translateX(-50%)',background:'var(--ink)',color:'#fff',padding:'12px 20px',borderRadius:12,display:'flex',alignItems:'center',gap:12,boxShadow:'0 8px 30px rgba(0,0,0,.3)',zIndex:50,flexWrap:'wrap'}}>
           <span style={{fontSize:13.5,fontWeight:600}}>{selected.size} selected</span>
           <span style={{color:'var(--faint)'}}>→ Set status to</span>
           <select style={{background:'#fff',color:'var(--ink)',border:'none',borderRadius:7,padding:'5px 10px',fontWeight:600,fontSize:13}} value={bulkStatus} onChange={e=>setBulkStatus(e.target.value)}>
@@ -202,32 +659,73 @@ export function Outreach({ store, activeEventId }) {
           <button className="btn ghost sm" style={{color:'#fff'}} onClick={()=>{setSelected(new Set());setSelectMode(false);}}>Cancel</button>
         </div>
       )}
-      {(modal?.type === 'add' || modal?.type === 'edit') && <ContactModal item={modal.item} activeEventId={activeEventId} store={store} onClose={() => setModal(null)} toast={toast} />}
+      {(modal?.type === 'add' || modal?.type === 'edit') && <ContactModal item={modal.type==='edit'?(store.contacts||[]).find(c=>c.id===modal.id)||null:null} activeEventId={activeEventId} store={store} onClose={() => setModal(null)} toast={toast} />}
       {modal?.type === 'import' && <ImportModal store={store} activeEventId={activeEventId} onClose={() => setModal(null)} toast={toast} />}
-      {modal?.type === 'notes' && <ContactNotesModal contact={modal.item} store={store} activeEventId={activeEventId} onClose={() => setModal(null)} />}
-      {modal?.type === 'whatsapp' && <WhatsAppModal contact={modal.item} store={store} activeEventId={activeEventId} onClose={() => setModal(null)} />}
-      {modal?.type === 'history' && <ContactHistoryModal contact={modal.item} rawStore={store.__raw||store} onClose={() => setModal(null)} />}
-      {modal?.type === 'del' && <DeleteModal label={displayName(modal.item)} onClose={() => setModal(null)} onConfirm={async () => {
-        await removeItem('contacts', modal.item.id);
-        const L = S(store,'logistics').find(x=>x.contactId===modal.item.id);
-        if(L) await removeItem('logistics', L.id);
-        const F = S(store,'founder').find(x=>x.contactId===modal.item.id);
-        if(F) await removeItem('founder', F.id);
-        S(store, 'assignments').filter((a) => a.contactId === modal.item.id).forEach((a) => removeItem('assignments', a.id));
-        S(store, 'poc').filter((p) => p.contactId === modal.item.id).forEach((p) => removeItem('poc', p.id));
-        setModal(null); toast('Contact deleted.');
-      }} />}
+      {modal?.type === 'notes' && <ContactNotesModal contact={(store.contacts||[]).find(c=>c.id===modal.id)||{}} store={store} activeEventId={activeEventId} onClose={() => setModal(null)} />}
+      {modal?.type === 'whatsapp' && <WhatsAppModal contact={(store.contacts||[]).find(c=>c.id===modal.id)||{}} store={store} activeEventId={activeEventId} onClose={() => setModal(null)} />}
+      {modal?.type === 'broadcast' && <WhatsAppBroadcast contacts={list.filter(c=>selected.has(c.id))} onClose={()=>setModal(null)} />}
+      {modal?.type === 'history' && <ContactHistoryModal contact={(store.contacts||[]).find(c=>c.id===modal.id)||{}} rawStore={store.__raw||store} onClose={() => setModal(null)} />}
+      {modal?.type === 'sessions' && <ContactSessionsModal contact={(store.contacts||[]).find(c=>c.id===modal.id)||{}} store={store} activeEventId={activeEventId} onClose={() => setModal(null)} toast={toast} />}
+      {downgradeModal && (
+        <Modal title="⚠ Downgrade confirmed guest?" onClose={()=>setDowngradeModal(null)} size="sm" footer={null}>
+          <p style={{fontSize:13.5}}><b>{displayName(downgradeModal.contact)}</b> is currently <b>Confirmed</b>. Changing to <b>{downgradeModal.newStatus}</b> will mark them as not attending.</p>
+          {downgradeModal.hasLogi && <div style={{background:'var(--amber-wash)',borderRadius:8,padding:'10px 14px',fontSize:13,color:'var(--amber)',margin:'10px 0'}}>
+            ⚠ This contact has travel and hotel details in Logistics. Those records will remain but will no longer appear in the active guest list.
+          </div>}
+          <div className="modal-foot" style={{padding:'12px 0 0'}}>
+            <button className="btn" onClick={()=>setDowngradeModal(null)}>Cancel — keep as Confirmed</button>
+            <button className="btn danger" onClick={async()=>{ await doSetStatus(downgradeModal.contact, downgradeModal.newStatus); setDowngradeModal(null); toast(`${displayName(downgradeModal.contact)} changed to ${downgradeModal.newStatus}.`); }}>Yes, change status</button>
+          </div>
+        </Modal>
+      )}
+      {modal?.type === 'del' && (()=>{
+        const _c = (store.contacts||[]).find(c=>c.id===modal.id)||{};
+        return _c.id ? <DeleteModal label={displayName(_c)} onClose={() => setModal(null)} onConfirm={async () => {
+          const _id = modal.id;
+          const _L = S(store,'logistics').find(x=>x.contactId===_id);
+          const _F = S(store,'founder').find(x=>x.contactId===_id);
+          const _assigns = S(store,'assignments').filter(a=>a.contactId===_id);
+          const _pocs = S(store,'poc').filter(p=>p.contactId===_id);
+          const _ps = (store.personalisedSchedule||[]).filter(r=>r.contactId===_id);
+          const _feli = (store.felicitation||[]).filter(f=>f.contactId===_id);
+          const linked = [
+            ...(_L ? [{collection:'logistics', data:_L}] : []),
+            ...(_F ? [{collection:'founder', data:_F}] : []),
+            ..._assigns.map(a=>({collection:'assignments',data:a})),
+            ..._pocs.map(p=>({collection:'poc',data:p})),
+            ..._ps.map(r=>({collection:'personalisedSchedule',data:r})),
+            ..._feli.map(f=>({collection:'felicitation',data:f})),
+          ];
+          setModal(null);
+          await trashItem('contacts', _c, linked, profile?.email||'');
+          // Remove from live collections
+          if(_L) await removeItem('logistics', _L.id);
+          if(_F) await removeItem('founder', _F.id);
+          _assigns.forEach(a=>removeItem('assignments',a.id));
+          _pocs.forEach(p=>removeItem('poc',p.id));
+          _ps.forEach(r=>removeItem('personalisedSchedule',r.id));
+          _feli.forEach(f=>removeItem('felicitation',f.id));
+          await removeItem('contacts', _id);
+          toast('Contact moved to trash. Restore within 30 days from Settings.');
+        }} /> : null;
+      })()}
     </>
   );
 }
 
 function ContactModal({ item, activeEventId, store, onClose, toast }) {
-  const [f, setF] = useState(() => ({ name: '', honor: '', desig: '', org: '', field: '', phone: '', email: '', liaisonName: '', liaisonPhone: '', type: 'Panelist', remark: '', ...item }));
+  const { profile } = useAuth();
+  const [f, setF] = useState(() => ({ name: '', honor: '', desig: '', org: '', field: '', phone: '', email: '', liaisonName: '', liaisonPhone: '', type: 'Panelist', remark: '', tags: [], ...item }));
   const set = (k) => (e) => setF((p) => ({ ...p, [k]: e.target.value }));
   const [dupWarning, setDupWarning] = useState(null);
 
+  const [errors, setErrors] = useState({});
   async function save() {
-    if (!f.name.trim()) return;
+    const errs = {};
+    if (!f.name.trim()) errs.name = 'Name is required';
+    if (!f.type) errs.type = 'Type is required';
+    if (Object.keys(errs).length) { setErrors(errs); return; }
+    setErrors({});
     // Check for duplicates before saving (skip when editing existing contact)
     if (!item) {
       const existing = store?.contacts || [];
@@ -244,7 +742,7 @@ function ContactModal({ item, activeEventId, store, onClose, toast }) {
   }
   return (<>
     <Modal title={item ? 'Edit contact' : 'Add contact'} onClose={onClose} onSave={save} saveLabel={item ? 'Save changes' : 'Add contact'}>
-      <Field label="Full name"><input className="input" value={f.name} onChange={set('name')} placeholder="e.g. Sujit Dutta" /></Field>
+      <Field label="Full name"><input className="input" style={errors.name?{borderColor:'var(--rose)'}:{}} value={f.name} onChange={e=>{set('name')(e);setErrors(p=>({...p,name:undefined}));}} placeholder="e.g. Sujit Dutta" />{errors.name&&<span style={{color:'var(--rose)',fontSize:12}}>{errors.name}</span>}</Field>
       <div className="grid2">
         <Field label="Honorific"><input className="input" value={f.honor} onChange={set('honor')} placeholder="Dr. / Prof." /></Field>
         <Field label="Type"><select className="input" value={f.type} onChange={set('type')}>{TYPES.map((t) => <option key={t}>{t}</option>)}</select></Field>
@@ -256,9 +754,61 @@ function ContactModal({ item, activeEventId, store, onClose, toast }) {
         <Field label="Liaison phone"><input className="input" value={f.liaisonPhone} onChange={set('liaisonPhone')} /></Field>
       </div>
       <Field label="Remark"><input className="input" value={f.remark} onChange={set('remark')} /></Field>
+      <Field label="Tags (for filtering access, comma-separated)">
+        <input className="input" value={Array.isArray(f.tags)?f.tags.join(', '):(f.tags||'')}
+          onChange={e=>setF(p=>({...p,tags:e.target.value.split(',').map(t=>t.trim()).filter(Boolean)}))}
+          placeholder="e.g. Priority, Bangalore batch, VK3 Speaker"/>
+        <span style={{fontSize:11,color:'var(--muted)',marginTop:3,display:'block'}}>Master can filter user access by these tags in Settings → Users</span>
+      </Field>
     </Modal>
     {dupWarning && <DuplicateWarningModal incoming={f} existing={dupWarning} onSaveAnyway={()=>{setDupWarning(null);doSave();}} onCancel={()=>setDupWarning(null)}/>}
   </>);
+}
+
+function ContactSessionsModal({ contact, store, activeEventId, onClose, toast }) {
+  const sessions = (store.sessions || []).sort((a,b)=>a.date>b.date?1:-1);
+  const assignments = store.assignments || [];
+
+  return (
+    <Modal title={`🗓️ Sessions — ${displayName(contact)}`} onClose={onClose} footer={null} size="md">
+      <div style={{fontSize:13,color:'var(--muted)',marginBottom:12}}>
+        Tick sessions this panelist will attend. Synced with Scheduling → Session Assignments.
+      </div>
+      {!sessions.length && <div style={{color:'var(--faint)',fontSize:13,padding:16,textAlign:'center'}}>
+        No sessions yet. Add sessions in Scheduling first.
+      </div>}
+      {sessions.map(s => {
+        const assigned = assignments.some(a=>a.contactId===contact.id&&a.sessionId===s.id);
+        return (
+          <label key={s.id} style={{display:'flex',alignItems:'center',gap:10,padding:'8px 12px',
+            borderRadius:8,marginBottom:6,cursor:'pointer',
+            border:`1px solid ${assigned?'var(--teal)':'var(--line)'}`,
+            background:assigned?'var(--teal-wash)':'#fff'}}>
+            <input type="checkbox" checked={assigned} style={{accentColor:'var(--teal)',width:15,height:15,flexShrink:0}}
+              onChange={async e=>{
+                if (e.target.checked) {
+                  await saveItem('assignments',{contactId:contact.id,sessionId:s.id,role:'Panelist',eventId:activeEventId});
+                  toast('Session assigned.');
+                } else {
+                  const a = assignments.find(x=>x.contactId===contact.id&&x.sessionId===s.id);
+                  if (a) { await removeItem('assignments',a.id); toast('Session removed.'); }
+                }
+              }}/>
+            <div style={{flex:1}}>
+              <div style={{fontWeight:500,fontSize:13}}>{s.title}</div>
+              <div style={{fontSize:11.5,color:'var(--muted)'}}>
+                {s.date}{s.start&&` · ${s.start}`}{s.end&&` – ${s.end}`}{s.venue&&` · ${s.venue}`}
+              </div>
+            </div>
+            {assigned && <span className="badge b-confirmed">Assigned</span>}
+          </label>
+        );
+      })}
+      <div className="modal-foot" style={{padding:'12px 0 0'}}>
+        <button className="btn" onClick={onClose}>Done</button>
+      </div>
+    </Modal>
+  );
 }
 
 function ImportModal({ store, activeEventId, onClose, toast }) {
@@ -312,109 +862,1548 @@ function ImportModal({ store, activeEventId, onClose, toast }) {
 }
 
 /* ============================ LOGISTICS ============================ */
-export function Logistics({ store, activeEventId }) {
-  const toast = useToast();
-  const [importOpen, setImportOpen] = useState(false);
-  const conf = S(store, 'contacts').filter((c) => c.status === 'Confirmed');
-  const logi = S(store, 'logistics');
-  const getL = (cid) => logi.find((x) => x.contactId === cid) || { contactId: cid, eventId: activeEventId };
-  const setK = (cid, k) => async (e) => {
-    const L = getL(cid);
-    await saveItem('logistics', { ...L, [k]: e.target.value });
-  };
-  if (!conf.length) return <><div className="page-head"><div className="ph-txt"><h1>Logistics</h1></div></div><div className="panel"><Empty title="No one to arrange yet" sub="Confirmed invitees appear here automatically." /></div></>;
-  const F = (cid, k, label, ph, type) => <Field label={label}><input className="input" type={type||'text'} defaultValue={getL(cid)[k]||''} onBlur={setK(cid,k)} placeholder={ph} /></Field>;
+/* ── Car Vendor Master (lives in Settings → Configurations) ──────── */
+/* ── Logistics requirement toggle (standalone — cannot be nested) ── */
+function LogisticsReqToggle({ cid, field, getL, toggleReq, setSubModal }) {
+  const L = getL(cid);
+  const val = L[field] || 'required';
   return (
-    <>
-      <div className="page-head"><div className="ph-txt"><h1>Logistics</h1><p>Confirmed invitees flow in automatically. Travel and stay attach here.</p></div>
-        <button className="btn sm" onClick={()=>setImportOpen(true)}>{ICON.upload}Import from Excel</button>
-      </div>
-      {importOpen && <LogisticsImportModal store={store} activeEventId={activeEventId} onClose={()=>setImportOpen(false)} toast={toast}/>}
-      {conf.map((c) => {
-        const L = getL(c.id); const filled = L.hotel || L.inbTime;
-        return (
-          <div className="panel" key={c.id}>
-            <div className="panel-head"><div className="person"><div className="avatar">{initials(c.name)}</div><div><div className="nm">{displayName(c)}</div><div className="role">{c.type} · {c.field}</div></div></div><div className="right">{filled?sbadge('Confirmed'):<span className="badge b-pending">Needs details</span>}</div></div>
-            <div className="panel-pad"><div className="grid2">
-              {F(c.id,'inbMode','Arrival mode','Flight / Train / Car')}
-              {F(c.id,'inbLoc','Arrival location','Mumbai Airport')}
-              {F(c.id,'inbDate','Arrival date','','date')}
-              {F(c.id,'inbTime','Arrival time','12:20')}
-              {F(c.id,'hotel','Hotel','Taj President, IHCL')}
-              {F(c.id,'checkin','Check-in time','13:30')}
-              {F(c.id,'outDate','Departure date','','date')}
-              {F(c.id,'outDepart','Departs for airport','07:00')}
-              {F(c.id,'outFlight','Outbound flight time','09:30')}
-            </div>{F(c.id,'special','Special requirements','Diet, accessibility, etc.')}</div>
-          </div>
-        );
-      })}
-    </>
+    <div style={{ display:'flex', gap:4, alignItems:'center' }}>
+      <select className="statsel"
+        style={{ fontSize:11.5, color: val==='not_required'?'var(--muted)':'var(--teal)', background: val==='not_required'?'#F5F4F0':'var(--teal-wash)' }}
+        value={val}
+        onChange={e => toggleReq(cid, field, e.target.value)}>
+        <option value="required">Required</option>
+        <option value="not_required">Not Required</option>
+      </select>
+      {val==='required' && (
+        <button className="btn ghost xs" title="Open details"
+          onClick={() => {
+            const typeMap = { flightReq:'flight', carReq:'car', accomReq:'accommodation' };
+            setSubModal({ type: typeMap[field] || field.replace('Req','').toLowerCase(), contactId:cid, item:getL(cid) });
+          }}>
+          ✏️
+        </button>
+      )}
+    </div>
   );
 }
 
-/* ============================ SCHEDULING ============================ */
-export function Scheduling({ store, activeEventId }) {
+
+export function CarVendorMaster({ store }) {
+  const { profile } = useAuth();
   const toast = useToast();
-  const [tab, setTab] = useState('sessions');
+  const vendors = store.carVendors || [];
   const [modal, setModal] = useState(null);
   return (
     <>
-      <div className="page-head"><div className="ph-txt"><h1>Scheduling</h1><p>Event sessions, panel assignments and founder one-on-ones.</p></div></div>
-      <div className="subnav">
-        <button className={tab==='sessions'?'active':''} onClick={()=>setTab('sessions')}>Event schedule</button>
-        <button className={tab==='assign'?'active':''} onClick={()=>setTab('assign')}>Session assignments</button>
-        <button className={tab==='founder'?'active':''} onClick={()=>setTab('founder')}>Founder one-on-ones</button>
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+          <div>
+            <div style={{ fontWeight: 600, fontSize: 14 }}>Car Vendor Master</div>
+            <div style={{ fontSize: 12.5, color: 'var(--muted)', marginTop: 2 }}>
+              Vendors and drivers used for guest transport. Referenced in Logistics.
+            </div>
+          </div>
+          <button className="btn primary sm" onClick={() => setModal({ type: 'add' })}>
+            {ICON.plus} Add vendor
+          </button>
+        </div>
+        {vendors.length > 0 ? (
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+            <thead>
+              <tr style={{ background: 'var(--teal-wash)' }}>
+                {['Vendor name', 'Contact', 'Drivers', ''].map(h => (
+                  <th key={h} style={{ padding: '8px 12px', textAlign: 'left', fontWeight: 600, fontSize: 12, borderBottom: '1px solid var(--line)' }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {vendors.map(v => (
+                <tr key={v.id} style={{ borderBottom: '1px solid var(--line)' }}>
+                  <td style={{ padding: '8px 12px', fontWeight: 500 }}>{v.name}</td>
+                  <td style={{ padding: '8px 12px', color: 'var(--muted)' }}>{v.contact || '—'}</td>
+                  <td style={{ padding: '8px 12px', color: 'var(--muted)' }}>
+                    {(v.drivers || []).map(d => d.name).join(', ') || '—'}
+                  </td>
+                  <td style={{ padding: '8px 12px', textAlign: 'right' }}>
+                    <div className="rowacts">
+                      <button className="btn ghost xs" onClick={() => setModal({ type: 'edit', item: v })}>{ICON.edit}</button>
+                      <button className="btn ghost xs" onClick={() => setModal({ type: 'del', id: v.id })}>{ICON.trash}</button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <div style={{ padding: '16px', color: 'var(--muted)', fontSize: 13, textAlign: 'center', background: 'var(--paper)', borderRadius: 8 }}>
+            No vendors yet. Add vendors here to use them in Logistics.
+          </div>
+        )}
       </div>
-      {tab==='sessions' && <SessionsTab store={store} activeEventId={activeEventId} setModal={setModal} />}
-      {tab==='assign' && <AssignTab store={store} activeEventId={activeEventId} />}
-      {tab==='founder' && <FounderTab store={store} activeEventId={activeEventId} setModal={setModal} />}
-      {(modal?.type==='add-s'||modal?.type==='edit-s') && <SessionModal item={modal.item} activeEventId={activeEventId} onClose={()=>setModal(null)} toast={toast} />}
-      {modal?.type==='del-s' && <DeleteModal label={modal.item.title} onClose={()=>setModal(null)} onConfirm={async()=>{ await removeItem('sessions',modal.item.id); S(store,'assignments').filter(a=>a.sessionId===modal.item.id).forEach(a=>removeItem('assignments',a.id)); setModal(null); toast('Session deleted.'); }} />}
-      {(modal?.type==='add-f'||modal?.type==='edit-f') && <FounderMeetingModal item={modal.item} store={store} activeEventId={activeEventId} onClose={()=>setModal(null)} toast={toast} />}
-      {modal?.type==='del-f' && <DeleteModal label={`meeting with ${displayName((store.contacts||[]).find(c=>c.id===modal.item.contactId)||{name:'this guest'})}`} onClose={()=>setModal(null)} onConfirm={async()=>{ await removeItem('founder',modal.item.id); setModal(null); toast('Meeting deleted.'); }} />}
+      {(modal?.type === 'add' || modal?.type === 'edit') && (
+        <VendorModal item={(store.carVendors||[]).find(v=>v.id===modal.id)||undefined} onClose={() => setModal(null)} toast={toast} />
+      )}
+      {modal?.type === 'del' && (() => {
+        const _vendor = (store.carVendors||[]).find(v=>v.id===modal.id);
+        return _vendor ? <DeleteModal label={_vendor.name} onClose={()=>setModal(null)}
+          onConfirm={async()=>{const _v=(store.carVendors||[]).find(x=>x.id===modal.id);if(_v){await trashItem('carVendors',_v,[],profile?.email||'');}setModal(null);await removeItem('carVendors',modal.id);toast('Vendor moved to trash.');}}/> : null;
+      })()}
     </>
   );
 }
 
-function SessionsTab({ store, activeEventId, setModal }) {
-  const toast = useToast();
-  const [importOpen, setImportOpen] = useState(false);
-  const rows = [...S(store,'sessions')].sort((a,b)=>a.date<b.date?-1:a.date>b.date?1:toMin(a.start)-toMin(b.start));
-  return (<>
-    <div className="panel"><div className="panel-head"><h2>Sessions</h2><div className="right">
-      <button className="btn sm" onClick={()=>setImportOpen(true)}>{ICON.upload}Import Excel</button>
-      <button className="btn primary sm" onClick={()=>setModal({type:'add-s'})}>{ICON.plus}Add session</button>
-    </div></div>
-      <div className="panel-body"><table><thead><tr><th>Date</th><th>Time</th><th>Session</th><th>Type</th><th></th></tr></thead><tbody>
-        {rows.map(s=>(
-          <tr key={s.id}><td className="muted-sm">{shortDate(s.date)}</td><td className="mono">{s.start}{s.end?'–'+s.end:''}</td><td><div className="nm">{s.title}</div>{s.topic&&<div className="role">Topic: {s.topic}</div>}</td><td><span className="badge b-type">{s.type}</span></td>
-            <td><div className="rowacts"><button className="btn ghost xs" onClick={()=>setModal({type:'edit-s',item:s})}>{ICON.edit}</button><button className="btn ghost xs" onClick={()=>setModal({type:'del-s',item:s})}>{ICON.trash}</button></div></td></tr>
+function VendorModal({ item, onClose, toast }) {
+  const [name, setName] = useState(item?.name || '');
+  const [contact, setContact] = useState(item?.contact || '');
+  const [drivers, setDrivers] = useState(item?.drivers || []);
+  const [driverName, setDriverName] = useState('');
+  const [driverContact, setDriverContact] = useState('');
+  const [errs, setErrs] = useState({});
+
+  function addDriver() {
+    if (!driverName.trim()) return;
+    setDrivers(d => [...d, { id: Date.now().toString(), name: driverName.trim(), contact: driverContact.trim() }]);
+    setDriverName(''); setDriverContact('');
+  }
+
+  async function save() {
+    if (!name.trim()) { setErrs({ name: 'Vendor name is required' }); return; }
+    await saveItem('carVendors', { ...item, name: name.trim(), contact: contact.trim(), drivers });
+    onClose(); toast(item ? 'Vendor updated.' : 'Vendor added.');
+  }
+
+  return (
+    <Modal title={item ? 'Edit vendor' : 'Add car vendor'} onClose={onClose} onSave={save}
+      saveLabel={item ? 'Save changes' : 'Add vendor'}>
+      <Field label="Vendor name">
+        <input className="input" style={errs.name ? { borderColor: 'var(--rose)' } : {}}
+          value={name} onChange={e => { setName(e.target.value); setErrs({}); }} />
+        {errs.name && <span style={{ color: 'var(--rose)', fontSize: 11.5 }}>{errs.name}</span>}
+      </Field>
+      <Field label="Vendor contact">
+        <input className="input" value={contact} onChange={e => setContact(e.target.value)} />
+      </Field>
+      <Field label="Drivers">
+        <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+          <input className="input" style={{ flex: 1 }} value={driverName}
+            onChange={e => setDriverName(e.target.value)} placeholder="Driver name"
+            onKeyDown={e => e.key === 'Enter' && addDriver()} />
+          <input className="input" style={{ width: 140 }} value={driverContact}
+            onChange={e => setDriverContact(e.target.value)} placeholder="Contact" />
+          <button className="btn sm" onClick={addDriver}>Add</button>
+        </div>
+        {drivers.map(d => (
+          <div key={d.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '5px 10px',
+            background: 'var(--teal-wash)', borderRadius: 8, marginBottom: 4, fontSize: 13 }}>
+            <span style={{ flex: 1 }}>{d.name}{d.contact ? ` — ${d.contact}` : ''}</span>
+            <button onClick={() => setDrivers(dr => dr.filter(x => x.id !== d.id))}
+              style={{ border: 'none', background: 'none', cursor: 'pointer', color: 'var(--rose)', fontSize: 14 }}>×</button>
+          </div>
         ))}
-        {!rows.length&&<tr><td colSpan="5"><Empty title="No sessions yet" sub="Add sessions or import from Excel." /></td></tr>}
-      </tbody></table></div></div>
-    {importOpen&&<GenericImportModal title="Import sessions" store={store} activeEventId={activeEventId} onClose={()=>setImportOpen(false)} toast={toast} parseFile={parseSessionsFile} planFn={planSessionsImport} existingItems={S(store,'sessions')} itemLabel="sessions" buildItem={item=>({...item,eventId:activeEventId})}/>}
-  </>);
+      </Field>
+    </Modal>
+  );
 }
 
-function SessionModal({ item, activeEventId, onClose, toast }) {
-  const [f, setF] = useState(()=>({title:'',topic:'',date:'',type:'Panel',start:'',end:'',...item}));
-  const set=(k)=>(e)=>setF(p=>({...p,[k]:e.target.value}));
-  async function save(){ if(!f.title.trim()||!f.date||!f.start){toast('Title, date and start time are required.');return;} await saveItem('sessions',{...f,eventId:activeEventId}); onClose(); toast(item?'Session updated.':'Session added.'); }
+/* ── TimePicker — HH:MM dropdowns (no native time input) ─────────── */
+export function TimePicker({ value, onChange, style }) {
+  const parts = (value || '').split(':');
+  const hh = parts[0] || '';
+  const mm = parts[1] || '';
+
+  const hours = Array.from({length:24}, (_,i) => String(i).padStart(2,'0'));
+  const mins  = ['00','05','10','15','20','25','30','35','40','45','50','55'];
+
+  function update(newHH, newMM) {
+    if (newHH && newMM) onChange(newHH + ':' + newMM);
+    else if (newHH) onChange(newHH + ':' + (mm||'00'));
+    else if (newMM) onChange((hh||'00') + ':' + newMM);
+  }
+
   return (
-    <Modal title={item?'Edit session':'Add session'} onClose={onClose} onSave={save} saveLabel={item?'Save changes':'Add session'}>
-      <Field label="Title"><input className="input" value={f.title} onChange={set('title')} placeholder="e.g. Legal Round Table Deliberation" /></Field>
-      <Field label="Topic (optional)"><input className="input" value={f.topic} onChange={set('topic')} /></Field>
+    <div style={{display:'flex', gap:4, alignItems:'center', ...style}}>
+      <select className="input" value={hh}
+        style={{width:70, padding:'6px 4px', textAlign:'center'}}
+        onChange={e => update(e.target.value, mm)}>
+        <option value="">HH</option>
+        {hours.map(h => <option key={h} value={h}>{h}</option>)}
+      </select>
+      <span style={{fontWeight:700, color:'var(--muted)'}}>:</span>
+      <select className="input" value={mm}
+        style={{width:70, padding:'6px 4px', textAlign:'center'}}
+        onChange={e => update(hh, e.target.value)}>
+        <option value="">MM</option>
+        {mins.map(m => <option key={m} value={m}>{m}</option>)}
+      </select>
+    </div>
+  );
+}
+
+
+/* ── Logistics — main table view ─────────────────────────────────── */
+export function Logistics({ store, activeEventId }) {
+  const toast = useToast();
+  const { can } = usePerm();
+  const contacts = (store.contacts || []).filter(c => c.status === 'Confirmed');
+  const logi = store.logistics || [];
+  const vendors = store.carVendors || [];
+  const vols = store.volunteers || [];
+  const [expandedId, setExpandedId] = useState(null);
+  const [subModal, setSubModal] = useState(null);
+  const [importOpen, setImportOpen] = useState(false);
+  const [logiShowFilter, setLogiShowFilter] = useState(false);
+
+  // getL must be defined before logiWithNames uses it
+  // If multiple docs exist for same contact, pick the most complete one
+  const getL = cid => {
+    const matches = logi.filter(x => x.contactId === cid);
+    if (!matches.length) return { contactId: cid, eventId: activeEventId };
+    if (matches.length === 1) return matches[0];
+    // Pick the one with the most filled fields
+    return matches.reduce((best, cur) => {
+      const score = r => Object.values(r).filter(v => v && v !== activeEventId).length;
+      return score(cur) > score(best) ? cur : best;
+    });
+  };
+
+  // Build enriched logistics rows (with contact name for sorting)
+  const logiWithNames = contacts.map(c => ({
+    ...getL(c.id), _name: displayName(c), _contactId: c.id,
+  }));
+  const { sorted: logiSorted, sortKey: logiSortKey, sortDir: logiSortDir,
+    toggleSort: logiToggleSort, filters: logiFilters, setFilter: logiSetFilter, clearFilters: logiClearFilters
+  } = useSortFilter(logiWithNames, { key: '_name', dir: 'asc' });
+  const sortedContacts = logiSorted.map(l => contacts.find(c => c.id === l._contactId)).filter(Boolean);
+
+  if (!contacts.length) return (
+    <>
+      <div className="page-head"><div className="ph-txt"><h1>Logistics</h1><p>Confirmed guests appear here automatically.</p></div></div>
+      <div className="panel"><Empty title="No confirmed guests yet" sub="Confirm invitees in Outreach to see them here." /></div>
+    </>
+  );
+
+  // Toggle a top-level requirement field
+  async function toggleReq(cid, field, val) {
+    const L = getL(cid);
+    await saveItem('logistics', { ...L, [field]: val, eventId: activeEventId });
+    if (val === 'required') {
+      const typeMap = { flightReq:'flight', carReq:'car', accomReq:'accommodation' };
+      setSubModal({ type: typeMap[field] || field.replace('Req','').toLowerCase(), contactId: cid, item: L });
+    }
+  }
+
+  async function setField(cid, key, val) {
+    const L = getL(cid);
+    await saveItem('logistics', { ...L, [key]: val, eventId: activeEventId });
+  }
+
+  // ReqToggle is defined as a standalone function below
+
+  // Pending flag logic
+  // A guest is "not required" when all 3 are explicitly marked not_required
+  const isNotRequired = cid => {
+    const L = getL(cid);
+    return L.flightReq === 'not_required' && L.carReq === 'not_required' && L.accomReq === 'not_required';
+  };
+
+  // A guest is pending when at least one required item is incomplete
+  const isPending = cid => {
+    if (isNotRequired(cid)) return false; // all explicitly set — not pending
+    const L = getL(cid);
+    const flightPending = L.flightReq !== 'not_required' && (!L.arrivalFlightNo && !L.departureFlightNo);
+    const carPending    = L.carReq    !== 'not_required' && !L.carVendorId;
+    const accomPending  = L.accomReq  !== 'not_required' && !L.hotelName;
+    const basicPending  = !L.arrivalDate;
+    return flightPending || carPending || accomPending || basicPending;
+  };
+
+  return (
+    <>
+      <div className="page-head">
+        <div className="ph-txt"><h1>Logistics</h1><p>Travel and stay for confirmed guests. Click any row to expand details.</p></div>
+        <button className={'btn sm'+(logiShowFilter?' primary':'')} onClick={()=>setLogiShowFilter(f=>!f)}>⚙ Filter</button>
+        <button className="btn sm" onClick={()=>quickExport('Logistics', sortedContacts.map(c=>{
+          const L=getL(c.id);
+          return {...L, guestName:displayName(c), arrivalDate:L.arrivalDate, departureDate:L.departureDate,
+            hotel:L.hotelName, flightStatus:L.flightReq, carStatus:L.carReq, accomStatus:L.accomReq};
+        }), [['guestName','Guest'],['arrivalDate','Arrival Date'],['arrivalTime','Arrival Time'],
+          ['arrivalLocation','Arrival Location'],['departureDate','Departure Date'],['departureTime','Departure Time'],
+          ['hotelName','Hotel'],['checkinDate','Check-in'],['checkoutDate','Check-out'],
+          ['flightReq','Flight'],['carReq','Car'],['accomReq','Accommodation']])}>⬇ Export</button>
+        <button className="btn sm" onClick={() => setImportOpen(true)}>{ICON.upload} Import</button>
+      </div>
+
+      {/* Pending flag banner */}
+      {(() => {
+        const pend    = contacts.filter(c => isPending(c.id));
+        const notReqd = contacts.filter(c => isNotRequired(c.id));
+        return (<>
+          {pend.length > 0 && (
+            <div style={{ background:'var(--amber-wash)', border:'1px solid #E8D5A3', borderRadius:10,
+              padding:'10px 16px', marginBottom:8, fontSize:13, color:'var(--amber)', display:'flex', gap:8, alignItems:'center' }}>
+              ⚠ <b>{pend.length} guest{pend.length>1?'s':''}</b> have incomplete logistics — travel details need to be filled.
+            </div>
+          )}
+          {notReqd.length > 0 && (
+            <div style={{ background:'#F0F8F4', border:'1px solid var(--teal)', borderRadius:10,
+              padding:'10px 16px', marginBottom:8, fontSize:13, color:'var(--teal)', display:'flex', gap:8, alignItems:'center' }}>
+              ✓ <b>{notReqd.length} guest{notReqd.length>1?'s':''}</b> marked as no arrangements required (local/self-arranged).
+            </div>
+          )}
+        </>);
+      })()}
+
+      <div className="panel">
+        <div className="panel-body" style={{ overflowX: 'auto' }}>
+          <table style={{ minWidth: 900 }}>
+            <thead>
+              <tr>
+                {['#', 'Name', 'Contact', 'Overall POC', 'Arrival', 'Departure', 'Flight', 'Car', 'Accommodation', 'Remarks', ''].map(h => (
+                  <th key={h} style={{ fontSize: 11.5, fontWeight: 600, whiteSpace: 'nowrap' }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {sortedContacts.map((c, idx) => {
+                const L = getL(c.id);
+                const pending = isPending(c.id);
+                const poc = vols.find(v => v.id === L.overallPocId);
+                const isExpanded = expandedId === c.id;
+                return (
+                  <React.Fragment key={c.id}>
+                    <tr
+                      style={{ background: pending ? '#FFFBF2' : isNotRequired(c.id) ? '#F5FFF8' : 'white', cursor: 'pointer' }}
+                      onClick={() => setExpandedId(isExpanded ? null : c.id)}>
+                      <td style={{ color: 'var(--muted)', fontSize: 12 }}>{idx + 1}</td>
+                      <td>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          {pending && <span title="Incomplete" style={{ color: 'var(--amber)', fontSize: 14 }}>⚠</span>}
+                          <div>
+                            <div className="nm">{displayName(c)}</div>
+                            <div className="role">{c.type}</div>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="muted-sm">{c.phone || '—'}</td>
+                      <td>
+                        <select className="statsel" value={L.overallPocId || ''}
+                          onClick={e => e.stopPropagation()}
+                          onChange={e => { e.stopPropagation(); setField(c.id, 'overallPocId', e.target.value); }}>
+                          <option value="">— Assign POC —</option>
+                          {vols.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                        </select>
+                      </td>
+                      <td>
+                        <div style={{ fontSize: 12 }}>
+                          <div>{L.arrivalDate ? `${L.arrivalDate}` : <span style={{ color: 'var(--faint)' }}>No date</span>}</div>
+                          {L.arrivalTime && <div style={{ color: 'var(--muted)' }}>{L.arrivalTime}</div>}
+                          {L.arrivalLocation && <div style={{ color: 'var(--muted)' }}>{L.arrivalLocation}</div>}
+                        </div>
+                      </td>
+                      <td>
+                        <div style={{ fontSize: 12 }}>
+                          <div>{L.departureDate ? `${L.departureDate}` : <span style={{ color: 'var(--faint)' }}>No date</span>}</div>
+                          {L.departureTime && <div style={{ color: 'var(--muted)' }}>{L.departureTime}</div>}
+                          {L.departureLocation && <div style={{ color: 'var(--muted)' }}>{L.departureLocation}</div>}
+                        </div>
+                      </td>
+                      <td onClick={e => e.stopPropagation()}>{can('logistics.flight') ? <LogisticsReqToggle cid={c.id} field="flightReq" getL={getL} toggleReq={toggleReq} setSubModal={setSubModal}/> : <span className="muted-sm">{getL(c.id).flightReq||'required'}</span>}</td>
+                      <td onClick={e => e.stopPropagation()}>{can('logistics.car') ? <LogisticsReqToggle cid={c.id} field="carReq" getL={getL} toggleReq={toggleReq} setSubModal={setSubModal}/> : <span className="muted-sm">{getL(c.id).carReq||'required'}</span>}</td>
+                      <td onClick={e => e.stopPropagation()}>{can('logistics.accom') ? <LogisticsReqToggle cid={c.id} field="accomReq" getL={getL} toggleReq={toggleReq} setSubModal={setSubModal}/> : <span className="muted-sm">{getL(c.id).accomReq||'required'}</span>}</td>
+
+                      <td style={{ color: 'var(--teal)', fontSize: 13 }}>{isExpanded ? '▲' : '▼'}</td>
+                    </tr>
+                    {isExpanded && (
+                      <tr key={c.id + '_exp'}>
+                        <td colSpan={11} style={{ background: 'var(--paper)', padding: '16px 20px', borderBottom: '2px solid var(--teal)' }}>
+                          <LogisticsExpandedRow c={c} L={L} store={store} setField={setField} vendors={vendors} vols={vols} toast={toast} />
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Sub-modals for Flight / Car / Accommodation */}
+      {subModal?.type === 'flight' && (
+        <FlightModal contactId={subModal.contactId} item={getL(subModal.contactId)}
+          onClose={() => setSubModal(null)} toast={toast} activeEventId={activeEventId} />
+      )}
+      {subModal?.type === 'car' && (
+        <CarModal contactId={subModal.contactId} item={getL(subModal.contactId)}
+          vendors={vendors} onClose={() => setSubModal(null)} toast={toast} activeEventId={activeEventId} />
+      )}
+      {subModal?.type === 'accommodation' && (
+        <AccommodationModal contactId={subModal.contactId} item={getL(subModal.contactId)}
+          onClose={() => setSubModal(null)} toast={toast} activeEventId={activeEventId} />
+      )}
+      {importOpen && <LogisticsImportModal store={store} activeEventId={activeEventId}
+        onClose={() => setImportOpen(false)} toast={toast} />}
+    </>
+  );
+}
+
+/* ── Expanded inline row — memoized to prevent remount on Firestore updates ── */
+const LogisticsExpandedRow = React.memo(function LogisticsExpandedRow({ c, L, store, setField, vendors, vols, toast }) {
+  const { can } = usePerm();
+  const [local, setLocal] = useState({
+    arrivalDate: L.arrivalDate||'', arrivalTime: L.arrivalTime||'', arrivalLocation: L.arrivalLocation||'',
+    departureDate: L.departureDate||'', departureTime: L.departureTime||'', departureLocation: L.departureLocation||'',
+    remarks: L.remarks||'',
+  });
+  // Sync from Firestore ONLY when the row is first opened (not on every re-render)
+  const initialised = React.useRef(false);
+  React.useEffect(() => {
+    if (!initialised.current) {
+      setLocal({
+        arrivalDate: L.arrivalDate||'', arrivalTime: L.arrivalTime||'', arrivalLocation: L.arrivalLocation||'',
+        departureDate: L.departureDate||'', departureTime: L.departureTime||'', departureLocation: L.departureLocation||'',
+        remarks: L.remarks||'',
+      });
+      initialised.current = true;
+    }
+  }, [c.id]);
+  const set = k => val => setLocal(p => ({...p, [k]: val}));
+  const setE = k => e => setLocal(p => ({...p, [k]: e.target.value}));
+
+  async function save() {
+    const L = (store?.logistics || []).find(x => x.contactId === c.id) || { contactId: c.id };
+    await saveItem('logistics', {
+      ...L,
+      arrivalDate:       local.arrivalDate,
+      arrivalTime:       local.arrivalTime,
+      arrivalLocation:   local.arrivalLocation,
+      departureDate:     local.departureDate,
+      departureTime:     local.departureTime,
+      departureLocation: local.departureLocation,
+      remarks:           local.remarks,
+    });
+    toast('Logistics details saved.');
+  }
+
+  // Missing field detection
+  const missing = [];
+  if (!local.arrivalDate)     missing.push('Arrival date');
+  if (!local.arrivalTime)     missing.push('Arrival time');
+  if (!local.arrivalLocation) missing.push('Arrival location');
+  if (!local.departureDate)   missing.push('Departure date');
+
+  return (
+    <div>
+      {missing.length > 0 && (
+        <div style={{background:'var(--amber-wash)',border:'1px solid #E8D5A3',borderRadius:8,
+          padding:'8px 14px',marginBottom:10,fontSize:12.5,color:'var(--amber)'}}>
+          ⚠ Missing: {missing.join(' · ')}
+        </div>
+      )}
+      <div style={{marginBottom:14}}>
+        <label style={{fontSize:12,fontWeight:600,display:'block',marginBottom:4,color:'var(--teal)'}}>Remarks</label>
+        <textarea className="input" rows={2} value={local.remarks} onChange={setE('remarks')}
+          placeholder="Special requirements, dietary needs, accessibility…"
+          style={{resize:'vertical',fontFamily:'var(--sans)',width:'100%'}}/>
+      </div>
+    <div className="split-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+      {/* Left: Arrival / Departure basics */}
+      <div>
+        <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--teal)', marginBottom: 10 }}>Arrival details</div>
+        <div className="grid2" style={{ gap: 8 }}>
+          <Field label="Arrival date"><input className="input" type="date" value={local.arrivalDate} onChange={setE('arrivalDate')} style={!local.arrivalDate?{borderColor:'var(--amber)'}:{}}/></Field>
+          <Field label="Arrival time"><TimePicker value={local.arrivalTime} onChange={set('arrivalTime')}/></Field>
+          <Field label="Arrival location" style={{ gridColumn: '1/-1' }}><input className="input" value={local.arrivalLocation} onChange={setE('arrivalLocation')} placeholder="Airport / station / venue" style={!local.arrivalLocation?{borderColor:'var(--amber)'}:{}}/></Field>
+        </div>
+        <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--teal)', margin: '12px 0 10px' }}>Departure details</div>
+        <div className="grid2" style={{ gap: 8 }}>
+          <Field label="Departure date"><input className="input" type="date" value={local.departureDate} onChange={setE('departureDate')} style={!local.departureDate?{borderColor:'var(--amber)'}:{}}/></Field>
+          <Field label="Departure from"><input className="input" value={local.departureLocation} onChange={setE('departureLocation')} placeholder="Airport / station" /></Field>
+          <Field label="Departure time" style={{ gridColumn: '1/-1' }}><TimePicker value={local.departureTime} onChange={set('departureTime')}/></Field>
+        </div>
+      </div>
+      {/* Right: sub-form summaries only */}
+      <div>
+        <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--teal)', marginBottom: 10 }}>Arrangements summary</div>
+        {/* Summary of sub-form data */}
+        {L.flightReq !== 'not_required' && L.arrivalFlightNo && (
+          <div style={{ marginTop: 10, padding: '8px 12px', background: 'var(--teal-wash)', borderRadius: 8, fontSize: 12 }}>
+            ✈️ Flight booked — {L.arrivalFlightNo} arriving {L.arrivalFlightDate} at {L.arrivalFlightTime}
+          </div>
+        )}
+        {L.carReq !== 'not_required' && L.carVendorId && (
+          <div style={{ marginTop: 6, padding: '8px 12px', background: 'var(--teal-wash)', borderRadius: 8, fontSize: 12 }}>
+            🚗 Car booked — {(vendors.find(v => v.id === L.carVendorId) || {}).name}
+          </div>
+        )}
+        {L.accomReq !== 'not_required' && L.hotelName && (
+          <div style={{ marginTop: 6, padding: '8px 12px', background: 'var(--teal-wash)', borderRadius: 8, fontSize: 12 }}>
+            🏨 {L.hotelName} — {L.checkinDate} to {L.checkoutDate}
+          </div>
+        )}
+      </div>
+    </div>
+    <div style={{ marginTop: 14, display: 'flex', justifyContent: 'flex-end' }}>
+      <button className="btn primary sm" onClick={save}>💾 Save details</button>
+    </div>
+    {!missing.length && !can('logistics.edit') && (
+      <div style={{textAlign:'center',fontSize:12,color:'var(--muted)',marginTop:8}}>🔒 You have view-only access to logistics details.</div>
+    )}
+  </div>
+  );
+});
+
+/* ── Flight modal ────────────────────────────────────────────────── */
+function FlightModal({ contactId, item, onClose, toast, activeEventId }) {
+  const [f, setF] = useState(() => ({
+    arrivalFrom: '', arrivalTo: '', arrivalFlightNo: '', arrivalFlightDate: '', arrivalFlightTime: '',
+    departureFrom: '', departureTo: '', departureFlightNo: '', departureFlightDate: '', departureFlightTime: '',
+    ...item,
+  }));
+  const set = k => e => setF(p => ({ ...p, [k]: e.target.value }));
+  async function save() {
+    const existing = item?.id ? { id: item.id } : {};
+    await saveItem('logistics', { ...f, ...existing, contactId, eventId: activeEventId });
+    onClose(); toast('Flight details saved.');
+  }
+  return (
+    <Modal title="✈️ Flight details" onClose={onClose} onSave={save} saveLabel="Save flight details">
+      <div style={{ fontWeight: 600, fontSize: 12, color: 'var(--teal)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '.05em' }}>Arrival flight</div>
       <div className="grid2">
-        <Field label="Date"><input className="input" type="date" value={f.date} onChange={set('date')} /></Field>
-        <Field label="Type"><select className="input" value={f.type} onChange={set('type')}>{SESSION_TYPES.map(t=><option key={t}>{t}</option>)}</select></Field>
-        <Field label="Start time"><input className="input" value={f.start} onChange={set('start')} placeholder="10:00" /></Field>
-        <Field label="End time (optional)"><input className="input" value={f.end} onChange={set('end')} placeholder="12:45" /></Field>
+        <Field label="From"><input className="input" value={f.arrivalFrom} onChange={set('arrivalFrom')} placeholder="City or airport" /></Field>
+        <Field label="To"><input className="input" value={f.arrivalTo} onChange={set('arrivalTo')} placeholder="City or airport" /></Field>
+        <Field label="Flight number"><input className="input" value={f.arrivalFlightNo} onChange={set('arrivalFlightNo')} placeholder="e.g. AI 631" /></Field>
+        <Field label="Arrival date"><input className="input" type="date" value={f.arrivalFlightDate} onChange={set('arrivalFlightDate')} /></Field>
+        <Field label="Arrival time"><TimePicker value={f.arrivalFlightTime} onChange={v => setF(p => ({...p, arrivalFlightTime:v}))}/></Field>
+      </div>
+      <div style={{ fontWeight: 600, fontSize: 12, color: 'var(--teal)', margin: '14px 0 8px', textTransform: 'uppercase', letterSpacing: '.05em' }}>Departure flight</div>
+      <div className="grid2">
+        <Field label="From"><input className="input" value={f.departureFrom} onChange={set('departureFrom')} placeholder="City or airport" /></Field>
+        <Field label="To"><input className="input" value={f.departureTo} onChange={set('departureTo')} placeholder="City or airport" /></Field>
+        <Field label="Flight number"><input className="input" value={f.departureFlightNo} onChange={set('departureFlightNo')} placeholder="e.g. AI 632" /></Field>
+        <Field label="Departure date"><input className="input" type="date" value={f.departureFlightDate} onChange={set('departureFlightDate')} /></Field>
+        <Field label="Flight Departure Time"><TimePicker value={f.departureFlightTime} onChange={v => setF(p => ({...p, departureFlightTime:v}))}/></Field>
       </div>
     </Modal>
   );
 }
 
+/* ── Car modal ───────────────────────────────────────────────────── */
+function CarModal({ contactId, item, vendors, onClose, toast, activeEventId }) {
+  const [f, setF] = useState(() => ({
+    carVendorId: '', carDriverId: '', carType: 'SUV',
+    carPickupDate: '', carPickupTime: '', carDepartureDate: '', carDepartureTime: '',
+    ...item,
+  }));
+  const set = k => e => setF(p => ({ ...p, [k]: e.target.value }));
+  const selectedVendor = vendors.find(v => v.id === f.carVendorId);
+  const drivers = selectedVendor?.drivers || [];
+  const selectedDriver = drivers.find(d => d.id === f.carDriverId);
+  const [errs, setErrs] = useState({});
+
+  async function save() {
+    if (!f.carVendorId) { setErrs({ vendor: 'Select a vendor' }); return; }
+    const existing = item?.id ? { id: item.id } : {};
+    await saveItem('logistics', { ...f, ...existing, contactId, eventId: activeEventId });
+    onClose(); toast('Car details saved.');
+  }
+
+  return (
+    <Modal title="🚗 Car details" onClose={onClose} onSave={save} saveLabel="Save car details">
+      <div className="grid2">
+        <Field label="Car vendor">
+          <select className="input" style={errs.vendor ? { borderColor: 'var(--rose)' } : {}}
+            value={f.carVendorId} onChange={e => { set('carVendorId')(e); setF(p => ({ ...p, carDriverId: '' })); setErrs({}); }}>
+            <option value="">— Select vendor —</option>
+            {vendors.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+          </select>
+          {errs.vendor && <span style={{ color: 'var(--rose)', fontSize: 11.5 }}>{errs.vendor}</span>}
+        </Field>
+        <Field label="Vendor contact">
+          <input className="input" value={selectedVendor?.contact || ''} readOnly style={{ background: 'var(--paper)', color: 'var(--muted)' }} />
+        </Field>
+        <Field label="Driver">
+          <select className="input" value={f.carDriverId} onChange={set('carDriverId')} disabled={!f.carVendorId}>
+            <option value="">— Select driver —</option>
+            {drivers.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+          </select>
+        </Field>
+        <Field label="Driver contact">
+          <input className="input" value={selectedDriver?.contact || ''} readOnly style={{ background: 'var(--paper)', color: 'var(--muted)' }} />
+        </Field>
+        <Field label="Car type">
+          <select className="input" value={f.carType} onChange={set('carType')}>
+            {['SUV', 'Sedan', 'Basic'].map(t => <option key={t}>{t}</option>)}
+          </select>
+        </Field>
+      </div>
+      <div style={{ fontWeight: 600, fontSize: 12, color: 'var(--teal)', margin: '14px 0 8px', textTransform: 'uppercase', letterSpacing: '.05em' }}>Pickup</div>
+      <div className="grid2">
+        <Field label="Pickup date"><input className="input" type="date" value={f.carPickupDate} onChange={set('carPickupDate')} /></Field>
+        <Field label="Pickup time"><TimePicker value={f.carPickupTime} onChange={v => setF(p => ({...p, carPickupTime:v}))}/></Field>
+      </div>
+      <div style={{ fontWeight: 600, fontSize: 12, color: 'var(--teal)', margin: '14px 0 8px', textTransform: 'uppercase', letterSpacing: '.05em' }}>Departure by car</div>
+      <div className="grid2">
+        <Field label="Departure date"><input className="input" type="date" value={f.carDepartureDate} onChange={set('carDepartureDate')} /></Field>
+        <Field label="Departure time"><TimePicker value={f.carDepartureTime} onChange={v => setF(p => ({...p, carDepartureTime:v}))}/></Field>
+      </div>
+    </Modal>
+  );
+}
+
+/* ── Accommodation modal ─────────────────────────────────────────── */
+function AccommodationModal({ contactId, item, onClose, toast, activeEventId }) {
+  const [f, setF] = useState(() => ({
+    hotelName: '', checkinDate: '', checkinTime: '', checkoutDate: '', checkoutTime: '',
+    ...item,
+  }));
+  const set = k => e => setF(p => ({ ...p, [k]: e.target.value }));
+
+  const totalNights = f.checkinDate && f.checkoutDate
+    ? Math.max(0, Math.ceil((new Date(f.checkoutDate) - new Date(f.checkinDate)) / (1000 * 60 * 60 * 24)))
+    : null;
+
+  async function save() {
+    // Always save into existing logistics record if one exists
+    const existing = item?.id ? { id: item.id } : {};
+    await saveItem('logistics', { ...f, ...existing, contactId, eventId: activeEventId });
+    onClose(); toast('Accommodation details saved.');
+  }
+
+  return (
+    <Modal title="🏨 Accommodation details" onClose={onClose} onSave={save} saveLabel="Save accommodation">
+      <Field label="Hotel name">
+        <input className="input" value={f.hotelName} onChange={set('hotelName')} placeholder="Hotel name" />
+      </Field>
+      <div className="grid2">
+        <Field label="Check-in date"><input className="input" type="date" value={f.checkinDate} onChange={set('checkinDate')} /></Field>
+        <Field label="Check-in time"><TimePicker value={f.checkinTime} onChange={v => setF(p => ({...p, checkinTime:v}))}/></Field>
+        <Field label="Check-out date"><input className="input" type="date" value={f.checkoutDate} onChange={set('checkoutDate')} /></Field>
+        <Field label="Check-out time"><TimePicker value={f.checkoutTime} onChange={v => setF(p => ({...p, checkoutTime:v}))}/></Field>
+      </div>
+      {totalNights !== null && (
+        <div style={{ padding: '10px 14px', background: 'var(--teal-wash)', borderRadius: 8, fontSize: 13, color: 'var(--teal)', fontWeight: 500 }}>
+          Total nights: {totalNights}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+
+const SESSION_TYPES_NEW = ['Panel', 'Meal', 'Ceremony', 'Exhibition', 'Drone Show',
+  'Media Bytes', 'Podcast', 'Hospitality', 'Miscellaneous'];
+
+/* ══ Overall Schedule ══════════════════════════════════════════════ */
+/* ── Overall schedule day table (standalone to avoid IIFE in JSX) ── */
+function OverallDayTable({ daySessions, store, setModal }) {
+  const { can } = usePerm();
+  const colCfg = (store.appConfig||[]).find(c=>c.id==='columnConfig')||{};
+  const activeCols = colCfg.overallSchedule || ['start','title','venue','type'];
+  const COL_LABELS = { date:'Date', start:'Time', end:'End', title:'Session', venue:'Venue', type:'Type', topic:'Topic' };
+  const showCol = k => activeCols.includes(k);
+  return (
+    <table style={{ width:'100%', borderCollapse:'collapse', fontSize:13 }}>
+      <thead>
+        <tr style={{ background:'var(--teal-wash)' }}>
+          {activeCols.filter(k=>COL_LABELS[k]).map(k=>(
+            <th key={k} style={{ padding:'7px 12px', textAlign:'left', fontSize:11.5, fontWeight:600, borderBottom:'1px solid var(--line)' }}>
+              {COL_LABELS[k]}
+            </th>
+          ))}
+          <th style={{ padding:'7px 12px' }}></th>
+        </tr>
+      </thead>
+      <tbody>
+        {daySessions.map(s => (
+          <tr key={s.id} style={{ borderBottom:'1px solid var(--line)' }}>
+            {showCol('date') && <td style={{ padding:'8px 12px', whiteSpace:'nowrap', color:'var(--muted)', fontSize:12 }}>{s.date||'—'}</td>}
+            {showCol('start') && <td style={{ padding:'8px 12px', whiteSpace:'nowrap', color:'var(--muted)', fontSize:12 }}>{s.start||'—'}{s.end?` – ${s.end}`:''}</td>}
+            {showCol('title') && <td style={{ padding:'8px 12px' }}><div className="nm">{s.title}</div>{s.topic&&<div className="role">{s.topic}</div>}</td>}
+            {showCol('venue') && <td style={{ padding:'8px 12px', color:'var(--muted)', fontSize:12 }}>{s.venue||'—'}</td>}
+            {showCol('type') && <td style={{ padding:'8px 12px' }}><span className="badge b-type">{s.type}</span></td>}
+            {showCol('topic') && !showCol('title') && <td style={{ padding:'8px 12px', color:'var(--muted)', fontSize:12 }}>{s.topic||'—'}</td>}
+            <td style={{ padding:'8px 12px', textAlign:'right' }}>
+              <div className="rowacts">
+                {can('schedule.minutemin') && <button className="btn ghost xs" onClick={()=>setModal({type:'minsched',id:s.id})} title="Minute-to-minute">📋</button>}
+                {can('schedule.edit') && <button className="btn ghost xs" onClick={()=>setModal({type:'edit',item:s})}>{ICON.edit}</button>}
+                {can('schedule.edit') && <button className="btn ghost xs" onClick={()=>setModal({type:'del',id:s.id})}>{ICON.trash}</button>}
+              </div>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+
+export function OverallSchedule({ store, activeEventId }) {
+  const { profile } = useAuth();
+  const toast = useToast();
+  const { can } = usePerm();
+  const sessions = (store.sessions || []).sort((a, b) =>
+    a.date > b.date ? 1 : a.date < b.date ? -1 : (a.start || '') > (b.start || '') ? 1 : -1);
+  const [modal, setModal] = useState(null);
+  const [q, setQ] = useState('');
+  const [viewMode, setViewMode] = useState('list'); // 'list' | 'overlay'
+
+  const filtered = sessions.filter(s =>
+    !q || (s.title || '').toLowerCase().includes(q.toLowerCase()) ||
+    (s.venue || '').toLowerCase().includes(q.toLowerCase()));
+
+  // Group by date
+  const byDate = {};
+  filtered.forEach(s => {
+    const d = s.date || 'No date';
+    if (!byDate[d]) byDate[d] = [];
+    byDate[d].push(s);
+  });
+
+  return (
+    <>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14, flexWrap: 'wrap', gap: 8 }}>
+        <SearchBox value={q} onChange={setQ} />
+        <div style={{ display: 'flex', gap: 8 }}>
+          <div style={{display:'flex',border:'1px solid var(--line)',borderRadius:8,overflow:'hidden'}}>
+            <button onClick={()=>setViewMode('list')}
+              style={{padding:'5px 12px',border:'none',background:viewMode==='list'?'var(--teal)':'#fff',
+                color:viewMode==='list'?'#fff':'var(--muted)',cursor:'pointer',fontSize:12,fontWeight:500}}>
+              ☰ List
+            </button>
+            <button onClick={()=>setViewMode('overlay')}
+              style={{padding:'5px 12px',border:'none',background:viewMode==='overlay'?'var(--teal)':'#fff',
+                color:viewMode==='overlay'?'#fff':'var(--muted)',cursor:'pointer',fontSize:12,fontWeight:500}}>
+              ⊞ Grid
+            </button>
+          </div>
+          {can('schedule.edit') && <button className="btn sm" onClick={() => setModal({ type: 'import' })}>{ICON.upload} Import</button>}
+          {can('schedule.edit') && <button className="btn primary sm" onClick={() => setModal({ type: 'add' })}>{ICON.plus} Add session</button>}
+        </div>
+      </div>
+
+      {Object.keys(byDate).length === 0 && (
+        <Empty title="No sessions yet" sub="Add sessions manually or import from Excel." />
+      )}
+
+      {/* ── Overlay / Grid view ──────────────────────────────── */}
+      {viewMode === 'overlay' && Object.keys(byDate).length > 0 && (
+        <OverlaySchedule byDate={byDate} onEdit={s=>can('schedule.edit')&&setModal({type:'edit',item:s})}
+          onDelete={s=>can('schedule.edit')&&setModal({type:'del',id:s.id})} onMinSched={s=>can('schedule.minutemin')&&setModal({type:'minsched',id:s.id})}/>
+      )}
+
+      {/* ── List view ────────────────────────────────────────── */}
+      {viewMode === 'list' && Object.entries(byDate).map(([date, daySessions]) => (
+        <div key={date} style={{ marginBottom: 20 }}>
+          <div style={{ fontFamily: 'var(--serif)', fontSize: 15, fontWeight: 500, color: 'var(--teal)',
+            marginBottom: 8, paddingBottom: 4, borderBottom: '1px solid var(--line)' }}>
+            {date !== 'No date' ? fmtDate(date) : 'No date set'}
+          </div>
+          <OverallDayTable daySessions={daySessions} store={store} setModal={setModal}/>
+        </div>
+      ))}
+
+      {(modal?.type === 'add' || modal?.type === 'edit') && (
+        <OverallSessionModal item={sessions.find(s=>s.id===modal.id)||undefined} activeEventId={activeEventId}
+          onClose={() => setModal(null)} toast={toast} />
+      )}
+      {modal?.type === 'del' && (() => {
+        const _sess = sessions.find(s=>s.id===modal.id);
+        return _sess ? <DeleteModal label={_sess.title} onClose={()=>setModal(null)}
+          onConfirm={async()=>{const _s=sessions.find(x=>x.id===modal.id);const _sa=(store.assignments||[]).filter(a=>a.sessionId===modal.id);if(_s){await trashItem('sessions',_s,_sa.map(a=>({collection:'assignments',data:a})),profile?.email||'');}_sa.forEach(a=>removeItem('assignments',a.id));setModal(null);await removeItem('sessions',modal.id);toast('Session moved to trash.');}}/> : null;
+      })()}
+      {modal?.type === 'minsched' && (
+        <MinuteToMinuteModal session={sessions.find(s=>s.id===modal.id)||undefined} store={store} activeEventId={activeEventId}
+          onClose={() => setModal(null)} toast={toast} />
+      )}
+      {modal?.type === 'import' && (
+        <ImportModal store={store} activeEventId={activeEventId} onClose={() => setModal(null)} toast={toast} />
+      )}
+    </>
+  );
+}
+
+/* ── Overlay / Grid Schedule View ───────────────────────────────── */
+function OverlaySchedule({ byDate, onEdit, onDelete, onMinSched }) {
+  const TYPE_COLORS = {
+    'Panel': '#0F6E56', 'Meal': '#A8690C', 'Ceremony': '#7C5CBF',
+    'Exhibition': '#1C5D8C', 'Drone Show': '#9A3550', 'Media Bytes': '#1D9E75',
+    'Podcast': '#5B7C1F', 'Hospitality': '#C17A2A', 'Miscellaneous': '#6E776F',
+  };
+  const { can } = usePerm();
+
+  function assignLanes(sessions) {
+    const sorted = [...sessions].sort((a,b)=>(a.start||'')>(b.start||'')?1:-1);
+    const lanes = [];
+    sorted.forEach(s => {
+      const sStart = toMin(s.start||'00:00');
+      const sEnd   = toMin(s.end||s.start||'00:00') + (s.end ? 0 : 60);
+      let placed = false;
+      for (let i = 0; i < lanes.length; i++) {
+        const last = lanes[i][lanes[i].length-1];
+        const lEnd = toMin(last.end||last.start||'00:00') + (last.end ? 0 : 60);
+        if (sStart >= lEnd) { lanes[i].push(s); placed = true; break; }
+      }
+      if (!placed) lanes.push([s]);
+    });
+    return lanes;
+  }
+
+  return (
+    <div style={{ overflowX: 'auto' }}>
+      {Object.entries(byDate).map(([date, sessions]) => {
+        const sorted = [...sessions].sort((a,b)=>(a.start||'')>(b.start||'')?1:-1);
+        const starts = sorted.map(s=>s.start).filter(Boolean);
+        if (!starts.length) return null;
+
+        const dayStart = toMin(starts[0]);
+        const dayEnd   = Math.max(...sorted.map(s=>toMin(s.end||s.start||'00:00')+(s.end?0:60)));
+        const totalMin = Math.max(dayEnd - dayStart, 60);
+        const PX = 3; // px per minute
+        const lanes = assignLanes(sorted);
+
+        return (
+          <div key={date} style={{ marginBottom:24 }}>
+            <div style={{ fontFamily:'var(--serif)', fontSize:15, fontWeight:500,
+              color:'var(--teal)', marginBottom:8, paddingBottom:4, borderBottom:'1px solid var(--line)' }}>
+              {date !== 'No date' ? fmtDate(date) : 'No date set'}
+              {lanes.length > 1 && <span style={{fontSize:11,color:'var(--muted)',marginLeft:8}}>({lanes.length} parallel tracks)</span>}
+            </div>
+
+            <div style={{ overflowX:'auto' }}>
+              {/* Time ruler */}
+              <div style={{ position:'relative', height:18, minWidth: totalMin*PX+16, marginBottom:2 }}>
+                {Array.from({length: Math.ceil(totalMin/60)+1}, (_,i) => {
+                  const min = dayStart + i*60;
+                  if (min > dayEnd) return null;
+                  const hh = String(Math.floor(min/60)).padStart(2,'0');
+                  const mm = String(min%60).padStart(2,'0');
+                  return (
+                    <div key={i} style={{position:'absolute', left:8+i*60*PX, fontSize:10, color:'var(--faint)'}}>
+                      {hh}:{mm}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Lanes */}
+              {lanes.map((lane, laneIdx) => (
+                <div key={laneIdx} style={{ position:'relative', height:88, marginBottom:3,
+                  minWidth: totalMin*PX+16, background:'#FAFAF7', borderRadius:6 }}>
+                  {lane.map(s => {
+                    const sStart = toMin(s.start||'00:00');
+                    const sEnd   = toMin(s.end||s.start||'00:00') + (s.end ? 0 : 60);
+                    const left   = 8 + (sStart - dayStart)*PX;
+                    const width  = Math.max((sEnd - sStart)*PX - 2, 60);
+                    const color  = TYPE_COLORS[s.type] || '#6E776F';
+                    return (
+                      <div key={s.id} style={{
+                        position:'absolute', top:2, left, width, height:84,
+                        background:color+'18', border:`2px solid ${color}`,
+                        borderRadius:6, padding:'4px 6px', overflow:'hidden',
+                      }} title={`${s.start}${s.end?` – ${s.end}`:''} · ${s.title}${s.venue?` · ${s.venue}`:''}`}>
+                        <div style={{fontSize:10,fontWeight:700,color,lineHeight:1.2}}>
+                          {s.start}{s.end?`–${s.end}`:''}
+                        </div>
+                        <div style={{fontSize:11,fontWeight:600,color:'var(--ink)',lineHeight:1.2,marginTop:1,wordBreak:'break-word'}}>
+                          {s.title}
+                        </div>
+                        {s.venue && <div style={{fontSize:10,color:'var(--muted)'}}>{s.venue}</div>}
+                        <div style={{display:'flex',gap:2,marginTop:3}}>
+                          {can('schedule.minutemin') && <button className="btn ghost xs" style={{fontSize:9,padding:'1px 3px'}}
+                            onClick={e=>{e.stopPropagation();onMinSched(s);}}>📋</button>}
+                          {can('schedule.edit') && <button className="btn ghost xs" style={{fontSize:9,padding:'1px 3px'}}
+                            onClick={e=>{e.stopPropagation();onEdit(s);}}>{ICON.edit}</button>}
+                          {can('schedule.edit') && <button className="btn ghost xs" style={{fontSize:9,padding:'1px 3px'}}
+                            onClick={e=>{e.stopPropagation();onDelete(s);}}>{ICON.trash}</button>}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ))}
+
+              {/* Legend */}
+              <div style={{display:'flex',flexWrap:'wrap',gap:8,marginTop:4}}>
+                {[...new Set(sorted.map(s=>s.type))].map(type=>(
+                  <div key={type} style={{display:'flex',alignItems:'center',gap:4,fontSize:11,color:'var(--muted)'}}>
+                    <div style={{width:10,height:10,borderRadius:2,background:TYPE_COLORS[type]||'#6E776F'}}/>
+                    {type}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+
+
+function OverallSessionModal({ item, activeEventId, onClose, toast }) {
+  const [f, setF] = useState(() => ({
+    title: '', topic: '', date: '', start: '', end: '', venue: '', type: 'Panel', ...item
+  }));
+  const set = k => e => setF(p => ({ ...p, [k]: e.target.value }));
+  const [errs, setErrs] = useState({});
+
+  async function save() {
+    const e = {};
+    if (!f.title.trim()) e.title = 'Session title is required';
+    if (!f.date) e.date = 'Date is required';
+    if (!f.start) e.start = 'Start time is required';
+    if (f.end && f.start && f.end <= f.start) e.end = 'End time must be after start time';
+    if (Object.keys(e).length) { setErrs(e); return; }
+    await saveItem('sessions', { ...f, eventId: activeEventId });
+    onClose(); toast(item ? 'Session updated.' : 'Session added.');
+  }
+
+  return (
+    <Modal title={item ? 'Edit session' : 'Add session'} onClose={onClose} onSave={save} saveLabel={item ? 'Save changes' : 'Add session'}>
+      <Field label="Session title">
+        <input className="input" style={errs.title ? { borderColor: 'var(--rose)' } : {}}
+          value={f.title} onChange={e => { set('title')(e); setErrs(p => ({ ...p, title: undefined })); }}
+          placeholder="e.g. Legal Round Table Deliberation" />
+        {errs.title && <span style={{ color: 'var(--rose)', fontSize: 11.5 }}>{errs.title}</span>}
+      </Field>
+      <Field label="Topic / description">
+        <input className="input" value={f.topic} onChange={set('topic')} />
+      </Field>
+      <div className="grid2">
+        <Field label="Date">
+          <input className="input" type="date" style={errs.date ? { borderColor: 'var(--rose)' } : {}}
+            value={f.date} onChange={e => { set('date')(e); setErrs(p => ({ ...p, date: undefined })); }} />
+          {errs.date && <span style={{ color: 'var(--rose)', fontSize: 11.5 }}>{errs.date}</span>}
+        </Field>
+        <Field label="Type">
+          <select className="input" value={f.type} onChange={set('type')}>
+            {SESSION_TYPES_NEW.map(t => <option key={t}>{t}</option>)}
+          </select>
+        </Field>
+        <Field label="Start time">
+          <TimePicker value={f.start} onChange={v => { setF(p=>({...p,start:v})); setErrs(p=>({...p,start:undefined})); }}/>
+          {errs.start && <span style={{ color: 'var(--rose)', fontSize: 11.5 }}>{errs.start}</span>}
+        </Field>
+        <Field label="End time">
+          <TimePicker value={f.end} onChange={v => { setF(p=>({...p,end:v})); setErrs(p=>({...p,end:undefined})); }}/>
+          {errs.end && <span style={{ color: 'var(--rose)', fontSize: 11.5 }}>{errs.end}</span>}
+        </Field>
+        <Field label="Venue">
+          <input className="input" value={f.venue} onChange={set('venue')} placeholder="e.g. Main Hall, Auditorium" />
+        </Field>
+      </div>
+    </Modal>
+  );
+}
+
+/* ══ Minute-to-Minute modal ════════════════════════════════════════ */
+function MinuteToMinuteModal({ session, store, activeEventId, onClose, toast }) {
+  const minItems = (store.minuteItems || []).filter(m => m.sessionId === session.id);
+  const contacts = (store.contacts || []).filter(c => c.status === 'Confirmed');
+  const [adding, setAdding] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [f, setF] = useState({ detail: '', schedule: '', duration: '', speakerId: '' });
+  const set = k => e => setF(p => ({ ...p, [k]: e.target.value }));
+
+  async function addItem() {
+    if (!f.detail.trim()) return;
+    if (editingId) {
+      // update existing
+      const existing = minItems.find(m => m.id === editingId);
+      await saveItem('minuteItems', { ...existing, ...f });
+      setEditingId(null);
+    } else {
+      await saveItem('minuteItems', { ...f, sessionId: session.id, eventId: activeEventId });
+    }
+    setF({ detail: '', schedule: '', duration: '', speakerId: '' });
+    setAdding(false); toast(editingId ? 'Row updated.' : 'Row added.');
+  }
+
+  function startEdit(m) {
+    setF({ detail: m.detail||'', schedule: m.schedule||'', duration: m.duration||'', speakerId: m.speakerId||'' });
+    setEditingId(m.id);
+    setAdding(true);
+  }
+
+  return (
+    <Modal title={`📋 Minute-to-minute — ${session.title}`} onClose={onClose} footer={null} size="lg">
+      <div style={{ marginBottom: 10, fontSize: 13, color: 'var(--muted)' }}>
+        {session.date ? fmtDate(session.date) : ''} {session.start} {session.end ? `– ${session.end}` : ''} · {session.venue || ''}
+      </div>
+      {(() => {
+        const colCfg = (store.appConfig||[]).find(c=>c.id==='columnConfig')||{};
+        const mCols = colCfg.minuteToMinute||['detail','schedule','duration','speakerId'];
+        const COL_LBL = {detail:'Session details',schedule:'Schedule',duration:'Duration',speakerId:'Speaker'};
+        return (
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, marginBottom: 12 }}>
+        <thead>
+          <tr style={{ background: 'var(--teal-wash)' }}>
+            {mCols.filter(k=>COL_LBL[k]).map(k=>(
+              <th key={k} style={{ padding:'7px 12px', textAlign:'left', fontSize:11.5, fontWeight:600, borderBottom:'1px solid var(--line)' }}>{COL_LBL[k]}</th>
+            ))}
+            <th style={{padding:'7px 12px'}}></th>
+          </tr>
+        </thead>
+        <tbody>
+          {minItems.map(m => {
+            const speaker = contacts.find(c => c.id === m.speakerId);
+            return (
+              <tr key={m.id} style={{ borderBottom: '1px solid var(--line)' }}>
+                {mCols.includes('detail') && <td style={{ padding: '7px 12px' }}>{m.detail}</td>}
+                {mCols.includes('schedule') && <td style={{ padding: '7px 12px', color: 'var(--muted)' }}>{m.schedule || '—'}</td>}
+                {mCols.includes('duration') && <td style={{ padding: '7px 12px', color: 'var(--muted)' }}>{m.duration ? `${m.duration} min` : '—'}</td>}
+                {mCols.includes('speakerId') && <td style={{ padding: '7px 12px', color: 'var(--muted)' }}>{speaker ? displayName(speaker) : '—'}</td>}
+                <td style={{ padding: '7px 12px' }}>
+                  <button className="btn ghost xs" onClick={async () => { await removeItem('minuteItems', m.id); toast('Row deleted.'); }}>{ICON.trash}</button>
+                </td>
+              </tr>
+            );
+          })}
+          {!minItems.length && !adding && (
+            <tr><td colSpan={mCols.length+1}><div style={{ padding: '16px', textAlign: 'center', color: 'var(--muted)', fontSize: 13 }}>No items yet. Add the first row below.</div></td></tr>
+          )}
+          {adding && (
+            <tr style={{ background: 'var(--teal-wash)' }}>
+              <td style={{ padding: '6px 8px' }}><input className="input" value={f.detail} onChange={set('detail')} placeholder="Session details" autoFocus /></td>
+              <td style={{ padding: '6px 8px' }}><TimePicker value={f.schedule} onChange={v => setF(p => ({...p, schedule:v}))}/></td>
+              <td style={{ padding: '6px 8px' }}><input className="input" type="number" value={f.duration} onChange={set('duration')} placeholder="mins" style={{ width: 70 }} /></td>
+              <td style={{ padding: '6px 8px' }}>
+                <select className="input" value={f.speakerId} onChange={set('speakerId')}>
+                  <option value="">— Speaker —</option>
+                  {contacts.map(c => <option key={c.id} value={c.id}>{displayName(c)}</option>)}
+                </select>
+              </td>
+              <td style={{ padding: '6px 8px', display: 'flex', gap: 4 }}>
+                <button className="btn primary sm" onClick={addItem}>{editingId?'Update':'Save'}</button>
+                <button className="btn sm" onClick={() => {setAdding(false);setEditingId(null);setF({detail:'',schedule:'',duration:'',speakerId:''});}}>Cancel</button>
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+        );
+      })()}
+      {!adding && <button className="btn sm" onClick={()=>{setEditingId(null);setF({detail:'',schedule:'',duration:'',speakerId:''});setAdding(true);}}>{ICON.plus} Add row</button>}
+      <div className="modal-foot" style={{ padding: '12px 0 0' }}>
+        <button className="btn" onClick={onClose}>Close</button>
+      </div>
+    </Modal>
+  );
+}
+
+/* ══ Sahebji One-on-One — redesigned ══════════════════════════════ */
+/* ── Sahebji auto-slot assignment ─────────────────────────────── */
+/* ══ Sahebji helpers ══════════════════════════════════════════════
+   Meetings live in `founder`. Each meeting now stores slotId; older meetings
+   without one are matched to a slot by date + start time. */
+const hhmm = m => `${String(Math.floor(m/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')}`;
+const mtgStart = m => toMin(m.time||'00:00');
+const mtgEnd   = m => mtgStart(m) + (parseInt(m.duration)||30);
+const isScheduled = m => !!(m && m.date && m.time);
+function slotOfMeeting(m, slots) {
+  if (!isScheduled(m)) return null;
+  if (m.slotId) { const s = slots.find(x => x.id === m.slotId); if (s && s.date === m.date) return s; }
+  return slots.find(s => s.date === m.date && mtgStart(m) >= toMin(s.startTime) && mtgStart(m) < toMin(s.endTime)) || null;
+}
+function slotContaining(date, time, duration, slots) {
+  const st = toMin(time), en = st + (parseInt(duration)||30);
+  return slots.find(s => s.date === date && st >= toMin(s.startTime) && en <= toMin(s.endTime)) || null;
+}
+const meetingsInSlot = (slot, meetings, slots) => meetings.filter(m => isScheduled(m) && slotOfMeeting(m, slots)?.id === slot.id);
+const sortSlots = list => [...list].sort((a,b) => a.date !== b.date ? (a.date > b.date ? 1 : -1) : ((a.startTime||'') > (b.startTime||'') ? 1 : -1));
+
+async function autoAssignSlots(contacts, slots, existingMeetings, activeEventId, toast) {
+  if (!slots.length || !contacts.length) return;
+  const scheduled = existingMeetings.filter(isScheduled);
+  const used = {};
+  scheduled.forEach(m => { (used[m.date] = used[m.date] || []).push({ start: mtgStart(m), end: mtgEnd(m) }); });
+
+  // Who needs a meeting: confirmed guests with no meeting, plus unscheduled meetings that still need one
+  const todo = [];
+  contacts.forEach(c => {
+    const mine = existingMeetings.filter(m => m.contactId === c.id);
+    if (!mine.length) todo.push({ contact: c, meeting: null });
+    else mine.filter(m => !isScheduled(m) && m.durationReq !== 'not_required').forEach(m => todo.push({ contact: c, meeting: m }));
+  });
+  if (!todo.length) { toast('Everyone already has a meeting scheduled.'); return; }
+
+  let assigned = 0;
+  for (const { contact, meeting } of todo) {
+    const dur = parseInt(meeting?.duration) || 30;
+    let placed = false;
+    for (const slot of sortSlots(slots)) {
+      const sEnd = toMin(slot.endTime);
+      const u = used[slot.date] || [];
+      for (let cur = toMin(slot.startTime); cur + dur <= sEnd; cur += 5) {
+        if (u.some(x => cur < x.end && cur + dur > x.start)) continue;
+        await saveItem('founder', {
+          ...(meeting || { contactId: contact.id, durationReq: 'required', venue: 'VIP Lounge', notes: 'Auto-assigned' }),
+          date: slot.date, time: hhmm(cur), duration: String(dur), slotId: slot.id, eventId: activeEventId,
+        });
+        (used[slot.date] = u).push({ start: cur, end: cur + dur });
+        placed = true; assigned++; break;
+      }
+      if (placed) break;
+    }
+  }
+  const left = todo.length - assigned;
+  toast(assigned ? `Scheduled ${assigned} meeting${assigned>1?'s':''}.${left ? ` ${left} didn't fit — add more slot time.` : ''}`
+                 : 'No free time left in the slots. Add more slot time or shorten meetings.');
+}
+
+export function SahebjiSchedule({ store, activeEventId }) {
+  const { profile } = useAuth();
+  const toast = useToast();
+  const { can } = usePerm();
+  const canEdit = can('schedule.sahebji');
+  const [tab, setTab] = useState('slots');
+  const [view, setView] = useState(() => { try { return localStorage.getItem('vk_meet_view') || 'cards'; } catch { return 'cards'; } });
+  const [printDate, setPrintDate] = useState(null);
+  const slots = sortSlots((store.sahebjiSlots || []).filter(s => s && s.id && s.date));
+  const meetings = (store.founder || []).filter(m => m && m.id)
+    .sort((a,b) => (a.date||'~') !== (b.date||'~') ? ((a.date||'~') > (b.date||'~') ? 1 : -1) : ((a.time||'') > (b.time||'') ? 1 : -1));
+  const allContacts = store.contacts || [];
+  const contacts = allContacts.filter(c => c.status === 'Confirmed');
+  const [modal, setModal] = useState(null);
+
+  const setViewSaved = v => { setView(v); try { localStorage.setItem('vk_meet_view', v); } catch {} };
+  useEffect(() => {
+    if (!printDate) return;
+    const t = setTimeout(() => { window.print(); setPrintDate(null); }, 80);
+    return () => clearTimeout(t);
+  }, [printDate]);
+
+  const nameOf = m => { const c = allContacts.find(x => x.id === m.contactId); return c ? displayName(c) : 'Unknown guest'; };
+  const flagsOf = m => {
+    const f = [];
+    const c = allContacts.find(x => x.id === m.contactId);
+    if (!c) f.push({ t: 'Guest deleted', bad: true });
+    else if (c.status !== 'Confirmed') f.push({ t: `Guest is ${c.status}`, bad: true });
+    if (isScheduled(m)) {
+      if (!slotContaining(m.date, m.time, m.duration, slots)) f.push({ t: 'Outside Sahebji slot' });
+      const clash = meetings.find(o => o.id !== m.id && isScheduled(o) && o.date === m.date && mtgStart(o) < mtgEnd(m) && mtgStart(m) < mtgEnd(o));
+      if (clash) f.push({ t: `Overlaps ${nameOf(clash)}`, bad: true });
+    }
+    return f;
+  };
+
+  const scheduledMeetings = meetings.filter(isScheduled);
+  const unscheduled = meetings.filter(m => !isScheduled(m) && m.durationReq !== 'not_required');
+  const noMeeting = contacts.filter(c => !meetings.some(m => m.contactId === c.id));
+  const dates = [...new Set([...slots.map(s => s.date), ...scheduledMeetings.map(m => m.date)])].sort();
+
+  const MeetingCard = ({ m }) => {
+    const flags = flagsOf(m);
+    const c = allContacts.find(x => x.id === m.contactId);
+    const cls = 'mtg-card' + (flags.some(f => f.bad) ? ' bad' : (flags.length || !isScheduled(m)) ? ' warn' : '');
+    return (
+      <div className={cls} role="button" tabIndex={0}
+        onClick={() => canEdit && setModal({ type: 'edit-meeting', id: m.id })}
+        onKeyDown={e => { if (e.key === 'Enter' && canEdit) setModal({ type: 'edit-meeting', id: m.id }); }}>
+        <div className="mtg-time">{isScheduled(m) ? <>{m.time}<span>{hhmm(mtgEnd(m))}</span></> : <span>—</span>}</div>
+        <div className="mtg-body">
+          <div className="nm">{nameOf(m)}</div>
+          {c && (c.desig || c.org) && <div className="role">{[c.desig, c.org].filter(Boolean).join(' · ')}</div>}
+          <div className="mtg-meta">{m.durationReq === 'not_required' ? 'No meeting needed' : `${m.duration || 30} min`} · {m.venue || 'VIP Lounge'}</div>
+          {flags.map((f, i) => <span key={i} className={'mtg-flag' + (f.bad ? ' bad' : '')}>⚠ {f.t}</span>)}
+        </div>
+        {canEdit && <button className="btn ghost xs mtg-del" title="Delete meeting" aria-label="Delete meeting"
+          onClick={e => { e.stopPropagation(); setModal({ type: 'del-meeting', id: m.id }); }}>{ICON.trash}</button>}
+      </div>
+    );
+  };
+
+  const renderSlotBlock = (slot) => {
+    const inSlot = meetingsInSlot(slot, scheduledMeetings, slots).sort((a,b) => mtgStart(a) - mtgStart(b));
+    const sStart = toMin(slot.startTime), sEnd = toMin(slot.endTime);
+    const items = []; let cur = sStart;
+    inSlot.forEach(m => {
+      if (mtgStart(m) - cur >= 10) items.push({ free: true, from: cur, to: mtgStart(m) });
+      items.push({ m }); cur = Math.max(cur, mtgEnd(m));
+    });
+    if (sEnd - cur >= 10) items.push({ free: true, from: cur, to: sEnd });
+    const freeMin = items.filter(i => i.free).reduce((a, i) => a + (i.to - i.from), 0);
+    return (
+      <div className="mtg-slot" key={slot.id}>
+        <div className="mtg-slot-head">
+          <b>Slot {slot.startTime}–{slot.endTime}</b>
+          <span>{inSlot.length} meeting{inSlot.length === 1 ? '' : 's'}</span>
+          <span>{freeMin} min free</span>
+        </div>
+        <div className="mtg-list">
+          {items.map((it, i) => it.free
+            ? <div className="mtg-free" key={'f' + i}>
+                <span>Free {hhmm(it.from)}–{hhmm(it.to)} · {it.to - it.from} min</span>
+                {canEdit && <button className="btn xs" onClick={() => setModal({ type: 'add-meeting', prefill: { date: slot.date, time: hhmm(it.from) } })}>{ICON.plus}Add</button>}
+              </div>
+            : <MeetingCard key={it.m.id} m={it.m} />)}
+          {!items.length && <div className="muted-sm">Slot is fully booked.</div>}
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <>
+      <div className="subnav">
+        <button className={tab === 'slots' ? 'active' : ''} onClick={() => setTab('slots')}>Sahebji available slots</button>
+        <button className={tab === 'meetings' ? 'active' : ''} onClick={() => setTab('meetings')}>One-on-one meetings</button>
+      </div>
+
+      {tab === 'slots' && (
+        <>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
+            {canEdit && <button className="btn primary sm" onClick={() => setModal({ type: 'add-slot' })}>{ICON.plus} Add slot</button>}
+          </div>
+          <div className="panel">
+            <div className="panel-body">
+              <table>
+                <thead><tr><th>Date</th><th>Start time</th><th>End time</th><th>Duration</th><th>Meetings</th><th></th></tr></thead>
+                <tbody>
+                  {slots.map(s => {
+                    const dur = s.startTime && s.endTime ? Math.round(toMin(s.endTime) - toMin(s.startTime)) + ' min' : '—';
+                    const n = meetingsInSlot(s, scheduledMeetings, slots).length;
+                    return (
+                      <tr key={s.id}>
+                        <td className="muted-sm">{fmtDate(s.date)}</td>
+                        <td className="muted-sm">{s.startTime}</td>
+                        <td className="muted-sm">{s.endTime}</td>
+                        <td><span className="badge b-type">{dur}</span></td>
+                        <td className="muted-sm">{n}</td>
+                        <td><div className="rowacts">
+                          {canEdit && <button className="btn ghost xs" aria-label="Edit slot" onClick={() => setModal({ type: 'edit-slot', id: s.id })}>{ICON.edit}</button>}
+                          {canEdit && <button className="btn ghost xs" aria-label="Delete slot" onClick={() => setModal({ type: 'del-slot', id: s.id })}>{ICON.trash}</button>}
+                        </div></td>
+                      </tr>
+                    );
+                  })}
+                  {!slots.length && <tr><td colSpan={6}><Empty title="No slots yet" sub="Add Sahebji's available time windows above." /></td></tr>}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
+
+      {tab === 'meetings' && (
+        <>
+          <div className="mtg-toolbar">
+            <div className="seg" role="group" aria-label="View">
+              <button className={view === 'cards' ? 'on' : ''} onClick={() => setViewSaved('cards')}>Cards</button>
+              <button className={view === 'table' ? 'on' : ''} onClick={() => setViewSaved('table')}>Table</button>
+            </div>
+            <div style={{ flex: 1 }} />
+            {canEdit && <button className="btn sm" onClick={() => autoAssignSlots(contacts, slots, meetings, activeEventId, toast)}
+              disabled={!slots.length || !contacts.length}>⚡ Auto-assign</button>}
+            {canEdit && <button className="btn primary sm" onClick={() => setModal({ type: 'add-meeting' })}>{ICON.plus} Add meeting</button>}
+          </div>
+
+          {slots.length === 0 && (
+            <div className="mtg-note">⚠ Add Sahebji's available slots first, then schedule meetings here.</div>
+          )}
+
+          {(unscheduled.length > 0 || noMeeting.length > 0) && (
+            <div className="mtg-day">
+              <div className="mtg-day-head"><h3>Needs a time</h3><span className="muted-sm">{unscheduled.length + noMeeting.length}</span></div>
+              <div className="mtg-list">
+                {unscheduled.map(m => <MeetingCard key={m.id} m={m} />)}
+                {noMeeting.map(c => (
+                  <div className="mtg-card warn" key={c.id} role="button" tabIndex={0}
+                    onClick={() => canEdit && setModal({ type: 'add-meeting', prefill: { contactId: c.id } })}>
+                    <div className="mtg-time"><span>—</span></div>
+                    <div className="mtg-body"><div className="nm">{displayName(c)}</div><div className="mtg-meta">Confirmed · no meeting yet</div></div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {view === 'cards' && dates.map(date => {
+            const daySlots = slots.filter(s => s.date === date);
+            const outside = scheduledMeetings.filter(m => m.date === date && !slotOfMeeting(m, slots));
+            const count = scheduledMeetings.filter(m => m.date === date).length;
+            return (
+              <section key={date} className={'mtg-day' + (printDate === date ? ' print-target' : '')}>
+                <div className="mtg-day-head">
+                  <h3>{fmtDate(date)}</h3>
+                  <span className="muted-sm">{count} meeting{count === 1 ? '' : 's'}</span>
+                  <button className="btn ghost xs no-print" style={{ marginLeft: 'auto' }} onClick={() => setPrintDate(date)}>{ICON.print}Print day</button>
+                </div>
+                {daySlots.map(renderSlotBlock)}
+                {outside.length > 0 && (
+                  <div className="mtg-slot mtg-slot-out">
+                    <div className="mtg-slot-head"><b>Outside Sahebji's slots</b><span>{outside.length}</span></div>
+                    <div className="mtg-list">{outside.map(m => <MeetingCard key={m.id} m={m} />)}</div>
+                  </div>
+                )}
+              </section>
+            );
+          })}
+          {view === 'cards' && !dates.length && !unscheduled.length && !noMeeting.length &&
+            <div className="panel"><Empty title="No meetings yet" sub="Add slots, then schedule or auto-assign meetings." /></div>}
+
+          {view === 'table' && (
+            <div className="panel">
+              <div className="panel-body">
+                <table>
+                  <thead><tr><th>Name</th><th>Duration</th><th>Date</th><th>Start</th><th>End</th><th>Venue</th><th></th></tr></thead>
+                  <tbody>
+                    {meetings.map(m => {
+                      const flags = flagsOf(m);
+                      return (
+                        <tr key={m.id} style={flags.length ? { background: '#FFF8F0' } : {}}>
+                          <td><div className="nm">{nameOf(m)}</div>{flags.map((f,i) => <div key={i} className={'mtg-flag' + (f.bad ? ' bad' : '')}>⚠ {f.t}</div>)}</td>
+                          <td>{m.durationReq === 'not_required' ? <span className="badge b-declined">Not required</span> : <span className="muted-sm">{m.duration || 30} min</span>}</td>
+                          <td className="muted-sm">{m.date ? fmtDate(m.date) : 'Not scheduled'}</td>
+                          <td className="muted-sm">{m.time || '—'}</td>
+                          <td className="muted-sm">{isScheduled(m) ? hhmm(mtgEnd(m)) : '—'}</td>
+                          <td className="muted-sm">{m.venue || 'VIP Lounge'}</td>
+                          <td><div className="rowacts">
+                            {canEdit && <button className="btn ghost xs" onClick={() => setModal({ type: 'edit-meeting', id: m.id })}>{ICON.edit}</button>}
+                            {canEdit && <button className="btn ghost xs" onClick={() => setModal({ type: 'del-meeting', id: m.id })}>{ICON.trash}</button>}
+                          </div></td>
+                        </tr>
+                      );
+                    })}
+                    {!meetings.length && <tr><td colSpan={7}><Empty title="No meetings yet" sub="Schedule or auto-assign meetings above." /></td></tr>}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {(modal?.type === 'add-slot' || modal?.type === 'edit-slot') && (
+        <SahebjiSlotModal item={slots.find(s => s.id === modal.id) || undefined} activeEventId={activeEventId}
+          meetings={scheduledMeetings} slots={slots} nameOf={nameOf}
+          onClose={() => setModal(null)} toast={toast} />
+      )}
+      {modal?.type === 'del-slot' && (() => {
+        const slot = slots.find(s => s.id === modal.id);
+        if (!slot) return null;
+        const affected = meetingsInSlot(slot, scheduledMeetings, slots);
+        return <SlotDeleteModal slot={slot} affected={affected} nameOf={nameOf} onClose={() => setModal(null)}
+          onConfirm={async (mode) => {
+            setModal(null);
+            const linked = affected.map(m => ({ collection: 'founder', data: m }));
+            await trashItem('sahebjiSlots', slot, linked, profile?.email || '');
+            await removeItem('sahebjiSlots', slot.id);
+            for (const m of affected) {
+              if (mode === 'delete') await removeItem('founder', m.id);
+              else await saveItem('founder', { ...m, date: '', time: '', slotId: null });
+            }
+            toast(!affected.length ? 'Slot moved to trash.'
+              : mode === 'delete' ? `Slot and ${affected.length} meeting${affected.length>1?'s':''} moved to trash.`
+              : `Slot moved to trash. ${affected.length} meeting${affected.length>1?'s are':' is'} now under "Needs a time".`);
+          }} />;
+      })()}
+      {(modal?.type === 'add-meeting' || modal?.type === 'edit-meeting') && (
+        <SahebjiMeetingModal item={meetings.find(m => m.id === modal.id) || undefined} prefill={modal.prefill}
+          store={store} activeEventId={activeEventId} onClose={() => setModal(null)} toast={toast} />
+      )}
+      {modal?.type === 'del-meeting' && (() => {
+        const mtg = meetings.find(m => m.id === modal.id);
+        return mtg ? <DeleteModal label={nameOf(mtg)} onClose={() => setModal(null)}
+          onConfirm={async () => { setModal(null); await trashItem('founder', mtg, [], profile?.email || ''); await removeItem('founder', mtg.id); toast('Meeting moved to trash.'); }} /> : null;
+      })()}
+    </>
+  );
+}
+
+/* Deleting a slot: the meetings inside it are handled explicitly, never left orphaned */
+function SlotDeleteModal({ slot, affected, nameOf, onClose, onConfirm }) {
+  const [busy, setBusy] = useState(false);
+  const go = async mode => { setBusy(true); await onConfirm(mode); };
+  return (
+    <Modal title="Delete slot?" onClose={onClose} footer={null} size="sm">
+      <p style={{ fontSize: 13.5, marginTop: 0 }}>
+        <b>{fmtDate(slot.date)}, {slot.startTime}–{slot.endTime}</b> will move to trash (restorable for 30 days, together with anything below).
+      </p>
+      {affected.length > 0 ? (
+        <>
+          <p style={{ fontSize: 13.5 }}>{affected.length} meeting{affected.length > 1 ? 's are' : ' is'} booked in this slot:</p>
+          <ul className="slot-affected">
+            {affected.sort((a,b) => mtgStart(a) - mtgStart(b)).map(m => <li key={m.id}><span className="mono">{m.time}</span> {nameOf(m)}</li>)}
+          </ul>
+          <div className="slot-del-actions">
+            <button className="btn danger" disabled={busy} onClick={() => go('delete')}>Delete slot and meetings</button>
+            <button className="btn" disabled={busy} onClick={() => go('unschedule')}>Delete slot, keep guests to reschedule</button>
+            <button className="btn ghost" disabled={busy} onClick={onClose}>Cancel</button>
+          </div>
+        </>
+      ) : (
+        <div className="slot-del-actions">
+          <button className="btn danger" disabled={busy} onClick={() => go('delete')}>Delete slot</button>
+          <button className="btn ghost" disabled={busy} onClick={onClose}>Cancel</button>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+function SahebjiSlotModal({ item, activeEventId, meetings = [], slots = [], nameOf, onClose, toast }) {
+  const [f, setF] = useState(() => ({ date: '', startTime: '', endTime: '', ...item }));
+  const [errs, setErrs] = useState({});
+  const [confirmOutside, setConfirmOutside] = useState(false);
+  const set = k => e => setF(p => ({ ...p, [k]: e.target.value }));
+
+  // When editing, meetings in this slot that would no longer fit the new times
+  const wouldFallOut = item ? meetingsInSlot(item, meetings, slots).filter(m =>
+    m.date !== f.date || (f.startTime && mtgStart(m) < toMin(f.startTime)) || (f.endTime && mtgEnd(m) > toMin(f.endTime))) : [];
+
+  async function save() {
+    const e = {};
+    if (!f.date) e.date = 'Date is required';
+    if (!f.startTime) e.startTime = 'Start time is required';
+    if (!f.endTime) e.endTime = 'End time is required';
+    if (f.startTime && f.endTime && f.endTime <= f.startTime) e.endTime = 'End must be after start';
+    if (Object.keys(e).length) { setErrs(e); return; }
+    if (wouldFallOut.length && !confirmOutside) { setConfirmOutside(true); return; }
+    await saveItem('sahebjiSlots', { ...f, eventId: activeEventId });
+    onClose();
+    toast(item ? (wouldFallOut.length ? `Slot updated. ${wouldFallOut.length} meeting${wouldFallOut.length>1?'s are':' is'} now outside it — check One-on-one meetings.` : 'Slot updated.') : 'Slot added.');
+  }
+  return (
+    <Modal title={item ? 'Edit slot' : 'Add Sahebji available slot'} onClose={onClose} onSave={save}
+      saveLabel={confirmOutside ? 'Save anyway' : item ? 'Save' : 'Add slot'} size="sm">
+      <div className="grid2">
+        <Field label="Date"><input className="input" type="date" style={errs.date ? { borderColor: 'var(--rose)' } : {}}
+          value={f.date} onChange={e => { set('date')(e); setErrs(p => ({ ...p, date: undefined })); setConfirmOutside(false); }} />
+          {errs.date && <span style={{ color: 'var(--rose)', fontSize: 11.5 }}>{errs.date}</span>}
+        </Field>
+        <div />
+        <Field label="Start time"><TimePicker value={f.startTime} onChange={v => { setF(p => ({ ...p, startTime: v })); setErrs(p => ({ ...p, startTime: undefined })); setConfirmOutside(false); }} />
+          {errs.startTime && <span style={{ color: 'var(--rose)', fontSize: 11.5 }}>{errs.startTime}</span>}
+        </Field>
+        <Field label="End time"><TimePicker value={f.endTime} onChange={v => { setF(p => ({ ...p, endTime: v })); setErrs(p => ({ ...p, endTime: undefined })); setConfirmOutside(false); }} />
+          {errs.endTime && <span style={{ color: 'var(--rose)', fontSize: 11.5 }}>{errs.endTime}</span>}
+        </Field>
+      </div>
+      {wouldFallOut.length > 0 && (
+        <div className="mtg-note" style={{ marginTop: 4 }}>
+          ⚠ {wouldFallOut.length} meeting{wouldFallOut.length > 1 ? 's' : ''} won't fit these times:
+          {' '}{wouldFallOut.map(m => `${nameOf ? nameOf(m) : ''} (${m.time})`).join(', ')}.
+          {confirmOutside ? ' Tap "Save anyway" to keep them as they are — they will be flagged.' : ''}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+function SahebjiMeetingModal({ item, prefill, store, activeEventId, onClose, toast }) {
+  const contacts = (store.contacts || []).filter(c => c.status === 'Confirmed');
+  const slots = store.sahebjiSlots || [];
+  const [f, setF] = useState(() => ({
+    contactId: contacts[0]?.id || '',
+    durationReq: 'required',
+    duration: '30',
+    date: '',
+    time: '',
+    venue: 'VIP Lounge',
+    notes: '',
+    ...prefill,
+    ...item
+  }));
+  const set = k => e => setF(p => ({ ...p, [k]: e.target.value }));
+
+  // Auto-calculate end time
+  const endTime = f.time && f.duration && f.durationReq === 'required'
+    ? (() => { const m = toMin(f.time) + parseInt(f.duration); return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`; })()
+    : '—';
+
+  async function save() {
+    if (!f.contactId || !f.date || !f.time) { return; }
+
+    // Slot boundary check — meeting must fall within a defined slot on that date
+    const slotsOnDate = slots.filter(s => s.date === f.date);
+    if (slotsOnDate.length > 0) {
+      const meetStart = toMin(f.time);
+      const meetEnd   = meetStart + parseInt(f.duration || 30);
+      const withinSlot = slotsOnDate.some(s => {
+        const slotStart = toMin(s.startTime);
+        const slotEnd   = toMin(s.endTime);
+        return meetStart >= slotStart && meetEnd <= slotEnd;
+      });
+      if (!withinSlot) {
+        const slotTimes = slotsOnDate.map(s => `${s.startTime}–${s.endTime}`).join(', ');
+        alert(`Meeting time must fall within a Sahebji available slot on this date.\nAvailable: ${slotTimes}`);
+        return;
+      }
+    }
+    // Conflict check
+    const others = (store.founder || []).filter(m => m.id !== item?.id && m.date === f.date);
+    const clash = others.find(m => {
+      const mEnd = toMin(m.time) + parseInt(m.duration || 30);
+      const fEnd = toMin(f.time) + parseInt(f.duration || 30);
+      return toMin(m.time) < fEnd && toMin(f.time) < mEnd;
+    });
+    if (clash) {
+      const clashC = contacts.find(c => c.id === clash.contactId);
+      alert(`Time conflict with ${clashC ? displayName(clashC) : 'another meeting'} at ${clash.time}. Please choose a different time.`);
+      return;
+    }
+    const slot = slotContaining(f.date, f.time, f.duration, slots);
+    const savedId = await saveItem('founder', { ...f, slotId: slot?.id || null, eventId: activeEventId });
+    // Two-way sync: update duration in personalisedMandatory so Personalised Schedule reflects it
+    if (f.durationReq === 'required' && f.duration) {
+      await saveItem('personalisedMandatory', {
+        id: `${f.contactId}_mandatory`,
+        contactId: f.contactId,
+        eventId: activeEventId,
+        sahebjiDuration: f.duration,
+        sahebji: true, // mark as required in mandatory fields
+      });
+    }
+    onClose(); toast(item ? 'Meeting updated.' : 'Meeting scheduled.');
+  }
+
+  return (
+    <Modal title={item ? 'Edit Sahebji meeting' : 'Schedule Sahebji one-on-one'} onClose={onClose} onSave={save} saveLabel={item ? 'Save' : 'Schedule'}>
+      <Field label="Guest">
+        <select className="input" value={f.contactId} onChange={set('contactId')}>
+          {contacts.map(c => <option key={c.id} value={c.id}>{displayName(c)}</option>)}
+        </select>
+      </Field>
+      <div className="grid2">
+        <Field label="Duration for meeting">
+          <select className="input" value={f.durationReq} onChange={set('durationReq')}>
+            <option value="required">Required</option>
+            <option value="not_required">Not Required</option>
+          </select>
+        </Field>
+        {f.durationReq === 'required' && (
+          <Field label="Duration (minutes)">
+            <input className="input" type="number" value={f.duration} onChange={set('duration')} min={5} step={5} />
+          </Field>
+        )}
+        <Field label="Date">
+          <input className="input" type="date" value={f.date} onChange={set('date')} />
+          {f.date && slots.filter(s=>s.date===f.date).length>0 && (
+            <div style={{fontSize:11,color:'var(--teal)',marginTop:3}}>
+              Available slot{slots.filter(s=>s.date===f.date).length>1?'s':''}: {slots.filter(s=>s.date===f.date).map(s=>`${s.startTime}–${s.endTime}`).join(', ')}
+            </div>
+          )}
+          {f.date && slots.filter(s=>s.date===f.date).length===0 && (
+            <div style={{fontSize:11,color:'var(--amber)',marginTop:3}}>⚠ No Sahebji slot defined for this date</div>
+          )}
+        </Field>
+        <Field label="Start time"><TimePicker value={f.time} onChange={v => setF(p => ({...p, time:v}))}/></Field>
+        <Field label="End time (auto-calculated)">
+          <input className="input" value={endTime} readOnly style={{ background: 'var(--paper)', color: 'var(--muted)' }} />
+        </Field>
+        <Field label="Venue"><input className="input" value={f.venue} onChange={set('venue')} /></Field>
+      </div>
+      <Field label="Notes"><input className="input" value={f.notes} onChange={set('notes')} /></Field>
+    </Modal>
+  );
+}
+
+/* ══ Main Scheduling shell ════════════════════════════════════════= */
 function AssignTab({ store, activeEventId }) {
   const conf = S(store,'contacts').filter(c=>c.status==='Confirmed');
   const panels = S(store,'sessions').filter(s=>s.type==='Panel').sort((a,b)=>a.date<b.date?-1:1);
@@ -467,153 +2456,279 @@ function AssignTab({ store, activeEventId }) {
   </>);
 }
 
-/* Founder one-on-ones with full add/edit/delete */
-function FounderTab({ store, activeEventId, setModal }) {
-  const conf = S(store,'contacts').filter(c=>c.status==='Confirmed');
-  const meetings = S(store,'founder');
-  if(!conf.length) return <div className="panel"><Empty title="Nothing here yet" sub="Confirm a guest in Outreach to schedule a one-on-one." /></div>;
+/* Sahebji one-on-ones with full add/edit/delete */
+
+export function Scheduling({ store, activeEventId }) {
+  const [tab, setTab] = useState('overall');
   return (
-    <div className="panel">
-      <div className="panel-head"><h2>Founder one-on-ones</h2><div className="right"><button className="btn primary sm" onClick={()=>setModal({type:'add-f'})}>{ICON.plus}Add meeting</button></div></div>
-      <div className="panel-body"><table><thead><tr><th>Guest</th><th>Date</th><th>Time</th><th>Venue</th><th>Notes</th><th></th></tr></thead><tbody>
-        {meetings.map(m=>{
-          const c=(store.contacts||[]).find(x=>x.id===m.contactId);
-          return (
-            <tr key={m.id}>
-              <td><div className="nm">{c?displayName(c):'—'}</div></td>
-              <td className="muted-sm">{shortDate(m.date)}</td>
-              <td className="mono">{m.time||'—'}</td>
-              <td className="muted-sm">{m.venue||'VIP Lounge'}</td>
-              <td className="muted-sm">{m.notes||'—'}</td>
-              <td><div className="rowacts">
-                <button className="btn ghost xs" onClick={()=>setModal({type:'edit-f',item:m})}>{ICON.edit}</button>
-                <button className="btn ghost xs" onClick={()=>setModal({type:'del-f',item:m})}>{ICON.trash}</button>
-              </div></td>
-            </tr>
-          );
-        })}
-        {!meetings.length&&<tr><td colSpan="6"><Empty title="No meetings scheduled yet" sub='Click "Add meeting" to schedule a one-on-one.' /></td></tr>}
-      </tbody></table>
-      <p className="muted-sm" style={{padding:'12px 20px 4px'}}>Every meeting renders with the agreed wording in the personalised schedule.</p>
-    </div></div>
+    <>
+      <div className="page-head"><div className="ph-txt">
+        <h1>Scheduling</h1>
+        <p>Overall schedule, session assignments, Sahebji one-on-ones and personalised schedules.</p>
+      </div></div>
+      <div className="subnav">
+        <button className={tab === 'overall' ? 'active' : ''} onClick={() => setTab('overall')}>Overall schedule</button>
+
+        <button className={tab === 'sahebji' ? 'active' : ''} onClick={() => setTab('sahebji')}>Sahebji one-on-ones</button>
+      </div>
+      {tab === 'overall' && <OverallSchedule store={store} activeEventId={activeEventId} />}
+
+      {tab === 'sahebji' && <SahebjiSchedule store={store} activeEventId={activeEventId} />}
+    </>
   );
 }
 
-function FounderMeetingModal({ item, store, activeEventId, onClose, toast }) {
-  const conf = S(store,'contacts').filter(c=>c.status==='Confirmed');
-  const [f, setF] = useState(()=>({contactId:conf[0]?.id||'',date:'',time:'',venue:'VIP Lounge',notes:'',...item}));
-  const set=(k)=>(e)=>setF(p=>({...p,[k]:e.target.value}));
-  async function save(){
-    if(!f.contactId||!f.date||!f.time){toast('Guest, date and time are required.');return;}
-    // Conflict detection — check if another meeting exists at same date+time
-    const meetings = S(store,'founder');
-    const clash = meetings.find(m => m.id!==item?.id && m.date===f.date && m.time===f.time);
-    if (clash) {
-      const clashContact = conf.find(c=>c.id===clash.contactId);
-      const clashName = clashContact ? displayName(clashContact) : 'another guest';
-      toast(`⚠ Time conflict — ${clashName} already has a meeting at ${f.time} on this date. Please choose a different time.`);
-      return;
-    }
-    await saveItem('founder',{...f,eventId:activeEventId});
-    onClose(); toast(item?'Meeting updated.':'Meeting scheduled.');
+
+
+/* ══════════════════════════════════════════════════════════════════
+   VOLUNTEER DIRECTORY
+   Master list — not event specific. Name, Contact, City, Area.
+══════════════════════════════════════════════════════════════════ */
+/* ── Task import: Department / Owner names are matched to real records.
+   Anything that doesn't match is shown and must be resolved before saving —
+   nothing silently lands in the first department any more. ── */
+function TaskImportModal({ depts, vols, tasks, activeEventId, onClose, toast }) {
+  const [step, setStep] = useState('choose');
+  const [rows, setRows] = useState([]);
+  const [deptMap, setDeptMap] = useState({});   // unmatched dept name → deptId
+  const [ownerMap, setOwnerMap] = useState({}); // unmatched owner name → volId | ''
+  const [defaultDept, setDefaultDept] = useState('');
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [lib, setLib] = useState(null);
+
+  async function handleFile(file) {
+    setErr('');
+    try {
+      const x = await import('./excel');
+      const { items } = await x.parseTasksFile(file);
+      if (!items.length) { setErr('No tasks found. Make sure the sheet has a Task / Title column, or download the template.'); return; }
+      const plan = x.planTasksImport(items, tasks);
+      setLib(x); setRows(plan.plan); setDeptMap({}); setOwnerMap({}); setStep('preview');
+    } catch (e) { setErr('Could not read file: ' + (e.message || e)); }
   }
+
+  const resolve = p => {
+    const it = p.item;
+    const d = lib.matchDept(it.deptName, depts);
+    const deptId = d ? d.id : it.deptName ? (deptMap[it.deptName] || '') : (it.deptId || defaultDept);
+    const v = lib.matchVolunteer(it.assigneeName, vols);
+    const assigneeId = v ? v.id : it.assigneeName ? (ownerMap[it.assigneeName] ?? '') : (it.assigneeId || '');
+    return { deptId, assigneeId, deptMatched: !!d, ownerMatched: !!v };
+  };
+  const unmatchedDepts  = lib ? [...new Set(rows.map(p => p.item.deptName).filter(n => n && !lib.matchDept(n, depts)))] : [];
+  const unmatchedOwners = lib ? [...new Set(rows.map(p => p.item.assigneeName).filter(n => n && !lib.matchVolunteer(n, vols)))] : [];
+  const needsDefault = lib ? rows.some(p => !p.item.deptName && !p.item.deptId) : false;
+  const resolved = lib ? rows.map(p => ({ p, r: resolve(p) })) : [];
+  const missingDept = resolved.filter(x => !x.r.deptId).length;
+
+  async function commit() {
+    if (missingDept) { setErr(`${missingDept} task${missingDept > 1 ? 's have' : ' has'} no department yet — choose one above.`); return; }
+    setBusy(true);
+    try {
+      const items = resolved.map(({ p, r }) => ({ ...p.item, deptId: r.deptId, assigneeId: r.assigneeId, deptName: '', assigneeName: '', eventId: activeEventId }));
+      await batchUpsert('tasks', items);
+      onClose();
+      toast(`Imported ${items.length} task${items.length > 1 ? 's' : ''}.`);
+    } catch (e) { setErr('Save failed: ' + (e.message || e)); setBusy(false); }
+  }
+
   return (
-    <Modal title={item?'Edit one-on-one meeting':'Schedule one-on-one meeting'} onClose={onClose} onSave={save} saveLabel={item?'Save changes':'Schedule meeting'}>
-      <Field label="Guest"><select className="input" value={f.contactId} onChange={set('contactId')}><option value="">Select guest…</option>{conf.map(c=><option key={c.id} value={c.id}>{displayName(c)}</option>)}</select></Field>
-      <div className="grid2">
-        <Field label="Date"><input className="input" type="date" value={f.date} onChange={set('date')} /></Field>
-        <Field label="Time"><input className="input" value={f.time} onChange={set('time')} placeholder="20:30" /></Field>
-        <Field label="Venue"><input className="input" value={f.venue} onChange={set('venue')} placeholder="VIP Lounge" /></Field>
-      </div>
-      <Field label="Notes"><input className="input" value={f.notes} onChange={set('notes')} placeholder="Any specific agenda or requirements" /></Field>
+    <Modal title="Import tasks" onClose={onClose} footer={null}>
+      {err && <div className="av-err">{err}</div>}
+      {step === 'choose' && <>
+        <p className="muted-sm" style={{ marginTop: 0 }}>Columns: Task, Department, Owner, Due Date, Status, Notes. Department and Owner are matched by name to your departments and volunteers.</p>
+        <label className="dropzone">
+          <span style={{ display: 'flex', justifyContent: 'center' }}>{ICON.upload}</span>
+          <div>Click to choose a file (.xlsx or .csv)</div>
+          <input type="file" accept=".xlsx,.xls,.csv" style={{ display: 'none' }} onChange={e => handleFile(e.target.files[0])} />
+        </label>
+        <div style={{ marginTop: 12, textAlign: 'center' }}><button className="linkbtn" onClick={() => downloadTemplate('tasks')}>Download blank template</button></div>
+        <div className="modal-foot" style={{ padding: '12px 0 0' }}><button className="btn" onClick={onClose}>Cancel</button></div>
+      </>}
+      {step === 'preview' && lib && <>
+        {(unmatchedDepts.length > 0 || needsDefault) && (
+          <div className="ti-fix">
+            <div className="av-step" style={{ marginTop: 0 }}>Departments not found — choose where these go</div>
+            {unmatchedDepts.map(n => (
+              <div className="ti-row" key={n}>
+                <span>"{n}"</span>
+                <select className="input" value={deptMap[n] || ''} onChange={e => setDeptMap(m => ({ ...m, [n]: e.target.value }))}>
+                  <option value="">Choose department…</option>{depts.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+                </select>
+              </div>
+            ))}
+            {needsDefault && (
+              <div className="ti-row"><span>Rows with no department</span>
+                <select className="input" value={defaultDept} onChange={e => setDefaultDept(e.target.value)}>
+                  <option value="">Choose department…</option>{depts.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+                </select>
+              </div>
+            )}
+            <p className="muted-sm" style={{ margin: '4px 0 0' }}>To use a new department, cancel, add it under Departments, then import again.</p>
+          </div>
+        )}
+        {unmatchedOwners.length > 0 && (
+          <div className="ti-fix">
+            <div className="av-step" style={{ marginTop: 0 }}>Owners not found in Volunteers</div>
+            {unmatchedOwners.map(n => (
+              <div className="ti-row" key={n}>
+                <span>"{n}"</span>
+                <select className="input" value={ownerMap[n] ?? ''} onChange={e => setOwnerMap(m => ({ ...m, [n]: e.target.value }))}>
+                  <option value="">No owner</option>{vols.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                </select>
+              </div>
+            ))}
+          </div>
+        )}
+        <div style={{ maxHeight: '34vh', overflow: 'auto', border: '1px solid var(--line)', borderRadius: 8 }}>
+          <table className="import-tbl"><thead><tr><th>Task</th><th>Department</th><th>Owner</th><th></th></tr></thead><tbody>
+            {resolved.map(({ p, r }, i) => (
+              <tr key={i}>
+                <td>{p.name}</td>
+                <td style={!r.deptId ? { color: 'var(--rose)' } : undefined}>{r.deptId ? depts.find(d => d.id === r.deptId)?.name : `⚠ ${p.item.deptName || 'none'}`}</td>
+                <td className="muted-sm">{r.assigneeId ? vols.find(v => v.id === r.assigneeId)?.name : '—'}</td>
+                <td>{p.mode === 'new' ? <span className="pill-new">New</span> : <span className="pill-upd">Update</span>}</td>
+              </tr>
+            ))}
+          </tbody></table>
+        </div>
+        <div className="modal-foot" style={{ padding: '12px 0 0' }}>
+          <button className="btn" onClick={() => setStep('choose')}>Back</button>
+          <button className="btn primary" onClick={commit} disabled={busy || missingDept > 0}>
+            {busy ? 'Importing…' : missingDept ? `${missingDept} need a department` : `Import ${rows.length} task${rows.length > 1 ? 's' : ''}`}
+          </button>
+        </div>
+      </>}
     </Modal>
   );
 }
 
-/* ============================ VOLUNTEERS & POC ============================ */
-export function People({ store, activeEventId }) {
-  const toast = useToast();
-  const [modal, setModal] = useState(null);
-  const vols=S(store,'volunteers'), poc=S(store,'poc'), contacts=S(store,'contacts');
-  const volName=id=>vols.find(v=>v.id===id)?.name||'—';
-  const cName=id=>{const c=contacts.find(x=>x.id===id);return c?displayName(c):'—';};
-  async function swap(p){const alt=vols.find(v=>v.id!==p.volunteerId);if(alt){await saveItem('poc',{...p,volunteerId:alt.id,status:'Active'});toast(`POC swapped to <b>${esc(alt.name)}</b> for that day.`);}}
+/* ── One-time repair for tasks imported before the fix: they kept the sheet's
+   Department / Owner text but were filed under the first department. ── */
+function TaskRepairModal({ fixes, depts, vols, onClose, toast }) {
+  const [busy, setBusy] = useState(false);
+  const dn = id => depts.find(d => d.id === id)?.name || '—';
+  const vn = id => vols.find(v => v.id === id)?.name || '—';
+  const fixable = fixes.filter(f => f.newDept || f.newOwner);
+  const stuck = fixes.filter(f => f.deptUnknown || f.ownerUnknown);
+  async function apply() {
+    setBusy(true);
+    try {
+      await batchUpsert('tasks', fixable.map(f => ({ ...f.task, ...(f.newDept ? { deptId: f.newDept } : {}), ...(f.newOwner ? { assigneeId: f.newOwner } : {}) })));
+      toast(`Fixed ${fixable.length} task${fixable.length > 1 ? 's' : ''}.`);
+      onClose();
+    } catch (e) { toast('Could not fix: ' + (e.code || e.message)); setBusy(false); }
+  }
   return (
-    <>
-      <div className="page-head"><div className="ph-txt"><h1>Volunteers & POC</h1><p>One volunteer directory feeding department duty and POC assignment per day.</p></div></div>
-      <div className="panel"><div className="panel-head"><h2>POC duty roster</h2><div className="desc">Per VIP, per day</div><div className="right"><button className="btn primary sm" onClick={()=>setModal({type:'add-poc'})}>{ICON.plus}Assign POC</button></div></div>
-        <div className="panel-body"><table><thead><tr><th>VIP</th><th>Day</th><th>POC on duty</th><th>Shift</th><th></th></tr></thead><tbody>
-          {poc.map(p=>(
-            <tr key={p.id}><td><div className="nm">{cName(p.contactId)}</div></td><td className="muted-sm">{shortDate(p.day)}</td>
-              <td><select className="statsel" value={p.volunteerId} onChange={e=>saveItem('poc',{...p,volunteerId:e.target.value,status:'Active'})}>{vols.map(v=><option key={v.id} value={v.id}>{v.name}</option>)}</select></td>
-              <td className="muted-sm">{p.shift}</td>
-              <td><div className="rowacts"><button className="btn ghost xs" onClick={()=>swap(p)}>Reassign</button><button className="btn ghost xs" onClick={()=>setModal({type:'del-poc',item:p})}>{ICON.trash}</button></div></td></tr>
-          ))}
-          {!poc.length&&<tr><td colSpan="5"><Empty title="No POC assignments" sub="Assign a volunteer to escort a VIP on a given day." /></td></tr>}
-        </tbody></table></div></div>
-      <div className="panel"><div className="panel-head"><h2>Volunteer directory</h2><div className="right">
-        <button className="btn sm" onClick={()=>setModal({type:'import-v'})}>{ICON.upload}Import Excel</button>
-        <button className="btn primary sm" onClick={()=>setModal({type:'add-v'})}>{ICON.plus}Add volunteer</button>
-      </div></div>
-        <div className="panel-body"><table><thead><tr><th>Name</th><th>City</th><th>Skills</th><th></th></tr></thead><tbody>
-          {vols.map(v=>(
-            <tr key={v.id}><td><div className="person"><div className="avatar">{initials(v.name)}</div><div className="nm">{v.name}</div></div></td><td className="muted-sm">{v.city}</td><td className="muted-sm">{v.skills}</td>
-              <td><div className="rowacts"><button className="btn ghost xs" onClick={()=>setModal({type:'edit-v',item:v})}>{ICON.edit}</button><button className="btn ghost xs" onClick={()=>setModal({type:'del-v',item:v})}>{ICON.trash}</button></div></td></tr>
-          ))}
-        </tbody></table></div></div>
-      {(modal?.type==='add-v'||modal?.type==='edit-v')&&<VolModal item={modal.item} onClose={()=>setModal(null)} toast={toast} />}
-      {modal?.type==='add-poc'&&<PocModal store={store} activeEventId={activeEventId} onClose={()=>setModal(null)} toast={toast} />}
-      {modal?.type==='del-v'&&<DeleteModal label={modal.item.name} onClose={()=>setModal(null)} onConfirm={async()=>{await removeItem('volunteers',modal.item.id);poc.filter(p=>p.volunteerId===modal.item.id).forEach(p=>removeItem('poc',p.id));setModal(null);toast('Volunteer deleted.');}} />}
-      {modal?.type==='del-poc'&&<DeleteModal label="this POC assignment" onClose={()=>setModal(null)} onConfirm={async()=>{await removeItem('poc',modal.item.id);setModal(null);toast('POC assignment removed.');}} />}
-      {modal?.type==='import-v'&&<GenericImportModal title="Import volunteers" store={store} activeEventId={activeEventId} onClose={()=>setModal(null)} toast={toast} parseFile={parseVolunteersFile} planFn={planVolunteersImport} existingItems={vols} itemLabel="volunteers" buildItem={item=>item}/>}
-    </>
+    <Modal title="Fix imported tasks" onClose={onClose} footer={null}>
+      <p className="muted-sm" style={{ marginTop: 0 }}>These tasks came from an Excel import that didn't link the Department / Owner columns. Here's what will change:</p>
+      {fixable.length > 0 && (
+        <div style={{ maxHeight: '40vh', overflow: 'auto', border: '1px solid var(--line)', borderRadius: 8 }}>
+          <table className="import-tbl"><thead><tr><th>Task</th><th>Department</th><th>Owner</th></tr></thead><tbody>
+            {fixable.map(f => (
+              <tr key={f.task.id}>
+                <td>{f.task.title}</td>
+                <td>{f.newDept ? <><s className="muted-sm">{dn(f.task.deptId)}</s> → <b>{dn(f.newDept)}</b></> : <span className="muted-sm">{dn(f.task.deptId)}</span>}</td>
+                <td>{f.newOwner ? <b>{vn(f.newOwner)}</b> : <span className="muted-sm">{vn(f.task.assigneeId)}</span>}</td>
+              </tr>
+            ))}
+          </tbody></table>
+        </div>
+      )}
+      {stuck.length > 0 && (
+        <div className="mtg-note" style={{ marginTop: 10 }}>
+          ⚠ Couldn't match {stuck.reduce((n, f) => n + (f.deptUnknown ? 1 : 0) + (f.ownerUnknown ? 1 : 0), 0) === 1 ? 'this name' : 'these names'}:{' '}
+          {stuck.map(f => [f.deptUnknown && `department "${f.task.deptName}"`, f.ownerUnknown && `owner "${f.task.assigneeName}"`].filter(Boolean).join(', ') + ` (${f.task.title})`).join('; ')}.
+          {' '}Fix these by editing the task.
+        </div>
+      )}
+      <div className="modal-foot" style={{ padding: '12px 0 0' }}>
+        <button className="btn" onClick={onClose}>Cancel</button>
+        <button className="btn primary" disabled={busy || !fixable.length} onClick={apply}>{busy ? 'Fixing…' : `Fix ${fixable.length} task${fixable.length === 1 ? '' : 's'}`}</button>
+      </div>
+    </Modal>
   );
 }
-function VolModal({item,onClose,toast}){
-  const[f,setF]=useState(()=>({name:'',phone:'',city:'',skills:'',...item}));
-  const set=k=>e=>setF(p=>({...p,[k]:e.target.value}));
-  async function save(){if(!f.name.trim())return;await saveItem('volunteers',f);onClose();toast(item?'Volunteer updated.':'Volunteer added.');}
-  return(<Modal title={item?'Edit volunteer':'Add volunteer'} onClose={onClose} onSave={save} size="sm" saveLabel={item?'Save changes':'Add volunteer'}>
-    <Field label="Name"><input className="input" value={f.name} onChange={set('name')}/></Field>
-    <div className="grid2"><Field label="Phone"><input className="input" value={f.phone} onChange={set('phone')}/></Field><Field label="City"><input className="input" value={f.city} onChange={set('city')}/></Field></div>
-    <Field label="Skills"><input className="input" value={f.skills} onChange={set('skills')} placeholder="POC, Hospitality…"/></Field>
-  </Modal>);
-}
-function PocModal({store,activeEventId,onClose,toast}){
-  const vips=S(store,'contacts').filter(c=>c.status==='Confirmed');
-  const vols=S(store,'volunteers');
-  const[f,setF]=useState({contactId:vips[0]?.id||'',volunteerId:vols[0]?.id||'',day:'',shift:'Full day',notes:''});
-  const set=k=>e=>setF(p=>({...p,[k]:e.target.value}));
-  async function save(){if(!f.contactId||!f.volunteerId||!f.day)return;await saveItem('poc',{...f,eventId:activeEventId,status:'Active'});onClose();toast('POC assigned.');}
-  return(<Modal title="Assign POC" onClose={onClose} onSave={save} size="sm" saveLabel="Assign">
-    <Field label="VIP / Guest"><select className="input" value={f.contactId} onChange={set('contactId')}>{vips.map(c=><option key={c.id} value={c.id}>{displayName(c)}</option>)}</select></Field>
-    <Field label="Volunteer"><select className="input" value={f.volunteerId} onChange={set('volunteerId')}>{vols.map(v=><option key={v.id} value={v.id}>{v.name}</option>)}</select></Field>
-    <div className="grid2"><Field label="Day"><input className="input" type="date" value={f.day} onChange={set('day')}/></Field><Field label="Shift"><select className="input" value={f.shift} onChange={set('shift')}>{SHIFTS.map(s=><option key={s}>{s}</option>)}</select></Field></div>
-    <Field label="Handover notes (diet, preferences, special instructions)"><input className="input" value={f.notes} onChange={set('notes')} placeholder="e.g. Vegetarian (Jain). Call office 30 min before pickup."/></Field>
-  </Modal>);
-}
 
-/* ============================ DEPARTMENTS & TASKS ============================ */
 export function Depts({ store, activeEventId }) {
+  const { profile } = useAuth();
   const toast=useToast();
+  const { can } = usePerm();
   const[modal,setModal]=useState(null);
   const depts=S(store,'departments'),tasks=S(store,'tasks'),vols=S(store,'volunteers');
+  const avail=store.availability||[];
   const dName=id=>depts.find(d=>d.id===id)?.name||'—';
   const vName=id=>vols.find(v=>v.id===id)?.name||'—';
+
+  // Tasks imported before the fix: their sheet text doesn't match their linked department/owner
+  const taskFixes = tasks.map(t => {
+    const d = t.deptName ? matchDept(t.deptName, depts) : null;
+    const v = t.assigneeName ? matchVolunteer(t.assigneeName, vols) : null;
+    return { task:t,
+      newDept: d && d.id !== t.deptId ? d.id : null,
+      newOwner: v && !t.assigneeId ? v.id : null,
+      deptUnknown: !!t.deptName && !d, ownerUnknown: !!t.assigneeName && !v && !t.assigneeId };
+  }).filter(f => f.newDept || f.newOwner || f.deptUnknown || f.ownerUnknown);
+
+  // Get volunteers assigned to a department for this event (from Volunteer Availability)
+  const getDeptVols = deptId => {
+    return vols.filter(v => {
+      const rec = avail.find(a=>a.volId===v.id&&a.day==='depts'&&a.eventId===activeEventId);
+      return (rec?.deptIds||[]).includes(deptId);
+    });
+  };
+
   return(
     <>
       <div className="page-head"><div className="ph-txt"><h1>Departments & Tasks</h1></div></div>
+      {taskFixes.length > 0 && can('depts.add') && (
+        <div className="mtg-note" style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
+          <span>⚠ {taskFixes.length} imported task{taskFixes.length>1?'s are':' is'} not linked to the department or owner named in the sheet.</span>
+          <button className="btn sm" style={{marginLeft:'auto'}} onClick={()=>setModal({type:'fix-t'})}>Review & fix</button>
+        </div>
+      )}
       <div className="panel"><div className="panel-head"><h2>Departments</h2><div className="right"><button className="btn primary sm" onClick={()=>setModal({type:'add-d'})}>{ICON.plus}Add</button></div></div>
-        <div className="panel-body"><table><thead><tr><th>Department</th><th>HOD(s)</th><th>Open tasks</th><th></th></tr></thead><tbody>
-          {depts.map(d=>{const hods=(d.hodIds||[]).map(id=>vName(id)).filter(x=>x!=='—').join(', ');const open=tasks.filter(t=>t.deptId===d.id&&t.status!=='Done').length;
-            return<tr key={d.id}><td><div className="nm">{d.name}</div><div className="role">{d.desc}</div></td><td className="muted-sm">{hods||'—'}</td><td><span className={'badge '+(open?'b-open':'b-done')}>{open} open</span></td>
-              <td><div className="rowacts"><button className="btn ghost xs" onClick={()=>setModal({type:'edit-d',item:d})}>{ICON.edit}</button><button className="btn ghost xs" onClick={()=>setModal({type:'del-d',item:d})}>{ICON.trash}</button></div></td></tr>;
+        <div className="panel-body"><table><thead><tr><th>Department</th><th>HOD(s)</th><th>Volunteers</th><th>Open tasks</th><th></th></tr></thead><tbody>
+          {depts.map(d=>{
+            const hods=(d.hodIds||[]).map(id=>vName(id)).filter(x=>x!=='—').join(', ');
+            const open=tasks.filter(t=>t.deptId===d.id&&t.status!=='Done').length;
+            const deptVols=getDeptVols(d.id);
+            return<tr key={d.id}>
+              <td><div className="nm">{d.name}</div><div className="role">{d.desc}</div></td>
+              <td className="muted-sm">{hods||'—'}</td>
+              <td>
+                {deptVols.length===0
+                  ? <span style={{color:'var(--faint)',fontSize:12}}>None assigned</span>
+                  : <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
+                      {deptVols.map(v=>(
+                        <span key={v.id} style={{
+                          fontSize:11.5,padding:'2px 8px',borderRadius:12,
+                          background:'var(--teal-wash)',color:'var(--teal)',
+                          border:'1px solid var(--teal)',whiteSpace:'nowrap'
+                        }} title={v.phone||''}>
+                          {v.name}
+                        </span>
+                      ))}
+                    </div>
+                }
+                <div style={{marginTop:3}}>
+                  <button className="btn ghost xs" style={{fontSize:10.5,padding:'1px 6px',color:'var(--muted)'}}
+                    onClick={()=>window.__jyotGo&&window.__jyotGo('availability')}
+                    title="Manage in Volunteer Availability">
+                    ↗ Manage
+                  </button>
+                </div>
+              </td>
+              <td><span className={'badge '+(open?'b-open':'b-done')}>{open} open</span></td>
+              <td><div className="rowacts"><button className="btn ghost xs" onClick={()=>setModal({type:'edit-d',id:d.id})}>{ICON.edit}</button><button className="btn ghost xs" onClick={()=>setModal({type:'del-d',id:d.id})}>{ICON.trash}</button></div></td>
+            </tr>;
           })}
-          {!depts.length&&<tr><td colSpan="4"><Empty title="No departments yet" sub="Add your first department."/></td></tr>}
+          {!depts.length&&<tr><td colSpan="5"><Empty title="No departments yet" sub="Add your first department."/></td></tr>}
         </tbody></table></div></div>
       <div className="panel"><div className="panel-head"><h2>Tasks</h2><div className="right">
         <button className="btn sm" onClick={()=>setModal({type:'import-t'})}>{ICON.upload}Import Excel</button>
-        <button className="btn primary sm" onClick={()=>setModal({type:'add-t'})}>{ICON.plus}Add task</button>
+        {can('depts.add') && <button className="btn primary sm" onClick={()=>setModal({type:'add-t'})}>{ICON.plus}Add task</button>}
       </div></div>
         <div className="panel-body"><table><thead><tr><th>Task</th><th>Department</th><th>Owner</th><th>Due</th><th>Status</th><th></th></tr></thead><tbody>
           {tasks.map(t=>{
@@ -628,15 +2743,16 @@ export function Depts({ store, activeEventId }) {
               <td><select className="statsel" value={t.status} disabled={isBlocked}
                 onChange={e=>!isBlocked&&saveItem('tasks',{...t,status:e.target.value})}
                 style={isBlocked?{opacity:.5,cursor:'not-allowed'}:{}}>{TASK_STATUS.map(s=><option key={s}>{s}</option>)}</select></td>
-              <td><div className="rowacts"><button className="btn ghost xs" onClick={()=>setModal({type:'edit-t',item:t})}>{ICON.edit}</button><button className="btn ghost xs" onClick={()=>setModal({type:'del-t',item:t})}>{ICON.trash}</button></div></td></tr>);
+              <td><div className="rowacts">{can('depts.add')&&<button className="btn ghost xs" onClick={()=>setModal({type:'edit-t',id:t.id})}>{ICON.edit}</button>}{can('depts.delete')&&<button className="btn ghost xs" onClick={()=>setModal({type:'del-t',id:t.id})}>{ICON.trash}</button>}</div></td></tr>);
           })}
           {!tasks.length&&<tr><td colSpan="6"><Empty title="No tasks yet" sub="Add the first task."/></td></tr>}
         </tbody></table></div></div>
-      {(modal?.type==='add-d'||modal?.type==='edit-d')&&<DeptModal item={modal.item} vols={vols} onClose={()=>setModal(null)} toast={toast}/>}
-      {(modal?.type==='add-t'||modal?.type==='edit-t')&&<TaskModal item={modal.item} depts={depts} vols={vols} tasks={tasks} activeEventId={activeEventId} onClose={()=>setModal(null)} toast={toast}/>}
-      {modal?.type==='del-d'&&<DeleteModal label={modal.item.name} onClose={()=>setModal(null)} onConfirm={async()=>{await removeItem('departments',modal.item.id);tasks.filter(t=>t.deptId===modal.item.id).forEach(t=>removeItem('tasks',t.id));setModal(null);toast('Department deleted.');}}/>}
-      {modal?.type==='del-t'&&<DeleteModal label={modal.item.title} onClose={()=>setModal(null)} onConfirm={async()=>{await removeItem('tasks',modal.item.id);setModal(null);toast('Task deleted.');}}/>}
-      {modal?.type==='import-t'&&<GenericImportModal title="Import tasks" store={store} activeEventId={activeEventId} onClose={()=>setModal(null)} toast={toast} parseFile={parseTasksFile} planFn={planTasksImport} existingItems={tasks} itemLabel="tasks" buildItem={item=>({...item,eventId:activeEventId,deptId:item.deptId||depts[0]?.id||''})}/>}
+      {(modal?.type==='add-d'||modal?.type==='edit-d')&&<DeptModal item={modal.type==='edit-d'?depts.find(d=>d.id===modal.id)||undefined:undefined} vols={vols} onClose={()=>setModal(null)} toast={toast}/>}
+      {(modal?.type==='add-t'||modal?.type==='edit-t')&&<TaskModal item={modal.type==='edit-t'?tasks.find(t=>t.id===modal.id)||undefined:undefined} depts={depts} vols={vols} tasks={tasks} activeEventId={activeEventId} onClose={()=>setModal(null)} toast={toast}/>}
+      {modal?.type==='del-d'&&(()=>{const _dept=depts.find(d=>d.id===modal.id);return _dept?<DeleteModal label={_dept.name} onClose={()=>setModal(null)} onConfirm={async()=>{const _did=modal.id;const _dtasks=tasks.filter(t=>t.deptId===_did);const linked=[..._dtasks.map(t=>({collection:'tasks',data:t}))];setModal(null);await trashItem('departments',_dept,linked,profile?.email||'');_dtasks.forEach(t=>removeItem('tasks',t.id));await removeItem('departments',_did);toast('Department moved to trash.');}}/>:null;})()}
+      {modal?.type==='del-t'&&(()=>{const _task=tasks.find(t=>t.id===modal.id);return _task?<DeleteModal label={_task.title} onClose={()=>setModal(null)} onConfirm={async()=>{setModal(null);await trashItem('tasks',_task,[],profile?.email||'');await removeItem('tasks',modal.id);toast('Task moved to trash.');}}/>:null;})()}
+      {modal?.type==='import-t'&&<TaskImportModal depts={depts} vols={vols} tasks={tasks} activeEventId={activeEventId} onClose={()=>setModal(null)} toast={toast}/>}
+      {modal?.type==='fix-t'&&<TaskRepairModal fixes={taskFixes} depts={depts} vols={vols} onClose={()=>setModal(null)} toast={toast}/>}
     </>
   );
 }
@@ -657,7 +2773,14 @@ function TaskModal({item,depts,vols,tasks,activeEventId,onClose,toast}){
   const toggleCon=id=>setF(p=>({...p,connected:p.connected.includes(id)?p.connected.filter(x=>x!==id):[...p.connected,id]}));
   const toggleBlockedBy=id=>setF(p=>({...p,blockedBy:(p.blockedBy||[]).includes(id)?(p.blockedBy||[]).filter(x=>x!==id):[...(p.blockedBy||[]),id]}));
   const otherTasks=(tasks||[]).filter(t=>t.id!==item?.id);
-  async function save(){if(!f.title.trim())return;await saveItem('tasks',{...f,eventId:activeEventId});onClose();toast(item?'Task updated.':'Task added.');}
+  const [taskErrors, setTaskErrors] = useState({});
+  async function save(){
+    const errs={};
+    if(!f.title.trim()) errs.title='Task title is required';
+    if(!f.deptId) errs.dept='Department is required';
+    if(Object.keys(errs).length){setTaskErrors(errs);return;}
+    await saveItem('tasks',{...f,deptName:'',assigneeName:'',eventId:activeEventId});onClose();toast(item?'Task updated.':'Task added.');
+  }
   return(<Modal title={item?'Edit task':'Add task'} onClose={onClose} onSave={save} saveLabel={item?'Save changes':'Add task'}>
     <Field label="Task"><input className="input" value={f.title} onChange={set('title')}/></Field>
     <div className="grid2">
@@ -675,163 +2798,976 @@ function TaskModal({item,depts,vols,tasks,activeEventId,onClose,toast}){
 }
 
 /* ============================ GENERATE ============================ */
-export function Reports({ store }) {
-  const toast=useToast();
-  const[mode,setMode]=useState('personal');
-  const confirmed=S(store,'contacts').filter(c=>c.status==='Confirmed');
-  return(
-    <>
-      <div className="page-head"><div className="ph-txt"><h1>Generate schedules</h1><p>Documents built from live data. Change anything upstream and regenerate.</p></div></div>
-      <div className="subnav">
-        <button className={mode==='personal'?'active':''} onClick={()=>setMode('personal')}>Personalised</button>
-        <button className={mode==='event'?'active':''} onClick={()=>setMode('event')}>Event schedule</button>
-        <button className={mode==='founder'?'active':''} onClick={()=>setMode('founder')}>Founder's day</button>
+/* ── PersonalisedSchedule Info Card (standalone component) ───────── */
+function PSInfoCard({ c, store }) {
+  const logistics = store.logistics || [];
+  const founder   = store.founder   || [];
+  const L = logistics.find(l => l.contactId === c.id) || {};
+  const sahebji = founder.find(f => f.contactId === c.id);
+  const vendor = (store.carVendors || []).find(v => v.id === L.carVendorId);
+  const driver = (vendor?.drivers || []).find(d => d.id === L.carDriverId);
+  return (
+    <div className="ps-info" style={{ minWidth:240, maxWidth:280, background:'#fff', border:'1px solid var(--line)',
+      borderRadius:10, padding:'14px 16px', fontSize:12.5, alignSelf:'flex-start', flexShrink:0 }}>
+      <div style={{ fontWeight:700, fontSize:13, color:'var(--teal)', marginBottom:10 }}>{displayName(c)}</div>
+      <div style={{ fontWeight:600, color:'var(--muted)', marginBottom:4, fontSize:11, textTransform:'uppercase', letterSpacing:'.05em' }}>✈️ Flight</div>
+      {L.arrivalFlightNo
+        ? <div style={{marginBottom:3}}>Arrival: <b>{L.arrivalFlightNo}</b> · {L.arrivalFlightDate} {L.arrivalFlightTime}</div>
+        : <div style={{color:'var(--faint)',fontSize:12,marginBottom:3}}>No arrival flight</div>}
+      {L.departureFlightNo && <div style={{marginBottom:8}}>Departure: <b>{L.departureFlightNo}</b> · {L.departureFlightDate} {L.departureFlightTime}</div>}
+      {L.carVendorId && <>
+        <div style={{ fontWeight:600, color:'var(--muted)', marginBottom:4, fontSize:11, textTransform:'uppercase', letterSpacing:'.05em' }}>🚗 Car</div>
+        {vendor && <div style={{marginBottom:3}}>Vendor: <b>{vendor.name}</b></div>}
+        {driver && <div style={{marginBottom:3}}>Driver: <b>{driver.name}</b></div>}
+        {L.carPickupDate && <div style={{marginBottom:3}}>Pickup: {L.carPickupDate} {L.carPickupTime}</div>}
+        {L.carDepartureDate && <div style={{marginBottom:8}}>Departs: {L.carDepartureDate} {L.carDepartureTime}</div>}
+      </>}
+      {L.hotelName && <>
+        <div style={{ fontWeight:600, color:'var(--muted)', marginBottom:4, fontSize:11, textTransform:'uppercase', letterSpacing:'.05em' }}>🏨 Hotel</div>
+        <div style={{marginBottom:3}}><b>{L.hotelName}</b></div>
+        {L.checkinDate && <div style={{marginBottom:3}}>Check-in: {L.checkinDate} {L.checkinTime}</div>}
+        {L.checkoutDate && <div style={{marginBottom:8}}>Check-out: {L.checkoutDate} {L.checkoutTime}</div>}
+      </>}
+      {sahebji && <>
+        <div style={{ fontWeight:600, color:'var(--muted)', marginBottom:4, fontSize:11, textTransform:'uppercase', letterSpacing:'.05em' }}>🙏 Sahebji</div>
+        <div style={{marginBottom:3}}>{sahebji.date} at {sahebji.time}</div>
+        {sahebji.duration && <div>Duration: {sahebji.duration} min</div>}
+      </>}
+    </div>
+  );
+}
+
+/* ── Personalised Schedule ────────────────────────────────────────── */
+/* ── Word download for Personalised Schedule ─────────────────────── */
+function downloadScheduleWord(contact, store, activeEventId) {
+  const logistics    = store.logistics    || [];
+  const sessions     = store.sessions     || [];
+  const assignments  = store.assignments  || [];
+  const founder      = store.founder      || [];
+  const personalised = store.personalisedSchedule || [];
+
+  // Load template settings
+  const tmpl = (store.appConfig||[]).find(c=>c.id==='scheduleTemplate') || {};
+  const hasTemplate    = !!(tmpl.headerTitle || tmpl.headerBg || tmpl.headerLogo);
+  const headerBg       = tmpl.headerBg       || '#0F6E56';
+  const headerTextColor= tmpl.headerTextColor|| '#ffffff';
+  const headerTitle    = tmpl.headerTitle    || 'VK Outreach Program — JYOT';
+  const headerSub      = tmpl.headerSub      || '';
+  const headerLogo     = tmpl.headerLogo     || '';
+  const logoPosition   = tmpl.logoPosition   || 'left';
+  const logoSize       = tmpl.logoSize       || 'medium';
+  const tableHeaderBg  = tmpl.tableHeaderBg  || headerBg;
+  const altRowColor    = tmpl.altRowColor    || '#F0FAF6';
+  const fontFamily     = tmpl.fontFamily     || 'Calibri';
+  const timeColWidth   = {narrow:'70pt',normal:'90pt',wide:'120pt'}[tmpl.timeColWidth||'normal'];
+  const footerLine1    = tmpl.footerLine1    || '';
+  const footerLine2    = tmpl.footerLine2    || '';
+  const footerLogo     = tmpl.footerLogo     || '';
+  const footerBorder   = tmpl.footerBorderColor || headerBg;
+  const showPageNumber = tmpl.showPageNumber !== false;
+  const showHotel      = tmpl.showHotel      !== false;
+  const showPOC        = tmpl.showPOC        !== false;
+  const showAutoTag    = tmpl.showAutoTag    !== false;
+  const logoSizePx     = {small:'40px',medium:'60px',large:'90px'}[logoSize]||'60px';
+
+  const L       = logistics.find(l => l.contactId === contact.id) || {};
+  const sahebji = founder.find(f => f.contactId === contact.id);
+
+  const rows = [];
+  personalised.filter(r => r.contactId===contact.id && r.date && r.time && r.event && !r.deleted
+    && (showPOC || !r.id?.startsWith('poc_auto_'))
+    && !r.id?.startsWith('poc_auto_') === !showPOC ? true : true )
+    .forEach(r => {
+      if (!showPOC && r.id?.startsWith('poc_auto_')) return;
+      rows.push({ date:r.date, time:r.time, event:r.event });
+    });
+  if (L.arrivalDate && L.arrivalTime)
+    rows.push({ date:L.arrivalDate, time:L.arrivalTime, event:'Journey towards Hotel' });
+  if (L.departureDate && L.departureTime)
+    rows.push({ date:L.departureDate, time:L.departureTime, event:'Departure towards Airport' });
+  if (sahebji?.date && sahebji?.time)
+    rows.push({ date:sahebji.date, time:sahebji.time, event:'One on One Meeting with His Holiness' });
+  const assignedIds = assignments.filter(a=>a.contactId===contact.id).map(a=>a.sessionId);
+  sessions.filter(s=>assignedIds.includes(s.id)).forEach(s=>{
+    if (!rows.some(r=>r.date===s.date&&r.time===s.start))
+      rows.push({ date:s.date, time:s.start, event:s.title });
+  });
+  rows.sort((a,b)=>((a.date+a.time)>(b.date+b.time)?1:-1));
+
+  const byDate = {};
+  rows.forEach(r=>{ if(!byDate[r.date]) byDate[r.date]=[]; byDate[r.date].push(r); });
+
+  // Build logo HTML for header
+  const logoHtml = headerLogo ? `<img src="${headerLogo}" style="height:${logoSizePx};object-fit:contain;display:block;" alt="logo"/>` : '';
+  const logoAlign = logoPosition==='center'?'center':logoPosition==='right'?'right':'left';
+
+  const headerHtml = `
+    <div style="background:${headerBg};color:${headerTextColor};padding:14pt 18pt;margin:-40pt -40pt 20pt -40pt;">
+      ${logoPosition==='center'
+        ? `<div style="text-align:center">${logoHtml}<div style="font-size:18pt;font-weight:700;color:${headerTextColor}">${headerTitle}</div>${headerSub?`<div style="font-size:11pt;opacity:.85;color:${headerTextColor}">${headerSub}</div>`:''}</div>`
+        : `<div style="display:flex;align-items:center;gap:12pt;justify-content:${logoPosition==='right'?'space-between':'flex-start'}">
+            ${logoPosition==='left'?logoHtml:''}
+            <div style="flex:1"><div style="font-size:18pt;font-weight:700;color:${headerTextColor}">${headerTitle}</div>${headerSub?`<div style="font-size:11pt;opacity:.85;color:${headerTextColor}">${headerSub}</div>`:''}</div>
+            ${logoPosition==='right'?logoHtml:''}
+           </div>`
+      }
+    </div>`;
+
+  const dayBlocks = Object.entries(byDate).map(([date,dayRows])=>`
+    <p style="font-size:13pt;font-weight:bold;color:${headerBg};margin:16pt 0 4pt;font-family:${fontFamily},sans-serif">${fmtDate(date)}</p>
+    <table style="width:100%;border-collapse:collapse;margin-bottom:12pt;font-family:${fontFamily},sans-serif">
+      <tr style="background:${tableHeaderBg}">
+        <th style="padding:6px 10px;color:${headerTextColor};font-size:11pt;text-align:left;width:${timeColWidth}">Time</th>
+        <th style="padding:6px 10px;color:${headerTextColor};font-size:11pt;text-align:left">Programme</th>
+      </tr>
+      ${dayRows.map((r,i)=>`
+        <tr style="background:${i%2===0?'#ffffff':altRowColor}">
+          <td style="padding:6px 10px;border:1px solid #ddd;font-size:11pt;font-family:${fontFamily},sans-serif">${r.time||'—'}</td>
+          <td style="padding:6px 10px;border:1px solid #ddd;font-size:11pt;font-family:${fontFamily},sans-serif">${r.event||''}${showAutoTag&&r.auto?'  ↺':''}</td>
+        </tr>`).join('')}
+    </table>`).join('');
+
+  const hotelBlock = showHotel ? `
+    <p style="font-size:11pt;color:#555;margin:0 0 16pt;font-family:${fontFamily},sans-serif">
+      Hotel: ${L.hotelName||'—'} &nbsp;·&nbsp; Arrival: ${L.arrivalDate||'—'} ${L.arrivalTime||''} &nbsp;·&nbsp; Departure: ${L.departureDate||'—'} ${L.departureTime||''}
+    </p>` : '';
+
+  const footerBlock = (footerLine1||footerLine2||footerLogo) ? `
+    <div style="border-top:2px solid ${footerBorder};margin-top:24pt;padding-top:8pt;display:flex;align-items:center;justify-content:space-between">
+      <div style="font-size:9pt;color:#888;font-family:${fontFamily},sans-serif">
+        ${footerLine1?`<div>${footerLine1}</div>`:''}
+        ${footerLine2?`<div>${footerLine2}</div>`:''}
+        ${showPageNumber?`<div style="color:#aaa;margin-top:2pt">Page 1</div>`:''}
       </div>
-      {mode==='personal'&&<PersonalReport store={store} confirmed={confirmed} toast={toast}/>}
-      {mode==='event'&&<EventScheduleReport store={store}/>}
-      {mode==='founder'&&<FounderReport store={store}/>}
+      ${footerLogo?`<img src="${footerLogo}" style="height:28pt;object-fit:contain" alt="logo"/>` : ''}
+    </div>` : '';
+
+  const html = hasTemplate
+    ? `<html xmlns:o="urn:schemas-microsoft-com:office:office"
+        xmlns:w="urn:schemas-microsoft-com:office:word"
+        xmlns="http://www.w3.org/TR/REC-html40">
+        <head><meta charset="utf-8">
+        <style>body{font-family:${fontFamily},sans-serif;margin:40pt;color:#1a1a1a}</style>
+        </head><body>
+        ${headerHtml}
+        <h2 style="font-size:16pt;color:${headerBg};margin:0 0 4pt;font-family:${fontFamily},sans-serif">${displayName(contact)}</h2>
+        <p style="font-size:12pt;color:#555;margin:0 0 6pt;font-family:${fontFamily},sans-serif">${[contact.type,contact.desig,contact.org].filter(Boolean).join(' · ')}</p>
+        ${hotelBlock}
+        ${dayBlocks}
+        ${footerBlock}
+        </body></html>`
+    : `<html xmlns:o="urn:schemas-microsoft-com:office:office"
+        xmlns:w="urn:schemas-microsoft-com:office:word"
+        xmlns="http://www.w3.org/TR/REC-html40">
+        <head><meta charset="utf-8">
+        <style>body{font-family:Calibri,sans-serif;margin:40pt;color:#1a1a1a}
+        h1{color:#0F6E56;font-size:18pt;margin:0 0 4pt}h2{font-size:14pt;font-weight:normal;margin:0 0 12pt;color:#444}</style>
+        </head><body>
+        <p style="font-size:10pt;color:#888;margin:0">VK Outreach Program — JYOT</p>
+        <h1>Personalised Schedule</h1>
+        <h2>${displayName(contact)} · ${contact.type||''} · ${contact.org||''}</h2>
+        ${hotelBlock}
+        ${dayBlocks}
+        </body></html>`;
+
+  const blob = new Blob([html],{type:'application/msword'});
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href=url; a.download=`Schedule_${displayName(contact).replace(/\s+/g,'_')}.doc`;
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a); URL.revokeObjectURL(url);
+}
+
+export function Reports({ store, activeEventId }) {
+  const toast = useToast();
+  const { can } = usePerm();
+
+  const contacts       = (store.contacts || []).filter(c => c.status === 'Confirmed');
+  const sessions       = store.sessions || [];
+  const assignments    = store.assignments || [];
+  const founder        = store.founder || [];
+  const logistics      = store.logistics || [];
+  const savedRows      = store.personalisedSchedule || [];
+  const savedMandatory = store.personalisedMandatory || [];
+
+  const configEventOptions = (store.appConfig||[]).find(c=>c.id==='eventOptions')?.items;
+  const EVENT_OPTIONS = configEventOptions || [
+    'Arrival at the Airport','Departure Flight','Journey towards Hotel',
+    'Journey towards Venue','Arrival at Venue','One-on-One Meeting with Sahebji',
+    'Media Bytes','Guided tour of Exhibition','Breakfast','Podcast',
+    'Lunch','Journey towards Airport','High Tea','Checkout from Hotel',
+  ];
+
+  const configMandatory = (store.appConfig||[]).find(c=>c.id==='mandatoryItems')?.items || [];
+  // configMandatory items may be strings or objects — normalise to objects
+  const configMandatoryNorm = configMandatory.map(i =>
+    typeof i === 'string' ? { key: i.toLowerCase().replace(/\s+/g,'_'), label: i } : i
+  ).filter(i => i && i.key);
+  const DEFAULT_MANDATORY = [
+    { key:'guidedTour', label:'Guided tour' },
+    { key:'mediaBytes', label:'Media Bytes' },
+    { key:'sahebji',    label:'Sahebji meeting' },
+    { key:'podcast',    label:'Podcast' },
+  ];
+  const ALL_MANDATORY = [
+    { key:'arrivalAtVenue', label:'Arrival at Venue', locked:true },
+    ...DEFAULT_MANDATORY,
+    ...configMandatoryNorm.filter(ci=>!DEFAULT_MANDATORY.find(d=>d.key===ci.key)).map(i=>({key:i.key,label:i.label||i.key,locked:false})),
+  ];
+
+  const MANDATORY_KEYWORDS = {
+    arrivalAtVenue: ['arrival at venue'],
+    guidedTour:     ['guided tour','exhibition'],
+    mediaBytes:     ['media bytes','media byte'],
+    sahebji:        ['sahebji','one-on-one','one on one'],
+    podcast:        ['podcast'],
+  };
+
+  // Local editing state per contact — { [cid]: { rows: [...], deleted: Set } }
+  const [localEdits, setLocalEdits] = useState({});
+  const [expandedId, setExpandedId] = useState(null);
+  const [printContact, setPrintContact] = useState(null);
+  const [summaryId, setSummaryId] = useState(null);
+  const [saving, setSaving] = useState({});
+  const [delChoice, setDelChoice] = useState(null);
+
+  const getL       = cid => logistics.find(l=>l.contactId===cid)||{};
+  const getSahebji = cid => founder.find(f=>f.contactId===cid);
+  const getMandatory = cid => savedMandatory.find(r=>r.contactId===cid)||{ arrivalAtVenue:true };
+  const getContactSessions = cid => {
+    const ids = assignments.filter(a=>a.contactId===cid).map(a=>a.sessionId);
+    return sessions.filter(s=>ids.includes(s.id)).sort((a,b)=>a.date>b.date?1:-1);
+  };
+
+  // Get saved manual rows from Firestore (threaded order)
+  const getSavedRows = cid => {
+    const rows = savedRows.filter(r=>r.contactId===cid && !r.auto);
+    const byId = Object.fromEntries(rows.map(r=>[r.id,r]));
+    const visited = new Set();
+    const ordered = [];
+    function chain(row) {
+      if (!row || visited.has(row.id)) return;
+      visited.add(row.id);
+      ordered.push(row);
+      rows.filter(r=>r.insertAfter===row.id && !visited.has(r.id)).forEach(chain);
+    }
+    rows.filter(r=>!r.insertAfter||!byId[r.insertAfter])
+        .sort((a,b)=>((a.date||'')+(a.time||''))>((b.date||'')+(b.time||''))?1:-1)
+        .forEach(chain);
+    rows.filter(r=>!visited.has(r.id))
+        .sort((a,b)=>((a.date||'')+(a.time||''))>((b.date||'')+(b.time||''))?1:-1)
+        .forEach(chain);
+    return ordered;
+  };
+
+  /* Auto rows come from other modules and stay linked to them.
+     Session row ids are per guest (auto_session_<sid>__<cid>); older saved rows used the
+     session id alone, which made guests overwrite each other — canonAutoId maps them. */
+  const emptyEdit = () => ({ rows:[], deletedAutoIds:new Set(), pocOverrides:{}, autoEdits:{}, unassign:new Set() });
+  const isLegacyAuto = r => { const b = r.refId || r.id || ''; return b.startsWith('auto_session_') && !b.includes('__'); };
+  const canonAutoId = r => { const b = r.refId || r.id || ''; return isLegacyAuto(r) ? `${b}__${r.contactId}` : b; };
+  const getOverride = (cid, autoId) => savedRows.find(r=>r.contactId===cid && r.override && r.refId===autoId);
+  const hasManualSahebji = cid => savedRows.some(r=>r.contactId===cid && !r.auto && /sahebji|one-on-one|one on one/i.test(r.event||''));
+  const EDITABLE_SOURCES = ['Scheduling','Logistics','Sahebji'];
+
+  const getAutoRows = (cid, deletedIds) => {
+    const L = getL(cid);
+    const autos = [];
+    if (L.arrivalDate && L.arrivalTime) {
+      autos.push({ id:`auto_arrival_${cid}`, contactId:cid, date:L.arrivalDate, time:L.arrivalTime, srcDate:L.arrivalDate, srcTime:L.arrivalTime,
+        event:'Arrival at the Airport', pocRequired:false, auto:true, source:'Logistics' });
+    }
+    getContactSessions(cid).forEach(s => {
+      const id = `auto_session_${s.id}__${cid}`;
+      const ov = getOverride(cid, id);
+      autos.push({ id, contactId:cid, date:ov?.date||s.date, time:ov?.time||s.start, srcDate:s.date, srcTime:s.start, overridden:!!ov,
+        event:s.title, pocRequired:false, auto:true, source:'Scheduling', sessionId:s.id });
+    });
+    const m = getSahebji(cid);
+    if (m && m.date && m.time && !hasManualSahebji(cid)) {
+      autos.push({ id:`auto_sahebji_${cid}`, contactId:cid, date:m.date, time:m.time, srcDate:m.date, srcTime:m.time,
+        event:'One-on-One Meeting with Sahebji', pocRequired:false, auto:true, source:'Sahebji', founderId:m.id });
+    }
+    // POC assignments auto-rows
+    savedRows.filter(r=>r.contactId===cid && r.auto && r.id?.startsWith('poc_auto_') && !r.deleted)
+      .forEach(r => autos.push({...r, source:'POC Allocation'}));
+    return autos.filter(r=>!deletedIds.has(r.id));
+  };
+
+  // Initialize local edits when a contact is expanded
+  function initEdits(cid) {
+    if (localEdits[cid]) return; // already initialised
+    const savedManual = getSavedRows(cid);
+    // Load deleted auto rows from Firestore (saved with auto:true but marked deleted)
+    const deletedAutoIds = new Set(
+      savedRows.filter(r=>r.contactId===cid && r.auto && r.deleted).map(canonAutoId)
+    );
+    // Load POC overrides for auto rows
+    const pocOverrides = Object.fromEntries(
+      savedRows.filter(r=>r.contactId===cid && r.auto && !r.deleted && !r.override).map(r=>[canonAutoId(r), r.pocRequired||false])
+    );
+    setLocalEdits(prev=>({...prev, [cid]:{
+      rows: savedManual,
+      deletedAutoIds,
+      pocOverrides,
+      autoEdits: {},
+      unassign: new Set(),
+    }}));
+  }
+
+  function getEdit(cid) {
+    return localEdits[cid] || emptyEdit();
+  }
+
+  function getAllRows(cid) {
+    const edit = getEdit(cid);
+    const manualRows = edit.rows;
+    const autoRows = getAutoRows(cid, edit.deletedAutoIds).map(r=>{
+      const base = { ...r, pocRequired: edit.pocOverrides[r.id] ?? r.pocRequired };
+      const ae = edit.autoEdits?.[r.id];
+      if (!ae) return base;
+      if (ae.reset) return { ...base, date:r.srcDate, time:r.srcTime, overridden:false, pendingReset:true };
+      return { ...base, date:ae.date ?? r.date, time:ae.time ?? r.time, changed:true, scope:ae.scope };
+    });
+    return [...manualRows, ...autoRows]
+      .sort((a,b)=>((a.date||'')+(a.time||''))>((b.date||'')+(b.time||''))?1:-1);
+  }
+
+  function updateRowLocal(cid, rowId, field, val) {
+    setLocalEdits(prev=>{
+      const edit = prev[cid]||emptyEdit();
+      const rows = edit.rows.map(r=>r.id===rowId?{...r,[field]:val}:r);
+      return {...prev,[cid]:{...edit,rows}};
+    });
+  }
+
+  function updateAutoPocLocal(cid, autoId, val) {
+    setLocalEdits(prev=>{
+      const edit = prev[cid]||emptyEdit();
+      return {...prev,[cid]:{...edit,pocOverrides:{...edit.pocOverrides,[autoId]:val}}};
+    });
+  }
+
+  function updateAutoLocal(cid, row, field, val) {
+    setLocalEdits(prev=>{
+      const edit = prev[cid]||emptyEdit();
+      const cur = edit.autoEdits?.[row.id] || {};
+      const scope = cur.scope || (row.source==='Scheduling' ? 'all' : 'source');
+      return {...prev,[cid]:{...edit,autoEdits:{...(edit.autoEdits||{}),[row.id]:{...cur,reset:false,scope,[field]:val}}}};
+    });
+  }
+  function setAutoScope(cid, rowId, scope) {
+    setLocalEdits(prev=>{
+      const edit = prev[cid]||emptyEdit();
+      const cur = edit.autoEdits?.[rowId] || {};
+      return {...prev,[cid]:{...edit,autoEdits:{...(edit.autoEdits||{}),[rowId]:{...cur,scope}}}};
+    });
+  }
+  function resetAutoLocal(cid, row) {
+    setLocalEdits(prev=>{
+      const edit = prev[cid]||emptyEdit();
+      return {...prev,[cid]:{...edit,autoEdits:{...(edit.autoEdits||{}),[row.id]:{reset:true}}}};
+    });
+  }
+  function unassignLocal(cid, row) {
+    setLocalEdits(prev=>{
+      const edit = prev[cid]||emptyEdit();
+      return {...prev,[cid]:{...edit,
+        unassign:new Set([...(edit.unassign||[]), row.sessionId]),
+        deletedAutoIds:new Set([...edit.deletedAutoIds, row.id])}};
+    });
+  }
+
+  function addRowLocal(cid, afterRow) {
+    const newRow = {
+      id:`${cid}_${Date.now()}`, contactId:cid, date:afterRow?.date||'', time:'',
+      event:'', pocRequired:false, auto:false, insertAfter:afterRow?.id||null,
+      eventId:activeEventId,
+    };
+    setLocalEdits(prev=>{
+      const edit = prev[cid]||emptyEdit();
+      // Insert after the afterRow
+      const rows = [...edit.rows];
+      const idx = afterRow ? rows.findIndex(r=>r.id===afterRow.id) : -1;
+      if (idx >= 0) rows.splice(idx+1, 0, newRow);
+      else rows.push(newRow);
+      return {...prev,[cid]:{...edit,rows}};
+    });
+  }
+
+  function deleteRowLocal(cid, row, force) {
+    if (row.source==='Scheduling' && !force) { setDelChoice({ cid, row }); return; }
+    setLocalEdits(prev=>{
+      const edit = prev[cid]||emptyEdit();
+      if (row.auto) {
+        const deletedAutoIds = new Set([...edit.deletedAutoIds, row.id]);
+        return {...prev,[cid]:{...edit,deletedAutoIds}};
+      } else {
+        const rows = edit.rows.filter(r=>r.id!==row.id);
+        return {...prev,[cid]:{...edit,rows}};
+      }
+    });
+  }
+
+  // Save everything for a contact to Firestore
+  async function saveContact(cid) {
+    setSaving(prev=>({...prev,[cid]:true}));
+    try {
+      const edit = getEdit(cid);
+      const SESSION_PREFIX = '__session__:';
+      const sessionAdds = edit.rows.filter(r=>(r.event||'').startsWith(SESSION_PREFIX));
+      const manualRows  = edit.rows.filter(r=>!(r.event||'').startsWith(SESSION_PREFIX));
+      const unassign = edit.unassign || new Set();
+      const report = [];
+
+      // 1. Rows that pick an existing session → assign the guest in Scheduling
+      for (const r of sessionAdds) {
+        const sid = r.event.slice(SESSION_PREFIX.length);
+        const s = sessions.find(x=>x.id===sid);
+        if (!s || assignments.some(a=>a.contactId===cid && a.sessionId===sid)) continue;
+        await saveItem('assignments',{contactId:cid,sessionId:sid,role:'Panelist',eventId:activeEventId});
+        report.push(`added to "${s.title}"`);
+      }
+      // 2. Session rows removed with "Remove from session"
+      for (const sid of unassign) {
+        for (const a of assignments.filter(a=>a.contactId===cid && a.sessionId===sid)) await removeItem('assignments', a.id);
+        const s = sessions.find(x=>x.id===sid);
+        report.push(`removed from "${s?.title||'session'}"`);
+      }
+      // 3. Edited linked rows → write back to the module they come from
+      const linked = getAutoRows(cid, new Set());
+      for (const [autoId, ae] of Object.entries(edit.autoEdits||{})) {
+        const row = linked.find(r=>r.id===autoId);
+        if (!row) continue;
+        if (ae.reset) {
+          const ov = getOverride(cid, autoId);
+          if (ov) { await removeItem('personalisedSchedule', ov.id); report.push(`"${row.event}" back to the main schedule`); }
+          continue;
+        }
+        const newDate = ae.date ?? row.date, newTime = ae.time ?? row.time;
+        if (newDate === row.date && newTime === row.time) continue;
+        if (row.source === 'Scheduling') {
+          const s = sessions.find(x=>x.id===row.sessionId);
+          if (!s) continue;
+          if (ae.scope === 'me') {
+            await saveItem('personalisedSchedule',{ id:`ovr_${autoId}`, contactId:cid, eventId:activeEventId,
+              auto:true, override:true, refId:autoId, date:newDate, time:newTime });
+            report.push(`"${s.title}" changed for this guest only`);
+          } else {
+            const n = assignments.filter(a=>a.sessionId===s.id).length;
+            if (!window.confirm(`"${s.title}" will move to ${newDate} at ${newTime} in Scheduling — this changes it for all ${n} guest${n===1?'':'s'} in the session. Continue?`)) continue;
+            const end = s.end ? hhmm(toMin(s.end) + (toMin(newTime) - toMin(s.start))) : '';
+            await saveItem('sessions',{ ...s, date:newDate, start:newTime, end });
+            for (const copy of savedRows.filter(r=>r.auto && !r.deleted && !r.override && r.sessionId===s.id))
+              await saveItem('personalisedSchedule',{ ...copy, date:newDate, time:newTime });
+            const ov = getOverride(cid, autoId);
+            if (ov) await removeItem('personalisedSchedule', ov.id);
+            report.push(`"${s.title}" moved in Scheduling`);
+          }
+        } else if (row.source === 'Logistics') {
+          const L = logistics.find(l=>l.contactId===cid) || { contactId:cid, eventId:activeEventId };
+          await saveItem('logistics',{ ...L, arrivalDate:newDate, arrivalTime:newTime });
+          const copy = savedRows.find(r=>r.id===autoId);
+          if (copy) await saveItem('personalisedSchedule',{ ...copy, date:newDate, time:newTime });
+          report.push('arrival updated in Logistics');
+        } else if (row.source === 'Sahebji') {
+          const m = founder.find(f=>f.id===row.founderId);
+          if (!m) continue;
+          const slot = slotContaining(newDate, newTime, m.duration, store.sahebjiSlots||[]);
+          if (!slot && !window.confirm(`${newDate} ${newTime} is outside Sahebji's available slots. Save anyway?`)) continue;
+          await saveItem('founder',{ ...m, date:newDate, time:newTime, slotId:slot?.id||null });
+          const copy = savedRows.find(r=>r.id===autoId);
+          if (copy) await saveItem('personalisedSchedule',{ ...copy, date:newDate, time:newTime });
+          report.push('Sahebji meeting updated');
+        }
+      }
+
+      // Save / update manual rows
+      for (const row of manualRows) {
+        await saveItem('personalisedSchedule',{...row,contactId:cid,eventId:activeEventId,auto:false});
+      }
+
+      // Delete manual rows that were removed
+      const existingManual = savedRows.filter(r=>r.contactId===cid && !r.auto);
+      const keepIds = new Set(manualRows.map(r=>r.id));
+      for (const r of existingManual) {
+        if (!keepIds.has(r.id)) await removeItem('personalisedSchedule',r.id);
+      }
+
+      // Save deleted auto row markers (not for sessions the guest was removed from — the row is gone anyway)
+      const unassignedRowIds = new Set(linked.filter(r=>r.sessionId && unassign.has(r.sessionId)).map(r=>r.id));
+      for (const autoId of edit.deletedAutoIds) {
+        if (unassignedRowIds.has(autoId)) continue;
+        await saveItem('personalisedSchedule',{id:autoId+'_del',contactId:cid,
+          eventId:activeEventId,auto:true,deleted:true,refId:autoId});
+      }
+
+      // Remove markers that are no longer wanted, and old-format markers (re-saved above in the new format)
+      const existingAutoMarkers = savedRows.filter(r=>r.contactId===cid && r.auto && r.deleted);
+      for (const m of existingAutoMarkers) {
+        if (isLegacyAuto(m) || !edit.deletedAutoIds.has(canonAutoId(m)) || unassignedRowIds.has(canonAutoId(m)))
+          await removeItem('personalisedSchedule',m.id);
+      }
+
+      // Save POC overrides for auto rows (one copy per guest)
+      const freshAuto = getAutoRows(cid, new Set());
+      for (const [autoId, poc] of Object.entries(edit.pocOverrides)) {
+        const existing = savedRows.find(r=>r.id===autoId);
+        const row = freshAuto.find(r=>r.id===autoId);
+        if (existing) await saveItem('personalisedSchedule',{...existing,pocRequired:poc});
+        else if (row) {
+          const { srcDate, srcTime, overridden, ...clean } = row;
+          await saveItem('personalisedSchedule',{...clean,pocRequired:poc,eventId:activeEventId});
+        }
+      }
+      // Remove this guest's old-format shared copies now that per-guest copies exist
+      for (const r of savedRows.filter(r=>r.contactId===cid && r.auto && !r.deleted && !r.override && isLegacyAuto(r)))
+        await removeItem('personalisedSchedule', r.id);
+
+      setLocalEdits(prev=>({...prev,[cid]:{...(prev[cid]||emptyEdit()), rows:manualRows, autoEdits:{}, unassign:new Set()}}));
+      toast(report.length ? `Schedule saved — ${report.join(', ')}.` : 'Schedule saved.');
+    } catch(e) {
+      toast('Error saving: '+e.message);
+    }
+    setSaving(prev=>({...prev,[cid]:false}));
+  }
+
+  async function setMandatory(cid, field, val) {
+    const existing = savedMandatory.find(r=>r.contactId===cid)||{};
+    await saveItem('personalisedMandatory',{
+      id:existing.id||`${cid}_mandatory`,
+      contactId:cid, eventId:activeEventId,
+      ...getMandatory(cid), [field]:val,
+    });
+  }
+
+  const getMandatoryPending = cid => {
+    const mandatory = getMandatory(cid);
+    const allRows = getAllRows(cid);
+    const pending = [];
+    ALL_MANDATORY.forEach(item=>{
+      if (!mandatory[item.key]) return;
+      const keywords = MANDATORY_KEYWORDS[item.key]||[(item.label||item.key||'').toLowerCase()];
+      const exists = allRows.some(r=>keywords.some(kw=>(r.event||'').toLowerCase().includes(kw)));
+      if (!exists) pending.push(item.label);
+    });
+    return pending;
+  };
+
+  if (!contacts.length) return (
+    <>
+      <div className="page-head"><div className="ph-txt"><h1>Personalised Schedule</h1></div></div>
+      <div className="panel"><Empty title="No confirmed guests yet" sub="Confirm guests in Outreach first." /></div>
+    </>
+  );
+
+  return (
+    <>
+      <div className="page-head"><div className="ph-txt">
+        <h1>Panelists Personalised Schedule</h1>
+        <p>Build each panelist's day-by-day schedule. Click Save after making changes.</p>
+      </div>
+
+      </div>
+
+      <div className="panel" style={{marginBottom:20}}>
+        <div className="panel-body" style={{overflowX:'auto'}}>
+          <table style={{minWidth:1000,fontSize:13}}>
+            <thead>
+              <tr style={{background:'var(--teal-wash)'}}>
+                {[
+                  {h:'',tip:''},
+                  {h:'Name',tip:''},
+                  {h:'Arrival Date',tip:'From Logistics',auto:true},
+                  {h:'Arrival Time',tip:'From Logistics',auto:true},
+                  {h:'Departure Date',tip:'From Logistics',auto:true},
+                  {h:'Departure Time',tip:'From Logistics',auto:true},
+                  {h:'Sessions',tip:'From Scheduling',auto:true},
+                  {h:'Remarks',tip:'From Logistics remarks'},
+                  {h:'Mandatory Fields',tip:''},
+                  {h:'⚠',tip:'Pending mandatory items'},
+                  {h:'',tip:'Print / Word'},
+                ].map(({h,tip,auto})=>(
+                  <th key={h} style={{padding:'8px 10px',textAlign:'left',fontSize:11.5,fontWeight:600,
+                    borderBottom:'1px solid var(--line)',whiteSpace:'nowrap',
+                    background:auto?'#EAF7F1':undefined,cursor:tip?'help':'default'}} title={tip||undefined}>
+                    {h}{auto&&<span style={{fontSize:9,marginLeft:3,color:'var(--teal)'}}>⟳</span>}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {contacts.map(c=>{
+                const L          = getL(c.id);
+                const sessions_c = getContactSessions(c.id);
+                const mandatory  = getMandatory(c.id);
+                const pending    = getMandatoryPending(c.id);
+                const isExpanded = expandedId===c.id;
+                const edit       = getEdit(c.id);
+                const isDirty    = !!localEdits[c.id];
+
+                return (
+                  <React.Fragment key={c.id}>
+                    <tr style={{borderBottom:'1px solid var(--line)',background:isExpanded?'var(--teal-wash)':'white'}}>
+                      <td style={{padding:'8px 8px',textAlign:'center',cursor:'pointer',fontSize:16,color:'var(--teal)'}}
+                        onClick={()=>{ if (!isExpanded) initEdits(c.id); setExpandedId(isExpanded?null:c.id); }}>
+                        {isExpanded?'▲':'▼'}
+                      </td>
+                      <td style={{padding:'8px 10px'}}>
+                        <div style={{display:'flex',alignItems:'flex-start',gap:8}}>
+                          <div style={{flex:1}}>
+                            <div className="nm">{displayName(c)}</div>
+                            <div className="role">{c.type} · {c.field}</div>
+                          </div>
+                          <button className="btn ghost xs" title="View full summary"
+                            onClick={e=>{e.stopPropagation(); setSummaryId(summaryId===c.id?null:c.id);}}
+                            style={{fontSize:12,flexShrink:0,marginTop:2}}>📋</button>
+                        </div>
+                      </td>
+                      <td style={{padding:'8px 10px',color:'var(--muted)',fontSize:12,background:'#EAF7F1'}}>{L.arrivalDate||'—'}</td>
+                      <td style={{padding:'8px 10px',color:'var(--muted)',fontSize:12,background:'#EAF7F1'}}>{L.arrivalTime||'—'}</td>
+                      <td style={{padding:'8px 10px',color:'var(--muted)',fontSize:12,background:'#EAF7F1'}}>{L.departureDate||'—'}</td>
+                      <td style={{padding:'8px 10px',color:'var(--muted)',fontSize:12,background:'#EAF7F1'}}>{L.departureTime||'—'}</td>
+                      <td style={{padding:'8px 10px',background:'#EAF7F1'}}>
+                        {sessions_c.length>0
+                          ? <div style={{fontSize:12}}>{sessions_c.map(s=>(
+                              <div key={s.id} style={{marginBottom:2}}>
+                                <span style={{color:'var(--teal)',fontWeight:500}}>{s.date}</span> · {s.title}
+                              </div>
+                            ))}</div>
+                          : <span style={{color:'var(--faint)',fontSize:12}}>None</span>}
+                      </td>
+                      <td style={{padding:'8px 10px'}}>
+                        {can('reports.edit')
+                          ? <input className="input" style={{fontSize:12,padding:'3px 8px',minWidth:120}}
+                              defaultValue={L.remarks||''}
+                              onBlur={e=>saveItem('logistics',{...L,contactId:c.id,remarks:e.target.value,eventId:activeEventId})}
+                              placeholder="Remarks…"/>
+                          : <span style={{fontSize:12,color:'var(--muted)'}}>{L.remarks||'—'}</span>}
+                      </td>
+                      <td style={{padding:'8px 10px'}}>
+                        <div style={{display:'flex',flexDirection:'column',gap:3,fontSize:12}}>
+                          {ALL_MANDATORY.map(item=>(
+                            <label key={item.key} style={{display:'flex',alignItems:'center',gap:5,cursor:item.locked?'default':'pointer'}}>
+                              <input type="checkbox"
+                                checked={!!mandatory[item.key]}
+                                disabled={item.locked||!can('reports.mandatory')}
+                                onChange={item.locked?undefined:e=>setMandatory(c.id,item.key,e.target.checked)}
+                                style={{accentColor:'var(--teal)'}}/>
+                              <span style={{color:item.locked?'var(--muted)':'var(--ink)',fontSize:11.5}}>{item.label}{item.locked?' 🔒':''}</span>
+                            </label>
+                          ))}
+                        </div>
+                      </td>
+                      <td style={{padding:'8px 10px',textAlign:'center'}}>
+                        {pending.length>0 && (
+                          <div title={`Pending: ${pending.join(', ')}`}
+                            style={{background:'var(--amber-wash)',border:'1px solid #E8D5A3',borderRadius:8,
+                              padding:'4px 8px',fontSize:11,color:'var(--amber)',cursor:'help',whiteSpace:'nowrap'}}>
+                            ⚠ {pending.length}
+                          </div>
+                        )}
+                      </td>
+                      <td style={{padding:'8px 6px',whiteSpace:'nowrap'}}>
+                        {can('reports.print') && <>
+                          <button className="btn ghost xs" title="Print / Save as PDF"
+                            onClick={()=>setPrintContact(c)} style={{fontSize:11,padding:'3px 7px'}}>🖨️</button>
+                          <button className="btn ghost xs" title="Download as Word"
+                            onClick={()=>downloadScheduleWord(c,store,activeEventId)}
+                            style={{fontSize:11,padding:'3px 7px',marginLeft:3}}>📄</button>
+                        </>}
+                      </td>
+                    </tr>
+
+                    {isExpanded && (
+                      <tr>
+                        <td colSpan={11} style={{background:'#FAFAF7',borderBottom:'2px solid var(--teal)',padding:0}}>
+                          <div style={{display:'flex',gap:16,padding:'16px 20px',alignItems:'flex-start'}}>
+                            <div style={{flex:1,overflowX:'auto'}}>
+
+                              {/* Header with Save button */}
+                              <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:10}}>
+                                <div>
+                                  <span style={{fontWeight:600,fontSize:13,color:'var(--teal)'}}>Day-by-day schedule</span>
+                                  {pending.length>0 && (
+                                    <span style={{fontSize:11,color:'var(--amber)',marginLeft:10}}>
+                                      ⚠ Pending: {pending.join(', ')}
+                                    </span>
+                                  )}
+                                </div>
+                                {can('reports.edit') && (
+                                  <button className="btn primary sm"
+                                    onClick={()=>saveContact(c.id)}
+                                    disabled={saving[c.id]}>
+                                    {saving[c.id]?'Saving…':'💾 Save schedule'}
+                                  </button>
+                                )}
+                              </div>
+
+                              <table style={{width:'100%',borderCollapse:'collapse',fontSize:12.5}}>
+                                <thead>
+                                  <tr style={{background:'var(--teal-wash)'}}>
+                                    <th style={{padding:'6px 10px',textAlign:'left',fontSize:11,fontWeight:600}}>Date</th>
+                                    <th style={{padding:'6px 10px',textAlign:'left',fontSize:11,fontWeight:600}}>Time</th>
+                                    <th style={{padding:'6px 10px',textAlign:'left',fontSize:11,fontWeight:600}}>Event</th>
+                                    <th style={{padding:'6px 10px',textAlign:'center',fontSize:11,fontWeight:600}}>POC?</th>
+                                    <th style={{padding:'6px 10px',textAlign:'left',fontSize:11,fontWeight:600}}>Source</th>
+                                    <th style={{padding:'6px 8px',width:80}}></th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {getAllRows(c.id).map((row,idx,allArr)=>(
+                                    <React.Fragment key={row.id}>
+                                      <tr style={{borderBottom:'1px solid var(--line)',background:row.auto?'#EAF7F1':'white'}}>
+                                        <td style={{padding:'4px 6px'}}>
+                                          {row.auto && EDITABLE_SOURCES.includes(row.source) && can('reports.edit')
+                                            ? <input className="input" type="date" value={row.date||''}
+                                                onChange={e=>updateAutoLocal(c.id,row,'date',e.target.value)}
+                                                style={{fontSize:12,padding:'3px 6px',borderColor:row.changed?'var(--amber)':undefined}}/>
+                                            : row.auto
+                                            ? <span style={{color:'var(--teal)',fontWeight:500,fontSize:12}}>{row.date}</span>
+                                            : <input className="input" type="date" value={row.date||''}
+                                                min={L.arrivalDate||undefined}
+                                                max={L.departureDate||undefined}
+                                                onChange={e=>{
+                                                  const d = e.target.value;
+                                                  if (L.arrivalDate && d < L.arrivalDate) { toast('Date is before guest arrival ('+L.arrivalDate+')'); return; }
+                                                  if (L.departureDate && d > L.departureDate) { toast('Date is after guest departure ('+L.departureDate+')'); return; }
+                                                  updateRowLocal(c.id,row.id,'date',d);
+                                                }}
+                                                style={{fontSize:12,padding:'3px 6px'}}/>}
+                                        </td>
+                                        <td style={{padding:'4px 6px'}}>
+                                          {row.auto && EDITABLE_SOURCES.includes(row.source) && can('reports.edit')
+                                            ? <TimePicker value={row.time||''} onChange={v=>updateAutoLocal(c.id,row,'time',v)}/>
+                                            : row.auto
+                                            ? <span style={{color:'var(--muted)',fontSize:12}}>{row.time}</span>
+                                            : <TimePicker value={row.time||''} onChange={v=>updateRowLocal(c.id,row.id,'time',v)}/>}
+                                        </td>
+                                        <td style={{padding:'4px 6px'}}>
+                                          {row.auto
+                                            ? <div>
+                                                <span style={{fontWeight:500,fontSize:12}}>{row.event}
+                                                  <span style={{fontSize:10,color:'var(--teal)',marginLeft:6,
+                                                    background:'var(--teal-wash)',padding:'1px 5px',borderRadius:8}}>⟳ linked</span>
+                                                </span>
+                                                {row.changed && row.source==='Scheduling' && (
+                                                  <select className="input ps-scope" value={row.scope||'all'} onChange={e=>setAutoScope(c.id,row.id,e.target.value)}>
+                                                    <option value="all">Move session for everyone ({assignments.filter(a=>a.sessionId===row.sessionId).length})</option>
+                                                    <option value="me">Only for this guest</option>
+                                                  </select>
+                                                )}
+                                                {row.changed && row.source==='Logistics' && <div className="ps-note">Saves to Logistics (arrival)</div>}
+                                                {row.changed && row.source==='Sahebji' && <div className="ps-note">Saves to the Sahebji meeting</div>}
+                                                {row.overridden && !row.changed && (
+                                                  <div className="ps-note warn">Differs from main schedule ({row.srcDate} {row.srcTime})
+                                                    {can('reports.edit') && <button className="linkbtn" style={{fontSize:11,marginLeft:6}} onClick={()=>resetAutoLocal(c.id,row)}>Reset</button>}
+                                                  </div>
+                                                )}
+                                                {row.pendingReset && <div className="ps-note">Will return to {row.srcDate} {row.srcTime} on save</div>}
+                                              </div>
+                                            : <select className="input" value={row.event||''}
+                                                onChange={e=>updateRowLocal(c.id,row.id,'event',e.target.value)}
+                                                style={{fontSize:12,padding:'3px 6px'}}>
+                                                <option value="">— Select event —</option>
+                                                <optgroup label="Activities">
+                                                  {EVENT_OPTIONS.map(o=><option key={o} value={o}>{o}</option>)}
+                                                </optgroup>
+                                                {(()=>{
+                                                  const mine = new Set(assignments.filter(a=>a.contactId===c.id).map(a=>a.sessionId));
+                                                  const avail = sessions.filter(x=>!mine.has(x.id)).sort((a,b)=>(a.date+a.start)>(b.date+b.start)?1:-1);
+                                                  return avail.length ? <optgroup label="Add to a session (updates Scheduling)">
+                                                    {avail.map(x=><option key={x.id} value={'__session__:'+x.id}>{shortDate(x.date)} {x.start} · {x.title}</option>)}
+                                                  </optgroup> : null;
+                                                })()}
+                                              </select>}
+                                          {!row.auto && (row.event||'').startsWith('__session__:') && <div className="ps-note">Will add this guest to the session in Scheduling on save</div>}
+                                        </td>
+                                        <td style={{padding:'4px 6px',textAlign:'center'}}>
+                                          <input type="checkbox"
+                                            checked={row.pocRequired||false}
+                                            onChange={e=>row.auto
+                                              ? updateAutoPocLocal(c.id,row.id,e.target.checked)
+                                              : updateRowLocal(c.id,row.id,'pocRequired',e.target.checked)}
+                                            style={{accentColor:'var(--teal)'}}/>
+                                        </td>
+                                        <td style={{padding:'4px 6px'}}>
+                                          {row.auto
+                                            ? <span style={{fontSize:10,color:'var(--teal)',background:'var(--teal-wash)',padding:'1px 6px',borderRadius:8}}>{row.source}</span>
+                                            : <span style={{fontSize:10,color:'var(--muted)',background:'#f5f5f5',padding:'1px 6px',borderRadius:8}}>Manual</span>}
+                                        </td>
+                                        <td style={{padding:'4px 6px',textAlign:'right'}}>
+                                          {can('reports.edit') && (
+                                            <div className="rowacts">
+                                              <button className="btn ghost xs"
+                                                title="Add row below"
+                                                onClick={()=>addRowLocal(c.id,row)}
+                                                style={{fontWeight:700,color:'var(--teal)'}}>+</button>
+                                              <button className="btn ghost xs"
+                                                title={row.auto?'Remove auto row':'Delete row'}
+                                                onClick={()=>deleteRowLocal(c.id,row)}
+                                                style={{color:'var(--rose)'}}>
+                                                {ICON.trash}
+                                              </button>
+                                            </div>
+                                          )}
+                                        </td>
+                                      </tr>
+                                    </React.Fragment>
+                                  ))}
+                                  {getAllRows(c.id).length===0 && (
+                                    <tr>
+                                      <td colSpan={6} style={{padding:'12px',textAlign:'center',color:'var(--muted)',fontSize:13}}>
+                                        No schedule rows yet.
+                                      </td>
+                                    </tr>
+                                  )}
+                                </tbody>
+                              </table>
+                              {can('reports.edit') && (
+                                <button onClick={()=>addRowLocal(c.id, getAllRows(c.id).slice(-1)[0]||null)}
+                                  style={{marginTop:8,border:'1px dashed var(--line)',background:'none',cursor:'pointer',
+                                    borderRadius:6,padding:'4px 14px',fontSize:12,color:'var(--teal)'}}>
+                                  {ICON.plus} Add row
+                                </button>
+                              )}
+                            </div>
+                            <PSInfoCard c={c} store={store}/>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Personalised Schedule Summary Popup */}
+      {summaryId && (()=>{
+        const sc = contacts.find(c=>c.id===summaryId);
+        if (!sc) return null;
+        const sL = getL(summaryId);
+        const allRows = getAllRows(summaryId, new Set());
+        const sessions_s = getContactSessions(summaryId);
+        const pocRecs = (store.poc||[]).filter(p=>p.contactId===summaryId&&p.eventId===activeEventId);
+        const byDate = {};
+        allRows.forEach(r=>{ if(r.date){ if(!byDate[r.date]) byDate[r.date]=[]; byDate[r.date].push(r); }});
+        return (
+          <div className="scrim" onMouseDown={()=>setSummaryId(null)}>
+            <div className="modal" onMouseDown={e=>e.stopPropagation()} style={{maxWidth:600,maxHeight:'85vh',overflowY:'auto'}}>
+              <div className="modal-head" style={{background:'var(--teal)',color:'#fff',position:'sticky',top:0,zIndex:2}}>
+                <div>
+                  <h2 style={{color:'#fff',margin:0}}>{displayName(sc)}</h2>
+                  <div style={{fontSize:12,opacity:.85}}>{sc.type} · {sc.desig} · {sc.org}</div>
+                </div>
+                <button className="x" style={{color:'#fff',opacity:.8}} onClick={()=>setSummaryId(null)}>✕</button>
+              </div>
+              <div className="modal-body" style={{padding:0}}>
+
+                {/* Travel info */}
+                <div style={{padding:'12px 20px',background:'var(--teal-wash)',borderBottom:'1px solid var(--line)'}}>
+                  <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,fontSize:12.5}}>
+                    <div>
+                      <span style={{color:'var(--muted)'}}>Hotel: </span>
+                      <strong>{sL.hotelName||'—'}</strong>
+                    </div>
+                    <div>
+                      <span style={{color:'var(--muted)'}}>Arrival: </span>
+                      <strong>{sL.arrivalDate||'—'} {sL.arrivalTime||''}</strong>
+                      {sL.arrivalFlight&&<span style={{color:'var(--muted)'}}> · {sL.arrivalFlight}</span>}
+                    </div>
+                    <div>
+                      <span style={{color:'var(--muted)'}}>Departure: </span>
+                      <strong>{sL.departureDate||'—'} {sL.departureTime||''}</strong>
+                      {sL.departureFlight&&<span style={{color:'var(--muted)'}}> · {sL.departureFlight}</span>}
+                    </div>
+                    <div>
+                      <span style={{color:'var(--muted)'}}>Sessions: </span>
+                      <strong>{sessions_s.length}</strong>
+                      {' · '}
+                      <span style={{color:'var(--muted)'}}>POC days: </span>
+                      <strong>{pocRecs.length}</strong>
+                    </div>
+                  </div>
+                </div>
+
+                {/* POC summary */}
+                {pocRecs.length>0&&(
+                  <div style={{padding:'10px 20px',background:'#EAF7F1',borderBottom:'1px solid var(--line)'}}>
+                    <div style={{fontSize:12,fontWeight:600,color:'var(--teal)',marginBottom:6}}>POC Assignments</div>
+                    {pocRecs.map(p=>{
+                      const vol=(store.volunteers||[]).find(v=>v.id===p.volunteerId);
+                      return (
+                        <div key={p.id} style={{fontSize:12,marginBottom:3}}>
+                          <strong>{fmtDate(p.day)}</strong>
+                          {' · '}{p.fromTime}–{p.toTime}
+                          {' · '}{vol?`${vol.name} (${vol.phone||'no phone'})`:'Unassigned'}
+                          {p.frozen&&' 🔒'}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Day-by-day schedule */}
+                {Object.entries(byDate).sort(([a],[b])=>a>b?1:-1).map(([date,dayRows])=>(
+                  <div key={date}>
+                    <div style={{padding:'8px 20px',background:'var(--paper)',borderBottom:'1px solid var(--line)',
+                      fontSize:12,fontWeight:600,color:'var(--teal)',position:'sticky',top:60}}>
+                      {fmtDate(date)}
+                    </div>
+                    {dayRows.sort((a,b)=>(a.time||'')>(b.time||'')?1:-1).map((r,i)=>(
+                      <div key={r.id||i} style={{
+                        display:'flex',gap:12,padding:'8px 20px',
+                        borderBottom:'1px solid var(--line)',
+                        background: r.auto ? '#FAFFF9' : '#fff',
+                      }}>
+                        <div style={{width:50,flexShrink:0,fontSize:12.5,fontWeight:500,color:'var(--teal)'}}>
+                          {r.time||'—'}
+                        </div>
+                        <div style={{flex:1,fontSize:12.5}}>{r.event}</div>
+                        {r.auto&&<span style={{fontSize:10,color:'var(--muted)',alignSelf:'center'}}>⟳</span>}
+                        {r.pocRequired&&<span style={{fontSize:10,color:'var(--amber)',alignSelf:'center'}}>POC req.</span>}
+                      </div>
+                    ))}
+                  </div>
+                ))}
+
+                {!Object.keys(byDate).length&&(
+                  <div style={{padding:32,textAlign:'center',color:'var(--muted)',fontSize:13}}>
+                    No schedule rows yet. Add rows or tick sessions in Scheduling.
+                  </div>
+                )}
+              </div>
+              <div className="modal-foot" style={{position:'sticky',bottom:0,background:'#fff'}}>
+                <button className="btn" onClick={()=>setSummaryId(null)}>Close</button>
+                <button className="btn primary" onClick={()=>{setPrintContact(sc);setSummaryId(null);}}>🖨️ Print</button>
+                <button className="btn primary" onClick={()=>{downloadScheduleWord(sc,store,activeEventId);setSummaryId(null);}}>📄 Word</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {delChoice && (
+        <Modal title="Remove session row" onClose={()=>setDelChoice(null)} footer={null} size="sm">
+          <p style={{fontSize:13.5,marginTop:0}}><b>{delChoice.row.event}</b> comes from Scheduling. What should happen?</p>
+          <div className="slot-del-actions">
+            <button className="btn danger" onClick={()=>{ unassignLocal(delChoice.cid, delChoice.row); setDelChoice(null); }}>Remove this guest from the session (updates Scheduling)</button>
+            <button className="btn" onClick={()=>{ deleteRowLocal(delChoice.cid, delChoice.row, true); setDelChoice(null); }}>Hide in this schedule only</button>
+            <button className="btn ghost" onClick={()=>setDelChoice(null)}>Cancel</button>
+          </div>
+          <p className="muted-sm" style={{margin:'10px 0 0'}}>Nothing changes until you click Save schedule.</p>
+        </Modal>
+      )}
+      {printContact && <VKSchedulePrint contact={printContact} store={store} activeEventId={activeEventId} onClose={()=>setPrintContact(null)}/>}
     </>
   );
 }
-const tagClass=src=>({Logistics:'t-log',Session:'t-ses',Founder:'t-fnd',Hospitality:'t-hos'}[src]||'t-hos');
-function PersonalReport({store,confirmed,toast}){
-  const[cid,setCid]=useState(confirmed[0]?.id||'');
-  const[showSrc,setShowSrc]=useState(false);
-  const[emailModal,setEmailModal]=useState(false);
-  if(!confirmed.length) return <div className="panel"><Empty title="No confirmed guests yet" sub="Confirm an invitee in Outreach to generate their schedule."/></div>;
-  const c=confirmed.find(x=>x.id===cid)||confirmed[0];
-  const sch=buildPersonalSchedule(c,store);
-  return(<>
-    <div className={'rep '+(showSrc?'show-src':'')}>
-      <div className="repbar">
-        <label className="muted-sm" style={{fontWeight:500}}>Guest</label>
-        <select className="input" style={{width:'auto',minWidth:220}} value={c.id} onChange={e=>setCid(e.target.value)}>{confirmed.map(x=><option key={x.id} value={x.id}>{displayName(x)}</option>)}</select>
-        <button className="btn primary sm" onClick={()=>toast('Schedule generated.')}>{ICON.spark}Generate</button>
-        <button className="btn sm" onClick={()=>window.print()}>{ICON.print}Print / Save PDF</button>
-        <button className="btn sm" onClick={()=>setEmailModal(true)}>✉ Send by email</button>
-        <div className="srctoggle" style={{marginLeft:'auto'}}><span>Show sources</span><button className={'switch '+(showSrc?'on':'')} onClick={()=>setShowSrc(s=>!s)}><i/></button></div>
-      </div>
-      <div className="legend"><span className="tag t-log">Logistics</span><span className="tag t-ses">Session</span><span className="tag t-fnd">Founder</span><span className="tag t-hos">Hospitality</span></div>
-      <div className="doc print-target">
-        <div className="doc-kicker">Vasudhaiva Kutumbakam Ki Oar 4.0</div><h2>Personalised Schedule</h2><div className="doc-name">{displayName(c)}</div>
-        {sch.days.length?sch.days.map(d=>(
-          <div className="day" key={d}><div className="day-h">{fmtDate(d)}</div>
-            {sch.byDay[d].map((e,i)=><div className="row" key={i}><div className="tm">{e.time}</div><div className="ac">{e.label}{e.sub&&<small>{e.sub}</small>}</div><div><span className={'tag '+tagClass(e.src)}>{e.src}</span></div></div>)}
-          </div>
-        )):<div className="empty"><p>No travel, sessions or meetings recorded yet.</p></div>}
-        {sch.stay&&<div className="stay"><b>Stay:</b> {sch.stay}</div>}
-      </div>
-    </div>
-    {emailModal&&<ScheduleEmailModal contact={c} scheduleHtml={''} onClose={()=>setEmailModal(false)} toast={toast}/>}
-  </>);
-}
-function EventScheduleReport({store}){
-  const ev=buildEventSchedule(store);
-  return(<><div className="repbar"><button className="btn sm" onClick={()=>window.print()}>{ICON.print}Print / Save PDF</button></div>
-    <div className="doc print-target"><div className="doc-kicker">Vasudhaiva Kutumbakam Ki Oar 4.0</div><h2>Event Schedule</h2>
-      {ev.days.map(d=><div className="day" key={d}><div className="day-h">{fmtDate(d)}</div>{ev.byDay[d].map(s=><div className="row" key={s.id}><div className="tm">{s.start}{s.end?'–'+s.end:''}</div><div className="ac">{s.title}{s.topic&&<small>Topic: {s.topic}</small>}</div><div/></div>)}</div>)}
-    </div></>);
-}
-function FounderReport({store}){
-  const fs=buildFounderSchedule(store);
-  return(<><div className="repbar"><button className="btn sm" onClick={()=>window.print()}>{ICON.print}Print / Save PDF</button></div>
-    <div className="doc print-target"><div className="doc-kicker">Vasudhaiva Kutumbakam Ki Oar 4.0</div><h2>Founder's Schedule</h2><div className="doc-name">One-on-one meetings</div>
-      {fs.days.length?fs.days.map(d=><div className="day" key={d}><div className="day-h">{fmtDate(d)}</div>{fs.byDay[d].map((e,i)=><div className="row" key={i}><div className="tm">{e.time}</div><div className="ac">{e.label}<small>at VIP Lounge</small></div><div/></div>)}</div>):<div className="empty"><p>No meetings scheduled yet.</p></div>}
-    </div></>);
-}
 
-function DeleteModal({label,onClose,onConfirm}){
-  return(<Modal title="Delete?" onClose={onClose} size="sm" footer={null}>
-    <p>Delete <b>{label}</b>? This cannot be undone.</p>
-    <div className="modal-foot" style={{padding:'14px 0 0'}}>
-      <button className="btn" onClick={onClose}>Cancel</button>
-      <button className="btn danger" onClick={onConfirm}>Delete</button>
-    </div>
-  </Modal>);
-}
-
-/* ============================ CONTROL ROOM ============================ */
-export function ControlRoom({ store }) {
-  const contacts = (store.contacts||[]).filter(c=>c.status==='Confirmed');
-  const logi = store.logistics||[];
-  const poc = store.poc||[];
-  const vols = store.volunteers||[];
-  const sessions = store.sessions||[];
-  const assigns = store.assignments||[];
-
-  const today = new Date().toISOString().slice(0,10);
-
-  const getL = cid => logi.find(x=>x.contactId===cid||x.id===cid)||{};
-  const getPOC = (cid, day) => {
-    const p = poc.find(x=>x.contactId===cid&&x.day===day);
-    return p ? vols.find(v=>v.id===p.volunteerId) : null;
-  };
-  const getSessions = cid => assigns.filter(a=>a.contactId===cid).map(a=>sessions.find(s=>s.id===a.sessionId)).filter(Boolean);
-
-  const arriving = contacts.filter(c=>{ const L=getL(c.id); return L.inbDate===today; });
-  const departing = contacts.filter(c=>{ const L=getL(c.id); return L.outDate===today; });
-  const onsite = contacts.filter(c=>{ const L=getL(c.id); return L.inbDate&&L.outDate&&L.inbDate<=today&&L.outDate>=today; });
-  const todaySessions = sessions.filter(s=>s.date===today).sort((a,b)=>toMin(a.start)-toMin(b.start));
-
-  return <>
-    <div className="page-head"><div className="ph-txt"><h1>Control Room</h1><p>Live event-day view — who is arriving, on-site, and in which session right now.</p></div></div>
-
-    {todaySessions.length>0&&<div className="cr-section">
-      <h3>Today's sessions</h3>
-      <div className="cr-grid">
-        {todaySessions.map(s=>{
-          const speakers = assigns.filter(a=>a.sessionId===s.id).map(a=>contacts.find(c=>c.id===a.contactId)).filter(Boolean);
-          return <div className="cr-card" key={s.id}>
-            <div className="cr-name"><span className="mono" style={{fontSize:12}}>{s.start}{s.end?'–'+s.end:''}</span> {s.title}</div>
-            {s.topic&&<div className="cr-detail">Topic: {s.topic}</div>}
-            {speakers.length>0&&<div className="cr-detail" style={{marginTop:6}}>Speakers: {speakers.map(c=>c.name).join(', ')}</div>}
-          </div>;
-        })}
-      </div>
-    </div>}
-
-    <div className="cr-section">
-      <h3>Arriving today {arriving.length>0&&<span className="badge b-pending" style={{marginLeft:8,fontSize:11}}>{arriving.length}</span>}</h3>
-      {arriving.length>0?<div className="cr-grid">{arriving.map(c=>{
-        const L=getL(c.id); const poc=getPOC(c.id,today);
-        return <div className="cr-card" key={c.id}>
-          <div className="cr-name"><div className="avatar" style={{width:26,height:26,fontSize:10}}>{initials(c.name)}</div>{displayName(c)}</div>
-          <div className="cr-detail">{L.inbMode} · {L.inbTime} · {L.inbLoc||'—'}</div>
-          {L.hotel&&<div className="cr-detail">Hotel: {L.hotel} · Check-in {L.checkin||'—'}</div>}
-          <div className="cr-poc">{poc?<><div className="avatar av">{initials(poc.name)}</div><span>POC: {poc.name}</span></>:<span style={{color:'var(--rose)'}}>⚠ No POC assigned</span>}</div>
-        </div>;
-      })}</div>:<div className="muted-sm" style={{padding:'12px 0'}}>No arrivals scheduled for today.</div>}
-    </div>
-
-    <div className="cr-section">
-      <h3>On-site {onsite.length>0&&<span className="badge b-confirmed" style={{marginLeft:8,fontSize:11}}>{onsite.length}</span>}</h3>
-      {onsite.length>0?<div className="cr-grid">{onsite.map(c=>{
-        const myS=getSessions(c.id).filter(s=>s.date===today);
-        const poc=getPOC(c.id,today);
-        return <div className="cr-card" key={c.id}>
-          <div className="cr-name"><div className="avatar" style={{width:26,height:26,fontSize:10}}>{initials(c.name)}</div>{displayName(c)}<span className="cr-status">{sbadge('Confirmed')}</span></div>
-          <div className="cr-detail">{c.type} · {c.field}</div>
-          {myS.length>0&&<div className="cr-detail" style={{marginTop:4}}>Sessions: {myS.map(s=>s.start+' '+s.title).join(' · ')}</div>}
-          <div className="cr-poc">{poc?<><div className="avatar av">{initials(poc.name)}</div><span>POC: {poc.name}</span></>:<span style={{color:'var(--rose)'}}>⚠ No POC assigned</span>}</div>
-        </div>;
-      })}</div>:<div className="muted-sm" style={{padding:'12px 0'}}>No guests on-site today.</div>}
-    </div>
-
-    <div className="cr-section">
-      <h3>Departing today {departing.length>0&&<span className="badge b-pending" style={{marginLeft:8,fontSize:11}}>{departing.length}</span>}</h3>
-      {departing.length>0?<div className="cr-grid">{departing.map(c=>{
-        const L=getL(c.id);
-        return <div className="cr-card" key={c.id}>
-          <div className="cr-name"><div className="avatar" style={{width:26,height:26,fontSize:10}}>{initials(c.name)}</div>{displayName(c)}</div>
-          <div className="cr-detail">Departs {L.outDepart||'—'}{L.outFlight?' · Flight '+L.outFlight:''}</div>
-        </div>;
-      })}</div>:<div className="muted-sm" style={{padding:'12px 0'}}>No departures scheduled for today.</div>}
-    </div>
-
-    {!arriving.length&&!onsite.length&&!departing.length&&!todaySessions.length&&
-      <div className="panel"><div className="empty">{ICON.cal}<h3>Nothing scheduled for today</h3><p>Add logistics and session dates in Logistics and Scheduling to see the live event view here.</p></div></div>}
-  </>;
-}
 
 /* ============================ FELICITATION KITS ============================ */
 export function FelicitationKits({ store, activeEventId }) {
@@ -840,7 +3776,7 @@ export function FelicitationKits({ store, activeEventId }) {
   const kits = store.felicitation || [];
   const getKit = cid => kits.find(k=>k.contactId===cid) || {contactId:cid, eventId:activeEventId};
   const ITEMS = ['Momento','Shawl','Kumkum','Cover','Gold Coin','Silver Coin','Frame'];
-  const key = item => item.toLowerCase().replace(/ /g,'_');
+  const key = item => (item||'').toLowerCase().replace(/ /g,'_');
 
   const toggle = async (c, item) => {
     const k = getKit(c.id);
@@ -901,186 +3837,1367 @@ export function FelicitationKits({ store, activeEventId }) {
 }
 
 /* ============================ VOLUNTEER AVAILABILITY ============================ */
-export function VolunteerAvailability({ store, activeEventId }) {
-  const toast = useToast();
-  const vols = store.volunteers || [];
-  const [modal, setModal] = useState(null);
-  const activeEvent = (store.events||[]).find(e=>e.id===activeEventId);
-
-  // Generate date range for the event
-  function eventDates() {
-    if (!activeEvent?.startDate) return [];
-    const dates=[]; let d=new Date(activeEvent.startDate+'T00:00:00');
-    // include 3 pre-event days
-    const pre=new Date(d); pre.setDate(pre.getDate()-3);
-    const end=new Date((activeEvent.endDate||activeEvent.startDate)+'T00:00:00');
-    let cur=new Date(pre); let g=0;
-    while(cur<=end&&g<30){ dates.push(cur.toISOString().slice(0,10)); cur=new Date(cur); cur.setDate(cur.getDate()+1); g++; }
-    return dates;
+/* VolModal — volunteer profile (shared across all events) */
+function VolModal({ item, onClose, toast, vols = [], canSetAvailability = false, onNext }) {
+  const [f, setF] = useState(()=>({name:'',phone:'',city:'',area:'',skills:'',...item}));
+  const set = k => e => setF(p=>({...p,[k]:e.target.value}));
+  const [err, setErr] = useState('');
+  const [next, setNext] = useState(!item && canSetAvailability);
+  const cities = [...new Set(vols.map(v=>(v.city||'').trim()).filter(Boolean))].sort();
+  const areas  = [...new Set(vols.filter(v=>!f.city||(v.city||'').trim().toLowerCase()===f.city.trim().toLowerCase()).map(v=>(v.area||'').trim()).filter(Boolean))].sort();
+  async function save() {
+    if (!f.name.trim()) { setErr('Name is required'); return; }
+    const dup = !item && vols.find(v=>(v.name||'').trim().toLowerCase()===f.name.trim().toLowerCase());
+    if (dup) { setErr(`${dup.name} is already in the list.`); return; }
+    const data = { ...f, name:f.name.trim(), phone:(f.phone||'').trim(), city:(f.city||'').trim(), area:(f.area||'').trim() };
+    const id = await saveItem('volunteers', data);
+    onClose();
+    toast(item ? 'Volunteer updated.' : `${data.name} added.`);
+    if (!item && next && onNext) onNext({ ...data, id });
   }
-  const dates = eventDates();
-  const SLOTS = ['Full Day','Morning','Afternoon','Evening','Not Available'];
-  const slotColor = s => ({
-    'Full Day':'var(--teal)','Morning':'var(--blue)','Afternoon':'var(--amber)',
-    'Evening':'var(--purple)','Not Available':'var(--rose)'
-  }[s]||'var(--muted)');
+  return (
+    <Modal title={item?'Edit volunteer':'Add volunteer'} onClose={onClose} onSave={save}
+      saveLabel={item?'Save changes':(next?'Add & set availability':'Add volunteer')}>
+      <p className="muted-sm" style={{marginTop:0}}>Profile details apply to every event.</p>
+      <Field label="Name *">
+        <input className="input" value={f.name} onChange={e=>{set('name')(e);setErr('');}} autoFocus
+          style={err?{borderColor:'var(--rose)'}:{}}/>
+        {err && <span style={{color:'var(--rose)',fontSize:11.5}}>{err}</span>}
+      </Field>
+      <div className="grid2">
+        <Field label="Contact"><input className="input" type="tel" value={f.phone} onChange={set('phone')} placeholder="Phone number"/></Field>
+        <Field label="City"><input className="input" list="vk-vol-cities" value={f.city} onChange={set('city')} placeholder="e.g. Mumbai"/></Field>
+        <Field label="Area"><input className="input" list="vk-vol-areas" value={f.area} onChange={set('area')} placeholder="e.g. Mulund"/></Field>
+        <Field label="Skills"><input className="input" value={f.skills||''} onChange={set('skills')} placeholder="e.g. POC, Hospitality"/></Field>
+      </div>
+      <datalist id="vk-vol-cities">{cities.map(c=><option key={c} value={c}/>)}</datalist>
+      <datalist id="vk-vol-areas">{areas.map(a=><option key={a} value={a}/>)}</datalist>
+      {!item && canSetAvailability && (
+        <label className="chk"><input type="checkbox" checked={next} onChange={e=>setNext(e.target.checked)}/>Set their availability for this event next</label>
+      )}
+    </Modal>
+  );
+}
 
-  const getAvail = (v,date) => {
-    const a = v.availability || {};
-    return a[date] || '';
-  };
-  const setAvail = async (v, date, slot) => {
-    const avail = {...(v.availability||{}), [date]:slot};
-    await saveItem('volunteers', {...v, availability:avail});
+/* ══════════════════════════════════════════════════════════════════
+   VOLUNTEER AVAILABILITY
+   Event-specific. Pulled from Volunteer Directory.
+   Records: days available, pre-event availability, departments.
+   Shows assignments as badges with navigation links.
+══════════════════════════════════════════════════════════════════ */
+
+export function Volunteers({ store, activeEventId }) {
+  const toast  = useToast();
+  const vols   = (store.volunteers || []).sort((a,b)=>(a.name||'').localeCompare(b.name||''));
+  const avail  = store.availability || [];
+  const depts  = store.departments  || [];
+  const poc    = store.poc          || [];
+  const tasks  = store.tasks        || [];
+  const contacts = (store.contacts||[]).filter(c=>c.status==='Confirmed');
+
+  // Full Day config from Settings
+  const fdConfig = (store.appConfig||[]).find(c=>c.id==='fullDayHours')||{start:'09:00',end:'22:00'};
+
+  // Build event days
+  const activeEvent = (store.events||[]).find(e=>e.id===activeEventId);
+  const eventDays = [];
+  if (activeEvent?.startDate && activeEvent?.endDate) {
+    let d = new Date(activeEvent.startDate+'T12:00:00');
+    const end = new Date(activeEvent.endDate+'T12:00:00');
+    let g = 0;
+    while (d <= end && g < 20) {
+      eventDays.push(localISO(d));
+      d = new Date(d); d.setDate(d.getDate()+1); g++;
+    }
+  }
+
+  const getAvail    = (volId, day)  => avail.find(a=>a.volId===volId&&a.day===day&&a.eventId===activeEventId)||{};
+  const getPreEvent = volId         => avail.find(a=>a.volId===volId&&a.day==='pre-event'&&a.eventId===activeEventId)||{};
+  const getDeptIds  = volId         => (avail.find(a=>a.volId===volId&&a.day==='depts'&&a.eventId===activeEventId)?.deptIds)||[];
+
+  async function setDayAvail(volId, day, field, val) {
+    const ex = getAvail(volId, day);
+    await saveItem('availability',{
+      id: ex.id||`${volId}_${day}_${activeEventId}`,
+      volId, day, eventId: activeEventId, ...ex, [field]: val,
+    });
+  }
+
+  async function setFullDay(volId, day, checked) {
+    const ex = getAvail(volId, day);
+    const update = { ...ex, fullDay: checked };
+    if (checked) { update.start = fdConfig.start||'09:00'; update.end = fdConfig.end||'22:00'; }
+    await saveItem('availability',{
+      id: ex.id||`${volId}_${day}_${activeEventId}`,
+      volId, day, eventId: activeEventId, ...update,
+    });
+  }
+
+  async function setPreEvent(volId, field, val) {
+    const ex = getPreEvent(volId);
+    await saveItem('availability',{
+      id: ex.id||`${volId}_pre-event_${activeEventId}`,
+      volId, day:'pre-event', eventId:activeEventId, ...ex, [field]:val,
+    });
+  }
+
+  async function setDeptIds(volId, deptId, checked) {
+    const ex = avail.find(a=>a.volId===volId&&a.day==='depts'&&a.eventId===activeEventId)||{};
+    const current = ex.deptIds||[];
+    const updated = checked ? [...current,deptId] : current.filter(id=>id!==deptId);
+    await saveItem('availability',{
+      id: ex.id||`${volId}_depts_${activeEventId}`,
+      volId, day:'depts', eventId:activeEventId, ...ex, deptIds:updated,
+    });
+  }
+
+  // Get assignments for a volunteer on a day (POC + tasks)
+  const getAssignments = (volId, day) => {
+    const results = [];
+    poc.filter(p=>p.volunteerId===volId&&p.day===day&&p.eventId===activeEventId).forEach(p=>{
+      const contact = contacts.find(c=>c.id===p.contactId);
+      if (contact) results.push({
+        type:'poc',
+        label:`POC: ${displayName(contact)}`,
+        time: p.fromTime&&p.toTime ? `${p.fromTime}–${p.toTime}` : '',
+        nav:'pocallocation',
+      });
+    });
+    tasks.filter(t=>t.assigneeId===volId&&t.due===day).forEach(t=>{
+      results.push({ type:'task', label:`Task: ${t.title}`, time:'', nav:'depts' });
+    });
+    return results;
   };
 
+  /* ── New: filters, view toggle, add-availability form ── */
+  const { can } = usePerm();
+  const canEdit = can('availability.edit');
+  const [view, setView] = useState(() => { try { return localStorage.getItem('vk_avail_view') || 'cards'; } catch { return 'cards'; } });
+  const setViewSaved = v => { setView(v); try { localStorage.setItem('vk_avail_view', v); } catch {} };
+  const [q, setQ] = useState('');
+  const [fCity, setFCity] = useState('');
+  const [fArea, setFArea] = useState('');
+  const [fDept, setFDept] = useState('');
+  const [fDay, setFDay] = useState('');
+  const [formFor, setFormFor] = useState(null); // null | 'new' | volunteer object
+
+  const norm = s => (s || '').trim().toLowerCase();
+  const cities = [...new Set(vols.map(v => (v.city || '').trim()).filter(Boolean))].sort();
+  const areas  = [...new Set(vols.filter(v => !fCity || norm(v.city) === norm(fCity)).map(v => (v.area || '').trim()).filter(Boolean))].sort();
+  const isUnsetFn = volId => !getPreEvent(volId).checked && !eventDays.some(d => getAvail(volId, d).checked);
+  const isAvailOn = (volId, d) => d === 'pre-event' ? !!getPreEvent(volId).checked : !!getAvail(volId, d).checked;
+  const shownVols = vols.filter(v =>
+    (!q || [v.name, v.phone, v.city, v.area].some(x => norm(x).includes(norm(q)))) &&
+    (!fCity || norm(v.city) === norm(fCity)) &&
+    (!fArea || norm(v.area) === norm(fArea)) &&
+    (!fDept || getDeptIds(v.id).includes(fDept)) &&
+    (!fDay || (fDay === 'unset' ? (eventDays.length > 0 && isUnsetFn(v.id)) : isAvailOn(v.id, fDay))));
+  const anyFilter = q || fCity || fArea || fDept || fDay;
+  const dayLabel = d => d.state === 'full' ? 'Full day' : d.state === 'time' ? d.text : '—';
+  const dayState = (volId, day) => {
+    const a = getAvail(volId, day);
+    if (!a.checked) return { state: 'off' };
+    if (a.fullDay) return { state: 'full' };
+    return { state: 'time', text: a.start && a.end ? `${a.start}–${a.end}` : 'Available' };
+  };
+  /* ── Merged directory features: profile add/edit/delete, import, detail panel ── */
+  const { profile: myProfile } = useAuth();
+  const [volModal, setVolModal] = useState(null);   // {type:'add'} | {type:'edit', vol}
+  const [detailId, setDetailId] = useState(null);
+  const [delVol, setDelVol] = useState(null);
+  const [importing, setImporting] = useState(false);
+  const noDays = !eventDays.length;
+  const canAddVol = can('people.add'), canEditVol = can('people.edit'), canDelVol = can('people.delete');
+  const isUnset = volId => !getPreEvent(volId).checked && !eventDays.some(d => getAvail(volId, d).checked);
+
+  async function downloadSample() {
+    const XLSX = await import('xlsx');
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet([
+      ['Name','Contact','City','Area','Skills','Pre Event','Event Days','Time Slot','Departments'],
+      ['Raj Doshi','9876543210','Mumbai','Mulund','POC, Hospitality','Yes','16,17,18','Full Day','POC Team'],
+      ['Priya Shah','9876543211','Thane','Ghodbunder','Logistics','No','17-19','10:00-14:00','Logistics'],
+    ]);
+    ws['!cols'] = [{wch:18},{wch:14},{wch:12},{wch:14},{wch:18},{wch:10},{wch:12},{wch:12},{wch:18}];
+    XLSX.utils.book_append_sheet(wb, ws, 'Volunteers');
+    XLSX.writeFile(wb, 'VK_Volunteers_Sample.xlsx');
+  }
+
+  /* Import: creates/updates profiles, and (if the sheet has Event Days / Time Slot / Pre Event /
+     Departments columns) the availability for the CURRENT event. Existing profiles are never blanked. */
+  async function handleImport(file) {
+    if (!file) return;
+    setImporting(true);
+    try {
+      const XLSX = await import('xlsx');
+      const wb = XLSX.read(await file.arrayBuffer());
+      const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
+      const pick = (row, ...keys) => {
+        const map = Object.fromEntries(Object.keys(row).map(k => [k.toLowerCase().replace(/[^a-z]/g, ''), row[k]]));
+        for (const k of keys) { const v = map[k]; if (v !== undefined && String(v).trim() !== '') return String(v).trim(); }
+        return '';
+      };
+      const dayNum = d => parseInt(d.slice(8, 10), 10);
+      const parseDays = txt => {
+        const t = txt.toLowerCase();
+        if (!t) return [];
+        if (/\ball\b/.test(t)) return [...eventDays];
+        const nums = new Set();
+        t.replace(/(\d{1,2})\s*(?:-|–|to)\s*(\d{1,2})/g, (m, a, b) => { for (let n = +a; n <= +b; n++) nums.add(n); return ''; })
+         .replace(/\d{1,2}/g, m => { nums.add(+m); return ''; });
+        return eventDays.filter(d => nums.has(dayNum(d)));
+      };
+      const parseSlot = txt => {
+        const t = txt.toLowerCase();
+        const m = t.match(/(\d{1,2})[:.]?(\d{2})?\s*(?:-|–|to)\s*(\d{1,2})[:.]?(\d{2})?/);
+        if (m) return { fullDay:false, start:`${m[1].padStart(2,'0')}:${m[2]||'00'}`, end:`${m[3].padStart(2,'0')}:${m[4]||'00'}` };
+        if (t.includes('morning')) return { fullDay:false, ...SHIFT_PRESETS.morning };
+        if (t.includes('evening')) return { fullDay:false, ...SHIFT_PRESETS.evening };
+        return { fullDay:true, start: fdConfig.start || '09:00', end: fdConfig.end || '22:00' };
+      };
+      let added = 0, updated = 0, skipped = 0, availRows = [];
+      const known = [...vols];
+      for (const row of rows) {
+        const name = pick(row, 'name', 'volunteername', 'fullname');
+        if (!name) { skipped++; continue; }
+        const fields = { phone: pick(row, 'contact', 'phone', 'mobile', 'number'), city: pick(row, 'city'), area: pick(row, 'area', 'location'), skills: pick(row, 'skills', 'skill', 'expertise') };
+        let vol = known.find(v => (v.name || '').trim().toLowerCase() === name.toLowerCase());
+        if (vol) {
+          const fill = Object.fromEntries(Object.entries(fields).filter(([k, v]) => v && !vol[k]));
+          if (Object.keys(fill).length) { await saveItem('volunteers', { ...vol, ...fill }); updated++; }
+        } else {
+          const id = await saveItem('volunteers', { name, ...fields });
+          vol = { id, name, ...fields }; known.push(vol); added++;
+        }
+        if (!activeEventId || noDays) continue;
+        const days = parseDays(pick(row, 'eventdays', 'days', 'availabledays'));
+        const slot = parseSlot(pick(row, 'timeslot', 'time', 'shift', 'availability'));
+        days.forEach(day => availRows.push({ id:`${vol.id}_${day}_${activeEventId}`, volId:vol.id, day, eventId:activeEventId, checked:true, ...slot }));
+        const pre = pick(row, 'preevent', 'beforeevent');
+        if (pre && !/^(no|n|false|0)$/i.test(pre)) availRows.push({ id:`${vol.id}_pre-event_${activeEventId}`, volId:vol.id, day:'pre-event', eventId:activeEventId, checked:true, remark: /^(yes|y|true|1)$/i.test(pre) ? '' : pre });
+        const dNames = pick(row, 'departments', 'department', 'dept').split(/[,;/]/).map(x => x.trim().toLowerCase()).filter(Boolean);
+        const dIds = depts.filter(d => dNames.includes((d.name || '').toLowerCase())).map(d => d.id);
+        if (dIds.length) availRows.push({ id:`${vol.id}_depts_${activeEventId}`, volId:vol.id, day:'depts', eventId:activeEventId, deptIds:[...new Set([...getDeptIds(vol.id), ...dIds])] });
+      }
+      if (availRows.length) await batchUpsert('availability', availRows);
+      toast(`Import done — ${added} added, ${updated} updated${skipped ? `, ${skipped} skipped` : ''}${availRows.length ? `, availability set for this event` : ''}.`);
+    } catch (e) { toast('Import failed: ' + e.message); }
+    setImporting(false);
+  }
+
+  async function deleteVolunteer(vol) {
+    const vAvail = avail.filter(a => a.volId === vol.id);
+    const allAvail = (store.availability || []).filter(a => a.volId === vol.id);
+    const vPocs = (store.poc || []).filter(p => p.volunteerId === vol.id);
+    const vTasks = (store.tasks || []).filter(t => t.assigneeId === vol.id);
+    const linked = [...new Map([...vAvail, ...allAvail].map(a => [a.id, a])).values()].map(a => ({ collection: 'availability', data: a }));
+    await trashItem('volunteers', vol, linked, myProfile?.email || '');
+    for (const { data } of linked) await removeItem('availability', data.id);
+    for (const p of vPocs) await saveItem('poc', { ...p, volunteerId: null, status: 'Unassigned' });
+    for (const t of vTasks) await saveItem('tasks', { ...t, assigneeId: null });
+    await removeItem('volunteers', vol.id);
+    toast(`${vol.name} moved to trash.${vPocs.length ? ` ${vPocs.length} POC slot${vPocs.length > 1 ? 's' : ''} now need someone new.` : ''}`);
+  }
+
+  const eventName = (store.events||[]).find(e=>e.id===activeEventId)?.name || 'this event';
   return (
     <>
-      <div className="page-head"><div className="ph-txt"><h1>Volunteer Availability</h1><p>Mark which volunteers are available on each day. This feeds the smart POC allotment.</p></div></div>
-      {!dates.length && <div className="flow-note">{ICON.info}<div>Set start and end dates on your event (Events tab) to see the availability grid.</div></div>}
-      {dates.length>0 && (
-        <div className="panel">
-          <div className="panel-head"><h2>Availability grid</h2>
-            <div className="right">
-              <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
-                {['Full Day','Morning','Afternoon','Evening','Not Available'].map(s=>(
-                  <span key={s} style={{fontSize:11,padding:'2px 8px',borderRadius:20,background:slotColor(s)+'22',color:slotColor(s),fontWeight:600}}>{s}</span>
-                ))}
+      <div className="page-head">
+        <div className="ph-txt">
+          <h1>Volunteers</h1>
+          <p>Your volunteer directory, with each person's availability for {eventName}. Profiles apply to all events; availability is per event.</p>
+        </div>
+        <div className="vol-actions">
+          <button className="btn sm" onClick={downloadSample} title="Download a sample Excel sheet">⬇ Sample</button>
+          {canAddVol && (
+            <label className="btn sm" style={{ cursor: 'pointer', margin: 0 }} title="Import from Excel">
+              {ICON.upload}{importing ? 'Importing…' : 'Import'}
+              <input type="file" accept=".xlsx,.xls,.csv" style={{ display: 'none' }} disabled={importing}
+                onChange={e => { if (e.target.files[0]) handleImport(e.target.files[0]); e.target.value = ''; }} />
+            </label>
+          )}
+          {canEdit && !noDays && vols.length > 0 && <button className="btn sm" onClick={() => setFormFor('new')}>{ICON.cal}Add availability</button>}
+          {canAddVol && <button className="btn primary sm" onClick={() => setVolModal({ type: 'add' })}>{ICON.plus}Add volunteer</button>}
+        </div>
+      </div>
+
+      {noDays && vols.length > 0 && <div className="mtg-note">This event has no start/end dates yet, so availability can't be recorded. Edit the event to add its dates.</div>}
+      {!vols.length && <div className="panel"><Empty title="No volunteers yet" sub="Add volunteers one by one, or import an Excel sheet (download the sample for the column format)." /></div>}
+
+      {vols.length > 0 && <div className="av-filters">
+        <SearchBox value={q} onChange={setQ} />
+        <select className="statsel" value={fCity} onChange={e => { setFCity(e.target.value); setFArea(''); }} aria-label="City">
+          <option value="">All cities</option>{cities.map(c => <option key={c}>{c}</option>)}
+        </select>
+        <select className="statsel" value={fArea} onChange={e => setFArea(e.target.value)} aria-label="Area" disabled={!areas.length}>
+          <option value="">All areas</option>{areas.map(a => <option key={a}>{a}</option>)}
+        </select>
+        <select className="statsel" value={fDept} onChange={e => setFDept(e.target.value)} aria-label="Department">
+          <option value="">All departments</option>{depts.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+        </select>
+        <select className="statsel" value={fDay} onChange={e => setFDay(e.target.value)} aria-label="Available on">
+          <option value="">Any day</option>
+          {!noDays && <option value="unset">Availability not set</option>}
+          <option value="pre-event">Pre-event</option>
+          {eventDays.map(d => <option key={d} value={d}>{shortDate(d)}</option>)}
+        </select>
+        {anyFilter && <button className="btn ghost sm" onClick={() => { setQ(''); setFCity(''); setFArea(''); setFDept(''); setFDay(''); }}>Clear</button>}
+        <span className="muted-sm av-count">{shownVols.length} of {vols.length}</span>
+        <div className="seg hide-sm" role="group" aria-label="View">
+          <button className={view === 'cards' ? 'on' : ''} onClick={() => setViewSaved('cards')}>Cards</button>
+          <button className={view === 'list' ? 'on' : ''} onClick={() => setViewSaved('list')}>List</button>
+          {!noDays && <button className={view === 'grid' ? 'on' : ''} onClick={() => setViewSaved('grid')}>Grid</button>}
+        </div>
+      </div>}
+
+      {vols.length > 0 && !shownVols.length && <div className="panel"><Empty title="No volunteers match" sub="Change or clear the filters above." /></div>}
+
+      {(view === 'cards' || (view === 'grid' && noDays) || window.matchMedia?.('(max-width: 900px)').matches) && shownVols.length > 0 && (
+        <div className="av-grid">
+          {shownVols.map(v => {
+            const deptIds = getDeptIds(v.id);
+            const pre = getPreEvent(v.id);
+            const nDays = eventDays.filter(d => getAvail(v.id, d).checked).length;
+            return (
+              <div className="av-card clickable" key={v.id} role="button" tabIndex={0}
+                onClick={() => setDetailId(v.id)} onKeyDown={e => { if (e.key === 'Enter') setDetailId(v.id); }}>
+                <div className="av-head">
+                  <div style={{ minWidth: 0 }}>
+                    <div className="nm">{v.name}</div>
+                    <div className="muted-sm av-sub">{[v.area, v.city].filter(Boolean).join(', ') || 'No location'}{v.phone ? ` · ${v.phone}` : ''}</div>
+                    {v.skills && <div className="muted-sm av-sub">Skills: {v.skills}</div>}
+                  </div>
+                  {!noDays && isUnset(v.id) && <span className="badge b-pending">Not set for this event</span>}
+                </div>
+                <div className="av-depts">
+                  {deptIds.length ? deptIds.map(id => <span key={id} className="badge b-type">{depts.find(d => d.id === id)?.name || '—'}</span>)
+                                  : <span className="muted-sm">No department</span>}
+                </div>
+                {!noDays && <div className="av-days">
+                  <div className={'av-day' + (pre.checked ? ' on' : '')} title={pre.remark || ''}>
+                    <span className="av-d">Pre-event</span><span className="av-t">{pre.checked ? (pre.remark || 'Yes') : '—'}</span>
+                  </div>
+                  {eventDays.map(day => {
+                    const st = dayState(v.id, day);
+                    const asg = getAssignments(v.id, day);
+                    return (
+                      <div key={day} className={'av-day' + (st.state !== 'off' ? ' on' : '')}
+                        title={asg.map(a => a.label + (a.time ? ' ' + a.time : '')).join('\n')}>
+                        <span className="av-d">{shortDate(day)}</span>
+                        <span className="av-t">{dayLabel(st)}</span>
+                        {asg.length > 0 && <span className="av-asg">{asg.length} assigned</span>}
+                      </div>
+                    );
+                  })}
+                </div>}
+                {!noDays && <div className="muted-sm" style={{ marginTop: 6 }}>{nDays} of {eventDays.length} event days</div>}
               </div>
-            </div>
-          </div>
-          <div className="panel-body" style={{overflowX:'auto'}}>
-            <table style={{minWidth:Math.max(600,dates.length*80+200)}}>
-              <thead><tr>
-                <th style={{minWidth:160}}>Volunteer</th>
-                {dates.map(d=>{
-                  const isEvent = activeEvent && d>=activeEvent.startDate && d<=(activeEvent.endDate||activeEvent.startDate);
-                  return <th key={d} style={{textAlign:'center',minWidth:70,fontSize:10,background:isEvent?'var(--teal-wash)':''}}>
-                    <div>{shortDate(d)}</div>
-                    {isEvent&&<div style={{color:'var(--teal)',fontSize:9,fontWeight:700}}>EVENT</div>}
-                  </th>;
-                })}
-              </tr></thead>
-              <tbody>
-                {vols.map(v=>(
-                  <tr key={v.id}>
-                    <td><div className="person"><div className="avatar">{initials(v.name)}</div><div><div className="nm">{v.name}</div><div className="role">{v.skills}</div></div></div></td>
-                    {dates.map(d=>{
-                      const slot=getAvail(v,d);
-                      return <td key={d} style={{textAlign:'center',padding:'6px 4px'}}>
-                        <select style={{fontSize:11,padding:'2px 4px',borderRadius:6,border:'1px solid var(--line)',background:slot?slotColor(slot)+'22':'#fff',color:slot?slotColor(slot):'var(--muted)',fontWeight:slot?600:400,cursor:'pointer',width:'100%'}}
-                          value={slot} onChange={e=>setAvail(v,d,e.target.value)}>
-                          <option value="">—</option>
-                          {SLOTS.map(s=><option key={s} value={s}>{s}</option>)}
-                        </select>
-                      </td>;
+            );
+          })}
+        </div>
+      )}
+
+      {view === 'list' && !window.matchMedia?.('(max-width: 900px)').matches && shownVols.length > 0 && (
+        <div className="panel"><div className="panel-body">
+          <table>
+            <thead><tr><th>Name</th><th>Contact</th><th>City</th><th>Area</th><th>Departments</th><th>This event</th><th></th></tr></thead>
+            <tbody>
+              {shownVols.map(v => {
+                const nDays = eventDays.filter(d => getAvail(v.id, d).checked).length;
+                return (
+                  <tr key={v.id} style={{ cursor: 'pointer' }} onClick={() => setDetailId(v.id)}>
+                    <td><div className="person"><div className="avatar" style={{ width: 30, height: 30, fontSize: 11 }}>{initials(v.name)}</div><div><div className="nm">{v.name}</div>{v.skills && <div className="role">{v.skills}</div>}</div></div></td>
+                    <td className="muted-sm">{v.phone || '—'}</td>
+                    <td className="muted-sm">{v.city || '—'}</td>
+                    <td className="muted-sm">{v.area || '—'}</td>
+                    <td className="muted-sm">{getDeptIds(v.id).map(id => depts.find(d => d.id === id)?.name).filter(Boolean).join(', ') || '—'}</td>
+                    <td>{noDays ? '—' : isUnset(v.id) ? <span className="badge b-pending">Not set</span> : <span className="muted-sm">{nDays} of {eventDays.length} days{getPreEvent(v.id).checked ? ' + pre-event' : ''}</span>}</td>
+                    <td><div className="rowacts" onClick={e => e.stopPropagation()}>
+                      {canEditVol && <button className="btn ghost xs" aria-label="Edit profile" onClick={() => setVolModal({ type: 'edit', vol: v })}>{ICON.edit}</button>}
+                      {canDelVol && <button className="btn ghost xs" aria-label="Delete volunteer" onClick={() => setDelVol(v)}>{ICON.trash}</button>}
+                    </div></td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div></div>
+      )}
+
+      {view === 'grid' && !noDays && !window.matchMedia?.('(max-width: 900px)').matches && shownVols.length > 0 && (
+      <div className="panel">
+        <div className="panel-body" style={{overflowX:'auto'}}>
+          <fieldset disabled={!canEdit} style={{border:0,padding:0,margin:0,minWidth:0}}>
+          <table style={{borderCollapse:'collapse',fontSize:12.5,width:'100%',minWidth:360+eventDays.length*170}}>
+            <thead>
+              <tr style={{background:'var(--teal-wash)'}}>
+                <th style={{padding:'8px 12px',textAlign:'left',minWidth:160,position:'sticky',left:0,background:'var(--teal-wash)',zIndex:2}}>Volunteer</th>
+                <th style={{padding:'8px 12px',textAlign:'left',minWidth:180}}>Departments</th>
+                <th style={{padding:'8px 10px',textAlign:'center',minWidth:150,background:'#EAF7F1'}}>Pre-event</th>
+                {eventDays.map(day=>(
+                  <th key={day} style={{padding:'8px 10px',textAlign:'center',minWidth:170,whiteSpace:'nowrap'}}>
+                    <div style={{fontWeight:600}}>{fmtDate(day)}</div>
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {shownVols.map((v,vi)=>{
+                const preEv  = getPreEvent(v.id);
+                const deptIds = getDeptIds(v.id);
+                return (
+                  <tr key={v.id} style={{borderBottom:'1px solid var(--line)',background:vi%2===0?'#fff':'#fafaf7'}}>
+                    {/* Name */}
+                    <td style={{padding:'8px 12px',position:'sticky',left:0,background:vi%2===0?'#fff':'#fafaf7',zIndex:1}}>
+                      <div style={{fontWeight:500}}>{v.name}</div>
+                      {v.phone&&<div style={{fontSize:11,color:'var(--muted)'}}>{v.phone}</div>}
+                    </td>
+                    {/* Departments */}
+                    <td style={{padding:'6px 10px',verticalAlign:'top'}}>
+                      <div style={{display:'flex',flexDirection:'column',gap:3}}>
+                        {depts.map(d=>(
+                          <label key={d.id} style={{display:'flex',alignItems:'center',gap:5,fontSize:11.5,cursor:'pointer'}}>
+                            <input type="checkbox" checked={deptIds.includes(d.id)}
+                              onChange={e=>setDeptIds(v.id,d.id,e.target.checked)}
+                              style={{accentColor:'var(--teal)'}}/>
+                            {d.name}
+                          </label>
+                        ))}
+                        {!depts.length&&<span style={{color:'var(--faint)',fontSize:11}}>No depts</span>}
+                      </div>
+                    </td>
+                    {/* Pre-event */}
+                    <td style={{padding:'6px 8px',textAlign:'center',background:'#EAF7F1',verticalAlign:'top'}}>
+                      <label style={{display:'flex',alignItems:'center',justifyContent:'center',gap:4,marginBottom:4,cursor:'pointer'}}>
+                        <input type="checkbox" checked={!!preEv.checked}
+                          onChange={e=>setPreEvent(v.id,'checked',e.target.checked)}
+                          style={{accentColor:'var(--teal)'}}/>
+                        <span style={{fontSize:11.5}}>Available</span>
+                      </label>
+                      {preEv.checked&&(
+                        <input className="input" style={{fontSize:11,padding:'2px 6px',width:'100%'}}
+                          placeholder="e.g. 10–15 Sep evenings"
+                          defaultValue={preEv.remark||''}
+                          onBlur={e=>setPreEvent(v.id,'remark',e.target.value)}/>
+                      )}
+                    </td>
+                    {/* Event days */}
+                    {eventDays.map(day=>{
+                      const a = getAvail(v.id, day);
+                      const assignments = getAssignments(v.id, day);
+                      return (
+                        <td key={day} style={{padding:'6px 8px',verticalAlign:'top'}}>
+                          {/* Available checkbox */}
+                          <label style={{display:'flex',alignItems:'center',gap:4,marginBottom:4,cursor:'pointer'}}>
+                            <input type="checkbox" checked={!!a.checked}
+                              onChange={e=>setDayAvail(v.id,day,'checked',e.target.checked)}
+                              style={{accentColor:'var(--teal)'}}/>
+                            <span style={{fontSize:11}}>Available</span>
+                          </label>
+                          {a.checked&&(<>
+                            {/* Full Day checkbox */}
+                            <label style={{display:'flex',alignItems:'center',gap:4,marginBottom:4,cursor:'pointer'}}>
+                              <input type="checkbox" checked={!!a.fullDay}
+                                onChange={e=>setFullDay(v.id,day,e.target.checked)}
+                                style={{accentColor:'var(--teal)'}}/>
+                              <span style={{fontSize:11}}>Full Day</span>
+                            </label>
+                            {/* Time range */}
+                            <div style={{display:'flex',alignItems:'center',gap:3,marginBottom:4}}>
+                              <TimePicker value={a.start||''} onChange={val=>setDayAvail(v.id,day,'start',val)}/>
+                              <span style={{fontSize:10,color:'var(--muted)'}}>–</span>
+                              <TimePicker value={a.end||''} onChange={val=>setDayAvail(v.id,day,'end',val)}/>
+                            </div>
+                            {/* Show availability window */}
+                            {a.start&&a.end&&(
+                              <div style={{fontSize:10.5,color:'var(--teal)',fontWeight:500,marginBottom:3}}>
+                                {a.start}–{a.end}
+                              </div>
+                            )}
+                          </>)}
+                          {/* Assignment badges */}
+                          {assignments.map((asgn,i)=>(
+                            <div key={i}
+                              style={{fontSize:10,padding:'2px 5px',borderRadius:6,marginTop:2,cursor:'pointer',
+                                background:asgn.type==='poc'?'var(--teal-wash)':'var(--amber-wash)',
+                                color:asgn.type==='poc'?'var(--teal)':'var(--amber)',
+                                border:`1px solid ${asgn.type==='poc'?'var(--teal)':'#E8D5A3'}`,
+                                whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}
+                              title={`${asgn.label}${asgn.time?' '+asgn.time:''} — click to navigate`}
+                              onClick={()=>{ if(window.__jyotGo) window.__jyotGo(asgn.nav); }}>
+                              🔗 {asgn.label}{asgn.time?` ${asgn.time}`:''}
+                            </div>
+                          ))}
+                        </td>
+                      );
                     })}
                   </tr>
-                ))}
-                {!vols.length&&<tr><td colSpan={dates.length+1}><Empty title="No volunteers yet" sub="Add volunteers in the Volunteers & POC module."/></td></tr>}
-              </tbody>
-            </table>
-          </div>
+                );
+              })}
+            </tbody>
+          </table>
+          </fieldset>
         </div>
+      </div>
+      )}
+
+      {volModal && <VolModal item={volModal.type === 'edit' ? volModal.vol : null} vols={vols} toast={toast}
+        canSetAvailability={canEdit && !noDays} onNext={v => setFormFor(v)} onClose={() => setVolModal(null)} />}
+      {delVol && <DeleteModal label={delVol.name} onClose={() => setDelVol(null)}
+        onConfirm={async () => { const v = delVol; setDelVol(null); setDetailId(null); await deleteVolunteer(v); }} />}
+      {detailId && vols.find(v => v.id === detailId) && (
+        <VolunteerDetail vol={vols.find(v => v.id === detailId)} depts={depts} eventDays={eventDays} noDays={noDays}
+          getAvail={getAvail} getPreEvent={getPreEvent} getDeptIds={getDeptIds} getAssignments={getAssignments}
+          setDayAvail={setDayAvail} setFullDay={setFullDay} setPreEvent={setPreEvent} setDeptIds={setDeptIds}
+          canEditAvail={canEdit} canEditVol={canEditVol} canDelVol={canDelVol} eventName={eventName}
+          onEditProfile={v => setVolModal({ type: 'edit', vol: v })} onDelete={v => setDelVol(v)}
+          onClose={() => setDetailId(null)} />
+      )}
+      {formFor && (
+        <AvailabilityForm vols={vols} depts={depts} eventDays={eventDays} activeEventId={activeEventId}
+          fdConfig={fdConfig} editVol={formFor === 'new' ? null : formFor}
+          getAvail={getAvail} getPreEvent={getPreEvent} getDeptIds={getDeptIds}
+          onClose={() => setFormFor(null)} toast={toast} />
       )}
     </>
   );
 }
 
-/* ============================ SMART POC ALLOTMENT ============================ */
-export function SmartPOC({ store, activeEventId }) {
-  const toast = useToast();
-  const contacts = (store.contacts||[]).filter(c=>c.status==='Confirmed');
-  const vols = store.volunteers||[];
-  const logi = store.logistics||[];
-  const poc = store.poc||[];
-  const activeEvent = (store.events||[]).find(e=>e.id===activeEventId);
+export const VolunteerAvailability = Volunteers;
 
-  // get days a VIP is present from logistics
-  function vipDays(c) {
-    const L=logi.find(x=>x.contactId===c.id||x.id===c.id)||{};
-    if(!L.inbDate||!L.outDate) return [];
-    const dates=[]; let d=new Date(L.inbDate+'T00:00:00'); const end=new Date(L.outDate+'T00:00:00'); let g=0;
-    while(d<=end&&g<20){ dates.push(d.toISOString().slice(0,10)); d=new Date(d); d.setDate(d.getDate()+1); g++; }
-    return dates;
-  }
-  // get volunteers available on a day
-  function availVols(day) {
-    return vols.filter(v=>{
-      const slot=(v.availability||{})[day];
-      return slot&&slot!=='Not Available';
-    });
-  }
-  // get existing POC for a VIP on a day
-  function existingPOC(cid,day) { return poc.find(p=>p.contactId===cid&&p.day===day); }
+/* ── Volunteer detail: profile (all events) + this event's availability, editable per day ── */
+function VolunteerDetail({ vol, depts, eventDays, noDays, getAvail, getPreEvent, getDeptIds, getAssignments,
+  setDayAvail, setFullDay, setPreEvent, setDeptIds, canEditAvail, canEditVol, canDelVol, eventName, onEditProfile, onDelete, onClose }) {
+  const pre = getPreEvent(vol.id);
+  const deptIds = getDeptIds(vol.id);
+  return (
+    <Modal title={vol.name} onClose={onClose} footer={null}>
+      <div className="vd-section">
+        <div className="vd-head"><h3>Profile</h3><span className="muted-sm">applies to all events</span>
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+            {canEditVol && <button className="btn sm" onClick={() => onEditProfile(vol)}>{ICON.edit}Edit</button>}
+            {canDelVol && <button className="btn sm danger" onClick={() => onDelete(vol)}>{ICON.trash}Delete</button>}
+          </div>
+        </div>
+        <div className="vd-grid">
+          <div><span>Contact</span>{vol.phone ? <a href={`tel:${vol.phone}`}>{vol.phone}</a> : '—'}</div>
+          <div><span>City</span>{vol.city || '—'}</div>
+          <div><span>Area</span>{vol.area || '—'}</div>
+          <div><span>Skills</span>{vol.skills || '—'}</div>
+        </div>
+      </div>
 
-  async function assign(cid, vid, day) {
-    const ex=existingPOC(cid,day);
-    if(ex) await saveItem('poc',{...ex,volunteerId:vid,status:'Active'});
-    else await saveItem('poc',{contactId:cid,volunteerId:vid,day,shift:'Full day',eventId:activeEventId,status:'Active'});
-    toast('POC assigned.');
-  }
-  async function autoAssign() {
-    let count=0;
-    for(const c of contacts) {
-      const days=vipDays(c);
-      for(const day of days) {
-        if(existingPOC(c.id,day)) continue;
-        const avail=availVols(day);
-        if(!avail.length) continue;
-        // pick least-loaded volunteer
-        const loads={};
-        avail.forEach(v=>{ loads[v.id]=(poc.filter(p=>p.volunteerId===v.id&&p.day===day).length); });
-        const best=avail.sort((a,b)=>(loads[a.id]||0)-(loads[b.id]||0))[0];
-        await saveItem('poc',{contactId:c.id,volunteerId:best.id,day,shift:'Full day',eventId:activeEventId,status:'Active'});
-        count++;
+      <div className="vd-section">
+        <div className="vd-head"><h3>{eventName}</h3><span className="muted-sm">availability for this event</span></div>
+        {noDays ? <p className="muted-sm">This event has no dates yet. Add start and end dates to the event first.</p> : (
+          <fieldset disabled={!canEditAvail} className="vd-fieldset">
+            <div className="vd-day">
+              <label className="vd-on"><input type="checkbox" checked={!!pre.checked} onChange={e => setPreEvent(vol.id, 'checked', e.target.checked)} /><b>Pre-event</b></label>
+              {pre.checked && <input className="input vd-remark" key={'pre' + (pre.remark || '')} defaultValue={pre.remark || ''} placeholder="Note, e.g. weekday evenings"
+                onBlur={e => { if (e.target.value !== (pre.remark || '')) setPreEvent(vol.id, 'remark', e.target.value); }} />}
+            </div>
+            {eventDays.map(day => {
+              const a = getAvail(vol.id, day);
+              const asg = getAssignments(vol.id, day);
+              return (
+                <div className="vd-day" key={day}>
+                  <label className="vd-on"><input type="checkbox" checked={!!a.checked} onChange={e => setDayAvail(vol.id, day, 'checked', e.target.checked)} /><b>{shortDate(day)}</b></label>
+                  {a.checked ? (
+                    <div className="vd-times">
+                      <label className="vd-full"><input type="checkbox" checked={!!a.fullDay} onChange={e => setFullDay(vol.id, day, e.target.checked)} />Full day</label>
+                      {!a.fullDay && <>
+                        <TimePicker value={a.start || ''} onChange={v => setDayAvail(vol.id, day, 'start', v)} />
+                        <span className="muted-sm">to</span>
+                        <TimePicker value={a.end || ''} onChange={v => setDayAvail(vol.id, day, 'end', v)} />
+                      </>}
+                      {a.fullDay && <span className="muted-sm">{a.start}–{a.end}</span>}
+                    </div>
+                  ) : <span className="muted-sm">Not available</span>}
+                  {asg.length > 0 && (
+                    <div className="vd-asg">
+                      {asg.map((x, i) => <button type="button" key={i} className="vd-asg-chip" onClick={() => { onClose(); window.__jyotGo && window.__jyotGo(x.nav); }}>
+                        {x.label}{x.time ? ` · ${x.time}` : ''}</button>)}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            <div className="vd-head" style={{ marginTop: 14 }}><h3>Departments</h3></div>
+            <div className="av-chips">
+              {depts.map(d => <button type="button" key={d.id} className={'av-chip' + (deptIds.includes(d.id) ? ' on' : '')}
+                onClick={() => setDeptIds(vol.id, d.id, !deptIds.includes(d.id))}>{d.name}</button>)}
+              {!depts.length && <span className="muted-sm">No departments yet.</span>}
+            </div>
+          </fieldset>
+        )}
+        <p className="muted-sm" style={{ margin: '12px 0 0' }}>Changes here save immediately.</p>
+      </div>
+    </Modal>
+  );
+}
+
+/* ── Add / edit availability: pick volunteers by city → area, then days, time and departments ── */
+const SHIFT_PRESETS = { morning: { start: '09:00', end: '13:00', label: 'Morning (9–1)' }, evening: { start: '17:00', end: '22:00', label: 'Evening (5–10)' } };
+function AvailabilityForm({ vols, depts, eventDays, activeEventId, fdConfig, editVol, getAvail, getPreEvent, getDeptIds, onClose, toast }) {
+  const single = !!editVol;
+  const norm = s => (s || '').trim().toLowerCase();
+  const [city, setCity] = useState('');
+  const [area, setArea] = useState('');
+  const [q, setQ] = useState('');
+  const [picked, setPicked] = useState(() => new Set(single ? [editVol.id] : []));
+  const [mode, setMode] = useState('available');
+  const [days, setDays] = useState(() => new Set(single ? eventDays.filter(d => getAvail(editVol.id, d).checked) : []));
+  const [pre, setPre] = useState(() => single ? !!getPreEvent(editVol.id).checked : false);
+  const [preRemark, setPreRemark] = useState(() => single ? (getPreEvent(editVol.id).remark || '') : '');
+  const first = single ? eventDays.map(d => getAvail(editVol.id, d)).find(a => a.checked) : null;
+  const [shift, setShift] = useState(() => !first ? 'full' : first.fullDay ? 'full'
+    : (first.start === SHIFT_PRESETS.morning.start && first.end === SHIFT_PRESETS.morning.end) ? 'morning'
+    : (first.start === SHIFT_PRESETS.evening.start && first.end === SHIFT_PRESETS.evening.end) ? 'evening' : 'custom');
+  const [start, setStart] = useState(first?.start || '09:00');
+  const [end, setEnd] = useState(first?.end || '18:00');
+  const [deptIds, setDeptIds] = useState(() => new Set(single ? getDeptIds(editVol.id) : []));
+  const [deptMode, setDeptMode] = useState(single ? 'replace' : 'add');
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const cities = [...new Set(vols.map(v => (v.city || '').trim()).filter(Boolean))].sort();
+  const areas = [...new Set(vols.filter(v => !city || norm(v.city) === norm(city)).map(v => (v.area || '').trim()).filter(Boolean))].sort();
+  const list = vols.filter(v => (!city || norm(v.city) === norm(city)) && (!area || norm(v.area) === norm(area)) && (!q || norm(v.name).includes(norm(q))));
+  const allShownPicked = list.length > 0 && list.every(v => picked.has(v.id));
+  const toggle = (setFn, id) => setFn(p => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n; });
+
+  async function save() {
+    setErr('');
+    if (!picked.size) { setErr('Choose at least one volunteer.'); return; }
+    if (mode === 'available' && shift === 'custom' && (!start || !end || end <= start)) { setErr('End time must be after start time.'); return; }
+    const times = shift === 'full' ? { start: fdConfig.start || '09:00', end: fdConfig.end || '22:00' }
+                : shift === 'custom' ? { start, end } : { start: SHIFT_PRESETS[shift].start, end: SHIFT_PRESETS[shift].end };
+    const rows = [];
+    for (const volId of picked) {
+      // In single-volunteer edit, the day chips are the full picture: unticked days become unavailable
+      const dayList = single ? eventDays : [...days];
+      for (const day of dayList) {
+        const on = single ? days.has(day) : mode === 'available';
+        const ex = getAvail(volId, day);
+        if (single && !on && !ex.checked) continue;
+        rows.push({ ...ex, id: ex.id || `${volId}_${day}_${activeEventId}`, volId, day, eventId: activeEventId,
+          checked: on, fullDay: on && shift === 'full', ...(on ? times : {}) });
+      }
+      if (single || pre) {
+        const ex = getPreEvent(volId);
+        const on = single ? pre : mode === 'available';
+        if (!(single && !on && !ex.checked)) {
+          rows.push({ ...ex, id: ex.id || `${volId}_pre-event_${activeEventId}`, volId, day: 'pre-event', eventId: activeEventId,
+            checked: on, remark: on ? preRemark : (ex.remark || '') });
+        }
+      }
+      if (single || deptIds.size) {
+        const current = getDeptIds(volId);
+        const next = deptMode === 'replace' ? [...deptIds] : [...new Set([...current, ...deptIds])];
+        rows.push({ id: `${volId}_depts_${activeEventId}`, volId, day: 'depts', eventId: activeEventId, deptIds: next });
       }
     }
-    toast(`Auto-assigned ${count} POC slots.`);
+    if (!rows.length) { setErr('Pick at least one day, Pre-event, or a department.'); return; }
+    setBusy(true);
+    try {
+      await batchUpsert('availability', rows);
+      toast(single ? `Availability saved for ${editVol.name}.` : `Availability saved for ${picked.size} volunteer${picked.size > 1 ? 's' : ''}.`);
+      onClose();
+    } catch (e) { setErr('Could not save: ' + (e.code || e.message)); setBusy(false); }
   }
 
   return (
-    <>
-      <div className="page-head"><div className="ph-txt"><h1>Smart POC Allotment</h1><p>See which volunteers are free for each VIP's visit days and assign with one click.</p></div>
-        <button className="btn primary" onClick={autoAssign}>{ICON.spark}Auto-assign all gaps</button>
+    <Modal title={single ? `Availability — ${editVol.name}` : 'Add availability'} onClose={onClose} onSave={busy ? null : save} saveLabel={busy ? 'Saving…' : 'Save'}>
+      {err && <div className="av-err">{err}</div>}
+
+      {!single && <>
+        <div className="av-step">1. Volunteers</div>
+        <div className="grid2">
+          <Field label="City">
+            <select className="input" value={city} onChange={e => { setCity(e.target.value); setArea(''); }}>
+              <option value="">All cities</option>{cities.map(c => <option key={c}>{c}</option>)}
+            </select>
+          </Field>
+          <Field label="Area (optional)">
+            <select className="input" value={area} onChange={e => setArea(e.target.value)} disabled={!areas.length}>
+              <option value="">All areas</option>{areas.map(a => <option key={a}>{a}</option>)}
+            </select>
+          </Field>
+        </div>
+        <div className="av-pick-head">
+          <input className="input" placeholder="Search name…" value={q} onChange={e => setQ(e.target.value)} />
+          <button className="btn sm" type="button" disabled={!list.length}
+            onClick={() => setPicked(p => { const n = new Set(p); list.forEach(v => allShownPicked ? n.delete(v.id) : n.add(v.id)); return n; })}>
+            {allShownPicked ? 'Clear shown' : `Select all ${list.length}`}
+          </button>
+        </div>
+        <div className="av-pick">
+          {list.map(v => (
+            <label key={v.id} className={'av-pick-row' + (picked.has(v.id) ? ' on' : '')}>
+              <input type="checkbox" checked={picked.has(v.id)} onChange={() => toggle(setPicked, v.id)} />
+              <span className="nm">{v.name}</span>
+              <span className="muted-sm">{[v.area, v.city].filter(Boolean).join(', ')}</span>
+            </label>
+          ))}
+          {!list.length && <div className="muted-sm" style={{ padding: 10 }}>No volunteers in this city/area.</div>}
+        </div>
+        <div className="muted-sm" style={{ margin: '6px 0 4px' }}>{picked.size} selected</div>
+      </>}
+
+      <div className="av-step">{single ? 'Days available' : '2. Days'}</div>
+      {!single && (
+        <div className="seg" style={{ marginBottom: 8 }} role="group" aria-label="Mark as">
+          <button type="button" className={mode === 'available' ? 'on' : ''} onClick={() => setMode('available')}>Available</button>
+          <button type="button" className={mode === 'unavailable' ? 'on' : ''} onClick={() => setMode('unavailable')}>Not available</button>
+        </div>
+      )}
+      <div className="av-chips">
+        <button type="button" className={'av-chip' + (pre ? ' on' : '')} onClick={() => setPre(p => !p)}>Pre-event</button>
+        {eventDays.map(d => (
+          <button type="button" key={d} className={'av-chip' + (days.has(d) ? ' on' : '')} onClick={() => toggle(setDays, d)}>{shortDate(d)}</button>
+        ))}
+        <button type="button" className="linkbtn" style={{ marginLeft: 4 }}
+          onClick={() => setDays(p => p.size === eventDays.length ? new Set() : new Set(eventDays))}>
+          {days.size === eventDays.length ? 'Clear days' : 'All days'}
+        </button>
       </div>
-      {!contacts.length&&<div className="panel"><Empty title="No confirmed guests" sub="Confirm guests in Outreach first."/></div>}
-      {contacts.map(c=>{
-        const days=vipDays(c);
-        if(!days.length) return <div className="panel" key={c.id}>
-          <div className="panel-head"><div className="nm">{displayName(c)}</div><div className="desc muted-sm" style={{marginLeft:8}}>No logistics dates set — add arrival and departure in Logistics.</div></div>
-        </div>;
-        return <div className="panel" key={c.id}>
-          <div className="panel-head"><div className="person"><div className="avatar">{initials(c.name)}</div><div><div className="nm">{displayName(c)}</div><div className="role">{c.type} · {c.field}</div></div></div></div>
-          <div className="panel-body">
-            <table><thead><tr><th>Day</th><th>POC assigned</th><th>Available volunteers</th><th></th></tr></thead><tbody>
-              {days.map(day=>{
-                const ex=existingPOC(c.id,day); const exVol=ex?vols.find(v=>v.id===ex.volunteerId):null;
-                const avail=availVols(day);
-                return <tr key={day}>
-                  <td className="muted-sm">{shortDate(day)}</td>
-                  <td>{exVol?<div className="person"><div className="avatar" style={{width:26,height:26,fontSize:10}}>{initials(exVol.name)}</div><div className="nm">{exVol.name}</div></div>:<span style={{color:'var(--rose)',fontSize:13}}>⚠ Not assigned</span>}</td>
-                  <td>
-                    {avail.length?<select className="statsel" value={ex?.volunteerId||''} onChange={e=>e.target.value&&assign(c.id,e.target.value,day)}>
-                      <option value="">Pick volunteer…</option>
-                      {avail.map(v=>{
-                        const load=poc.filter(p=>p.volunteerId===v.id&&p.day===day).length;
-                        return <option key={v.id} value={v.id}>{v.name} ({(v.availability||{})[day]}) — {load} VIP{load!==1?'s':''}</option>;
-                      })}
-                    </select>:<span className="muted-sm">No volunteers available</span>}
-                  </td>
-                  <td>{ex&&<button className="btn ghost xs" onClick={async()=>{await removeItem('poc',ex.id);toast('POC removed.');}}>Remove</button>}</td>
-                </tr>;
-              })}
-            </tbody></table>
+      {pre && (mode === 'available' || single) && (
+        <Field label="Pre-event note (optional)"><input className="input" value={preRemark} onChange={e => setPreRemark(e.target.value)} placeholder="e.g. weekday evenings" /></Field>
+      )}
+
+      {(mode === 'available' || single) && <>
+        <div className="av-step">{single ? 'Time' : '3. Time'}</div>
+        <div className="av-chips">
+          {[['full', `Full day (${fdConfig.start || '09:00'}–${fdConfig.end || '22:00'})`], ['morning', SHIFT_PRESETS.morning.label], ['evening', SHIFT_PRESETS.evening.label], ['custom', 'Custom']].map(([k, l]) => (
+            <button type="button" key={k} className={'av-chip' + (shift === k ? ' on' : '')} onClick={() => setShift(k)}>{l}</button>
+          ))}
+        </div>
+        {shift === 'custom' && (
+          <div className="av-custom"><TimePicker value={start} onChange={setStart} /><span>to</span><TimePicker value={end} onChange={setEnd} /></div>
+        )}
+        {single && <p className="muted-sm" style={{ margin: '4px 0 0' }}>This time applies to every ticked day. For different times on different days, use the Grid view on desktop.</p>}
+      </>}
+
+      <div className="av-step">{single ? 'Departments' : '4. Departments (optional)'}</div>
+      <div className="av-chips">
+        {depts.map(d => <button type="button" key={d.id} className={'av-chip' + (deptIds.has(d.id) ? ' on' : '')} onClick={() => toggle(setDeptIds, d.id)}>{d.name}</button>)}
+        {!depts.length && <span className="muted-sm">No departments yet.</span>}
+      </div>
+      {!single && deptIds.size > 0 && (
+        <div className="seg" style={{ marginTop: 8 }} role="group" aria-label="Department mode">
+          <button type="button" className={deptMode === 'add' ? 'on' : ''} onClick={() => setDeptMode('add')}>Add to existing</button>
+          <button type="button" className={deptMode === 'replace' ? 'on' : ''} onClick={() => setDeptMode('replace')}>Replace</button>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   POC ALLOCATION
+   - Requirements collapsed per panelist+day with time window
+   - Volunteer cards show mini timeline bar
+   - Time-aware assignment
+══════════════════════════════════════════════════════════════════ */
+/* ── POC Volunteer Card — standalone so it never re-mounts on parent re-render ── */
+
+/* ══════════════════════════════════════════════════════════════════
+   POC ALLOCATION — Compact table with day selector + inline dropdown
+   Rules:
+   - Not available that day → not shown in dropdown
+   - Available but assigned elsewhere → shown greyed, not selectable
+   - Available and free → shown normally
+══════════════════════════════════════════════════════════════════ */
+export function POCAllocation({ store, activeEventId }) {
+  const toast = useToast();
+  const { can } = usePerm();
+  const { profile } = useAuth();
+  const [selectedDay, setSelectedDay] = useState(null);
+  const [confirmAssign, setConfirmAssign] = useState(null);
+  const [openDropdown, setOpenDropdown] = useState(null); // req.key
+  const [autoOpen, setAutoOpen] = useState(false);
+  const [showIssues, setShowIssues] = useState(false);
+
+  const vols         = store.volunteers || [];
+  const avail        = store.availability || [];
+  const poc          = store.poc || [];
+  const contacts     = (store.contacts||[]).filter(c=>c.status==='Confirmed');
+  const depts        = store.departments || [];
+  const personalised = store.personalisedSchedule || [];
+
+  // Event days
+  const activeEvent = (store.events||[]).find(e=>e.id===activeEventId);
+  const eventDays = [];
+  if (activeEvent?.startDate && activeEvent?.endDate) {
+    let d = new Date(activeEvent.startDate+'T12:00:00');
+    const end = new Date(activeEvent.endDate+'T12:00:00');
+    while (d <= end && eventDays.length < 20) {
+      eventDays.push(localISO(d));
+      d = new Date(d); d.setDate(d.getDate()+1);
+    }
+  }
+
+  // POC dept
+  const pocDept = depts.find(d=>d.name.toLowerCase().includes('poc'));
+  const pocVols = pocDept
+    ? vols.filter(v=>{
+        const rec = avail.find(a=>a.volId===v.id&&a.day==='depts'&&a.eventId===activeEventId);
+        return (rec?.deptIds||[]).includes(pocDept.id);
+      })
+    : vols;
+
+  const toMins = t => { if(!t) return 0; const [h,m]=(t||'00:00').split(':'); return parseInt(h)*60+parseInt(m||0); };
+  const fromMins = m => `${String(Math.floor(m/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')}`;
+
+  const getVolAvail = (volId, day) => {
+    const a = avail.find(x=>x.volId===volId&&x.day===day&&x.eventId===activeEventId);
+    if (!a?.checked) return null;
+    return { start: a.start||'09:00', end: a.end||'22:00' };
+  };
+
+  const getVolAssignments = (volId, day) =>
+    poc.filter(p=>p.volunteerId===volId&&p.day===day&&p.eventId===activeEventId&&p.fromTime&&p.toTime)
+       .map(p=>({from:toMins(p.fromTime),to:toMins(p.toTime),contactId:p.contactId}));
+
+  const getFreeSlots = (volId, day) => {
+    const va = getVolAvail(volId, day);
+    if (!va) return [];
+    const start = toMins(va.start), end = toMins(va.end);
+    const assigned = getVolAssignments(volId, day).sort((a,b)=>a.from-b.from);
+    const free = [];
+    let cur = start;
+    assigned.forEach(a=>{ if(a.from>cur) free.push({from:cur,to:a.from}); cur=Math.max(cur,a.to); });
+    if (cur<end) free.push({from:cur,to:end});
+    return free;
+  };
+
+  const canCover = (volId, day, fromTime, toTime) => {
+    const need = {from:toMins(fromTime), to:toMins(toTime)};
+    return getFreeSlots(volId, day).some(s=>s.from<=need.from&&s.to>=need.to);
+  };
+
+  // Collapse POC requirements per panelist+day
+  const getRequirements = () => {
+    const byKey = {};
+    personalised
+      .filter(r=>r.pocRequired&&r.eventId===activeEventId&&r.date&&r.time&&!r.deleted)
+      .forEach(r=>{
+        const key=`${r.contactId}_${r.date}`;
+        if(!byKey[key]) byKey[key]={contactId:r.contactId,date:r.date,rows:[]};
+        byKey[key].rows.push(r);
+      });
+    return Object.values(byKey).map(g=>{
+      const rows = g.rows.sort((a,b)=>a.time>b.time?1:-1);
+      const fromTime = rows[0].time;
+      const allRows = personalised
+        .filter(r=>r.contactId===g.contactId&&r.date===g.date&&r.eventId===activeEventId&&!r.deleted)
+        .sort((a,b)=>a.time>b.time?1:-1);
+      const lastIdx = allRows.findIndex(r=>r.time===rows[rows.length-1].time&&r.pocRequired);
+      const nextRow = allRows[lastIdx+1];
+      const toTime = nextRow?.time || fromMins(toMins(rows[rows.length-1].time)+60);
+      const contact = contacts.find(c=>c.id===g.contactId);
+      return {
+        key:`${g.contactId}_${g.date}`,
+        contactId:g.contactId,
+        contactName:contact?displayName(contact):'—',
+        date:g.date, fromTime, toTime,
+      };
+    }).sort((a,b)=>a.date>b.date?1:a.date<b.date?-1:a.fromTime>b.fromTime?1:-1);
+  };
+
+  const requirements = getRequirements();
+  const reqDays = [...new Set(requirements.map(r=>r.date))].sort();
+  const day = selectedDay || reqDays[0];
+  const dayReqs = requirements.filter(r=>r.date===day);
+
+  const getAssignment = (contactId, day) =>
+    poc.find(p=>p.contactId===contactId&&p.day===day&&p.eventId===activeEventId);
+
+  async function assignPOC(req, volId) {
+    const existing = getAssignment(req.contactId, req.date);
+    if (existing?.frozen) { toast('Frozen — unfreeze first.'); return; }
+    await writeAssignment(req, volId);
+    const vol = vols.find(v=>v.id===volId);
+    toast(`${vol?.name||'POC'} assigned — ${req.fromTime}–${req.toTime}`);
+    setOpenDropdown(null);
+  }
+
+  async function writeAssignment(req, volId) {
+    const existing = getAssignment(req.contactId, req.date);
+    if (existing?.frozen) return;
+    const vol = vols.find(v=>v.id===volId);
+    const contact = contacts.find(c=>c.id===req.contactId);
+    await saveItem('poc',{
+      id: existing?.id||crypto.randomUUID(),
+      contactId:req.contactId, volunteerId:volId,
+      day:req.date, fromTime:req.fromTime, toTime:req.toTime,
+      slot:`${req.fromTime}–${req.toTime}`, status:'Active',
+      eventId:activeEventId, frozen:false,
+    });
+    if (contact&&vol) {
+      await saveItem('personalisedSchedule',{
+        id:`poc_auto_${req.contactId}_${req.date}`,
+        contactId:req.contactId, eventId:activeEventId,
+        date:req.date, time:req.fromTime,
+        event:`POC: ${vol.name}${vol.phone?' — '+vol.phone:''}`,
+        pocRequired:false, auto:true,
+      });
+    }
+  }
+
+  async function unassignPOC(req) {
+    const existing = getAssignment(req.contactId, req.date);
+    if (!existing||existing.frozen) { if(existing?.frozen) toast('Frozen — unfreeze first.'); return; }
+    await removeItem('poc', existing.id);
+    const psRec = personalised.find(r=>r.id===`poc_auto_${req.contactId}_${req.date}`);
+    if (psRec) await removeItem('personalisedSchedule', psRec.id);
+    toast('POC removed.');
+  }
+
+  async function toggleFreeze(req) {
+    const existing = getAssignment(req.contactId, req.date);
+    if (!existing) return;
+    await saveItem('poc',{...existing,frozen:!existing.frozen});
+    toast(existing.frozen?'Unfrozen.':'Frozen.');
+  }
+
+
+  /* ══ Warnings: computed live from requirements, assignments, availability and stay dates ══ */
+  const maxPerDay = parseInt((store.appConfig||[]).find(c=>c.id==='pocMaxPerDay')?.value) || 3;
+  const allContacts = store.contacts || [];
+  const logiAll = store.logistics || [];
+  const eventPoc = poc.filter(p=>p.eventId===activeEventId);
+  const overlaps = (a,b) => toMins(a.fromTime) < toMins(b.toTime) && toMins(b.fromTime) < toMins(a.toTime);
+  const issues = [];
+  const addIssue = (day, contactId, sev, text) => issues.push({ day, contactId, key:`${contactId}_${day}`, sev, text });
+  const cName = id => { const c = allContacts.find(x=>x.id===id); return c ? displayName(c) : 'Unknown guest'; };
+  requirements.forEach(r => { if (!getAssignment(r.contactId, r.date)) addIssue(r.date, r.contactId, 'bad', 'No POC assigned'); });
+  eventPoc.forEach(p => {
+    const vol = vols.find(v=>v.id===p.volunteerId);
+    const c = allContacts.find(x=>x.id===p.contactId);
+    if (!vol) addIssue(p.day, p.contactId, 'bad', 'Assigned volunteer no longer exists');
+    if (!c) addIssue(p.day, p.contactId, 'bad', 'Guest has been deleted');
+    else if (c.status !== 'Confirmed') addIssue(p.day, p.contactId, 'bad', `Guest is now ${c.status}`);
+    const req = requirements.find(r=>r.contactId===p.contactId && r.date===p.day);
+    if (!req) addIssue(p.day, p.contactId, 'warn', 'POC is no longer required for this day');
+    else if (p.fromTime && (p.fromTime !== req.fromTime || p.toTime !== req.toTime)) addIssue(p.day, p.contactId, 'warn', `Timing changed — now needed ${req.fromTime}–${req.toTime} (assigned ${p.fromTime}–${p.toTime})`);
+    if (vol) {
+      const va = getVolAvail(vol.id, p.day);
+      if (!va) addIssue(p.day, p.contactId, 'bad', `${vol.name} is not available on this day`);
+      else if (p.fromTime && (toMins(p.fromTime) < toMins(va.start) || toMins(p.toTime) > toMins(va.end))) addIssue(p.day, p.contactId, 'warn', `Outside ${vol.name}'s hours (${va.start}–${va.end})`);
+    }
+    const L = logiAll.find(l=>l.contactId===p.contactId) || {};
+    if ((L.arrivalDate && p.day < L.arrivalDate) || (L.departureDate && p.day > L.departureDate))
+      addIssue(p.day, p.contactId, 'bad', `Outside guest's stay (${L.arrivalDate||'?'} to ${L.departureDate||'?'})`);
+  });
+  // Double-booking and overload, per volunteer per day
+  const byVolDay = {};
+  eventPoc.filter(p=>p.fromTime&&p.toTime).forEach(p => { (byVolDay[p.volunteerId+'|'+p.day] = byVolDay[p.volunteerId+'|'+p.day] || []).push(p); });
+  Object.values(byVolDay).forEach(list => {
+    const vol = vols.find(v=>v.id===list[0].volunteerId);
+    list.forEach((a,i) => list.slice(i+1).forEach(b => {
+      if (overlaps(a,b)) {
+        addIssue(a.day, a.contactId, 'bad', `${vol?.name||'Volunteer'} double-booked with ${cName(b.contactId)}`);
+        addIssue(b.day, b.contactId, 'bad', `${vol?.name||'Volunteer'} double-booked with ${cName(a.contactId)}`);
+      }
+    }));
+    if (list.length > maxPerDay) list.forEach(p => addIssue(p.day, p.contactId, 'warn', `${vol?.name||'Volunteer'} has ${list.length} guests this day (limit ${maxPerDay})`));
+  });
+  const issuesFor = key => issues.filter(i=>i.key===key);
+  const badCount = issues.filter(i=>i.sev==='bad').length;
+
+  /* ══ Auto-assign: rule-based, most-constrained guest first, never touches frozen/existing ══ */
+  function planAuto(scopeDays) {
+    const busy = {}, count = {}, total = {};
+    eventPoc.forEach(p => {
+      const k = p.volunteerId+'|'+p.day;
+      if (p.fromTime&&p.toTime) (busy[k] = busy[k] || []).push({ fromTime:p.fromTime, toTime:p.toTime });
+      count[k] = (count[k]||0) + 1; total[p.volunteerId] = (total[p.volunteerId]||0) + 1;
+    });
+    const chosen = {}; // contactId -> Set(volId) used on other days, for continuity
+    eventPoc.forEach(p => { (chosen[p.contactId] = chosen[p.contactId] || new Set()).add(p.volunteerId); });
+    const candidates = r => pocVols.filter(v => {
+      const va = getVolAvail(v.id, r.date); if (!va) return false;
+      if (toMins(va.start) > toMins(r.fromTime) || toMins(va.end) < toMins(r.toTime)) return false;
+      const k = v.id+'|'+r.date;
+      if ((busy[k]||[]).some(w => overlaps(w, r))) return false;
+      return (count[k]||0) < maxPerDay;
+    });
+    const open = requirements.filter(r => scopeDays.includes(r.date) && !getAssignment(r.contactId, r.date));
+    const ordered = open.map(r => ({ r, n: candidates(r).length })).sort((a,b) => a.n - b.n || (a.r.date > b.r.date ? 1 : -1));
+    const out = [];
+    for (const { r } of ordered) {
+      const cs = candidates(r);
+      if (!cs.length) { out.push({ req:r, volId:'', options:[], reason:'Nobody in the POC team is free for this whole window' }); continue; }
+      const score = v => ((chosen[r.contactId]?.has(v.id)) ? 1000 : 0) - 10*(count[v.id+'|'+r.date]||0) - (total[v.id]||0);
+      const best = [...cs].sort((a,b) => score(b) - score(a))[0];
+      const k = best.id+'|'+r.date;
+      (busy[k] = busy[k] || []).push({ fromTime:r.fromTime, toTime:r.toTime });
+      count[k] = (count[k]||0) + 1; total[best.id] = (total[best.id]||0) + 1;
+      (chosen[r.contactId] = chosen[r.contactId] || new Set()).add(best.id);
+      const cont = eventPoc.some(p => p.contactId===r.contactId && p.volunteerId===best.id) || out.some(o => o.req.contactId===r.contactId && o.volId===best.id);
+      out.push({ req:r, volId:best.id, options:cs.map(v=>v.id),
+        reason: cont ? 'Same POC as their other day' : `Least busy (${(count[k]||1)-1} other guest${(count[k]||1)-1===1?'':'s'} that day)` });
+    }
+    return out.sort((a,b) => a.req.date !== b.req.date ? (a.req.date > b.req.date ? 1 : -1) : (a.req.fromTime > b.req.fromTime ? 1 : -1));
+  }
+
+  async function applyPlan(rows) {
+    let n = 0;
+    for (const row of rows) { if (row.volId) { await writeAssignment(row.req, row.volId); n++; } }
+    toast(n ? `Assigned ${n} POC${n>1?'s':''}.` : 'Nothing assigned.');
+    setAutoOpen(false);
+  }
+
+  if (!requirements.length) return (
+    <>
+      <div className="page-head">
+        <div className="ph-txt"><h1>POC Allocation</h1><p>Assign volunteers to panelists as Points of Contact per day.</p></div>
+      </div>
+      <div className="panel panel-pad">
+        <Empty title="No POC requirements yet" sub="Tick 'POC Required' on rows in Personalised Schedule and save to see requirements here."/>
+      </div>
+    </>
+  );
+
+  return (
+    <>
+      <div className="page-head">
+        <div className="ph-txt">
+          <h1>POC Allocation</h1>
+          <p>Assign Point of Contact volunteers to panelists per day. Warnings update live as schedules, availability and travel change.</p>
+        </div>
+        <label className="poc-limit" title="Warn when a volunteer has more guests than this in one day">
+          Max guests per POC/day
+          <select className="statsel" value={maxPerDay} disabled={!can('settings.config')}
+            onChange={async e=>{ await saveItem('appConfig',{id:'pocMaxPerDay',value:String(e.target.value)}); toast('Limit updated.'); }}>
+            {[1,2,3,4,5,6,8,10].map(n=><option key={n} value={n}>{n}</option>)}
+          </select>
+        </label>
+        {can('poc.assign') && <button className="btn primary" onClick={()=>setAutoOpen(true)}>⚡ Auto-assign</button>}
+      </div>
+
+      <div className={'poc-issues' + (issues.length ? (badCount ? ' bad' : ' warn') : ' ok')}>
+        <button className="poc-issues-head" onClick={()=>setShowIssues(v=>!v)} disabled={!issues.length}>
+          {issues.length ? <>⚠ {issues.length} issue{issues.length>1?'s':''}{badCount ? ` · ${badCount} need action` : ''}</> : <>✓ No issues — every POC need is covered and consistent</>}
+          {issues.length > 0 && <span style={{marginLeft:'auto'}}>{showIssues ? 'Hide' : 'Show'}</span>}
+        </button>
+        {showIssues && issues.length > 0 && (
+          <div className="poc-issues-list">
+            {[...issues].sort((a,b)=> (a.sev===b.sev?0:a.sev==='bad'?-1:1) || (a.day>b.day?1:-1)).map((i,idx)=>(
+              <button key={idx} className={'poc-issue ' + i.sev} onClick={()=>{ setSelectedDay(i.day); setShowIssues(false); }}>
+                <span className="mono">{shortDate(i.day)}</span><b>{cName(i.contactId)}</b><span>{i.text}</span>
+              </button>
+            ))}
           </div>
-        </div>;
-      })}
+        )}
+      </div>
+
+      <div className="poc-layout">
+
+        {/* Day selector */}
+        <div className="poc-days">
+          <div className="poc-days-label">Day</div>
+          {reqDays.map(d=>(
+            <button key={d} onClick={()=>{ setSelectedDay(d); setOpenDropdown(null); }}
+              style={{width:'100%',textAlign:'left',padding:'8px 12px',borderRadius:8,marginBottom:4,border:'none',
+                background:d===day?'var(--teal)':'var(--paper)',
+                color:d===day?'#fff':'var(--ink)',cursor:'pointer',fontSize:12.5,fontWeight:500}}>
+              {fmtDate(d)}
+              <span style={{float:'right',fontSize:11,opacity:.7}}>
+                {requirements.filter(r=>r.date===d).length}
+                {issues.some(i=>i.day===d&&i.sev==='bad') && <span style={{color:d===day?'#fff':'var(--rose)',marginLeft:4}}>⚠</span>}
+              </span>
+            </button>
+          ))}
+        </div>
+
+        {/* Main table */}
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{fontWeight:600,fontSize:13,color:'var(--teal)',marginBottom:12}}>{fmtDate(day)}</div>
+
+          {dayReqs.length===0
+            ? <div className="panel panel-pad"><p className="muted-sm">No POC requirements for {fmtDate(day)}.</p></div>
+            : <div className="panel"><div className="panel-body">
+                <table style={{width:'100%',borderCollapse:'collapse',fontSize:13,minWidth:560}}>
+                  <thead>
+                    <tr style={{background:'var(--teal-wash)'}}>
+                      <th style={{padding:'10px 14px',textAlign:'left',width:'28%'}}>Panelist</th>
+                      <th style={{padding:'10px 14px',textAlign:'left',width:'14%'}}>POC Window</th>
+                      <th style={{padding:'10px 14px',textAlign:'left',width:'36%'}}>Assigned POC</th>
+                      <th style={{padding:'10px 14px',textAlign:'left',width:'22%'}}>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {dayReqs.map((req,ri)=>{
+                      const assignment  = getAssignment(req.contactId, day);
+                      const assignedVol = assignment ? vols.find(v=>v.id===assignment.volunteerId) : null;
+                      const isOpen      = openDropdown===req.key;
+                      const availVols   = pocVols.filter(v=>getVolAvail(v.id,day));
+
+                      return (
+                        <React.Fragment key={req.key}>
+                          <tr style={{borderBottom:isOpen?'none':'1px solid var(--line)',background:ri%2===0?'#fff':'#fafaf7'}}>
+                            {/* Panelist */}
+                            <td style={{padding:'10px 14px'}}>
+                              <div className="nm" style={{fontSize:13}}>{req.contactName}</div>
+                              {issuesFor(req.key).filter(i=>i.text!=='No POC assigned').map((i,ix)=>(
+                                <div key={ix} className={'mtg-flag' + (i.sev==='bad'?' bad':'')} style={{display:'block'}}>⚠ {i.text}</div>
+                              ))}
+                            </td>
+
+                            {/* Window */}
+                            <td style={{padding:'10px 14px'}}>
+                              <span style={{fontSize:12.5,fontWeight:600,color:'var(--teal)',whiteSpace:'nowrap'}}>
+                                {req.fromTime} – {req.toTime}
+                              </span>
+                            </td>
+
+                            {/* Assigned POC / dropdown trigger */}
+                            <td style={{padding:'10px 14px',position:'relative'}}>
+                              {assignment?.frozen ? (
+                                /* Frozen — show name, no dropdown */
+                                <div style={{display:'flex',alignItems:'center',gap:8}}>
+                                  <div style={{width:28,height:28,borderRadius:'50%',background:'var(--teal)',
+                                    color:'#fff',display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,fontWeight:700}}>
+                                    {initials(assignedVol?.name||'?')}
+                                  </div>
+                                  <div>
+                                    <div style={{fontSize:12.5,fontWeight:500}}>{assignedVol?.name||'—'}</div>
+                                    {assignedVol?.phone&&<div style={{fontSize:11,color:'var(--muted)'}}>{assignedVol.phone}</div>}
+                                  </div>
+                                  <span style={{fontSize:13,marginLeft:4}} title="Frozen">🔒</span>
+                                </div>
+                              ) : (
+                                /* Dropdown trigger */
+                                <button
+                                  onClick={()=>setOpenDropdown(isOpen?null:req.key)}
+                                  style={{
+                                    width:'100%',textAlign:'left',padding:'7px 10px',
+                                    border:`1px solid ${assignment?'var(--teal)':'var(--line)'}`,
+                                    borderRadius:8,background:assignment?'var(--teal-wash)':'#fff',
+                                    cursor:'pointer',display:'flex',alignItems:'center',gap:8,
+                                    color:'var(--ink)',fontSize:12.5,
+                                  }}>
+                                  {assignedVol ? (
+                                    <>
+                                      <div style={{width:22,height:22,borderRadius:'50%',background:'var(--teal)',
+                                        color:'#fff',display:'flex',alignItems:'center',justifyContent:'center',
+                                        fontSize:9,fontWeight:700,flexShrink:0}}>
+                                        {initials(assignedVol.name)}
+                                      </div>
+                                      <div style={{flex:1,minWidth:0}}>
+                                        <div style={{fontWeight:500,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{assignedVol.name}</div>
+                                        {assignedVol.phone&&<div style={{fontSize:11,color:'var(--muted)'}}>{assignedVol.phone}</div>}
+                                      </div>
+                                      <span style={{fontSize:11,color:'var(--teal)',fontWeight:600}}>✓</span>
+                                    </>
+                                  ) : (
+                                    <span style={{color:'var(--muted)'}}>Select volunteer…</span>
+                                  )}
+                                  <span style={{marginLeft:'auto',fontSize:11,color:'var(--muted)'}}>▾</span>
+                                </button>
+                              )}
+                            </td>
+
+                            {/* Actions */}
+                            <td style={{padding:'10px 14px'}}>
+                              <div className="rowacts">
+                                {assignment&&(
+                                  <button className={`btn ghost xs`}
+                                    onClick={()=>toggleFreeze(req)}
+                                    style={{color:assignment.frozen?'var(--teal)':'var(--muted)'}}
+                                    title={assignment.frozen?'Unfreeze':'Freeze'}>
+                                    {assignment.frozen?'🔓':'🔒'}
+                                  </button>
+                                )}
+                                {assignment&&!assignment.frozen&&(
+                                  <button className="btn ghost xs" style={{color:'var(--rose)'}}
+                                    onClick={()=>unassignPOC(req)} title="Remove POC">{ICON.trash}</button>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+
+                          {/* Inline dropdown */}
+                          {isOpen && (
+                            <tr style={{borderBottom:'1px solid var(--line)'}}>
+                              <td colSpan={4} style={{padding:0,background:'#FAFAF7'}}>
+                                <div style={{padding:'8px 14px 12px',borderTop:'1px solid var(--line)'}}>
+                                  <div style={{fontSize:11.5,color:'var(--muted)',marginBottom:8,fontWeight:500}}>
+                                    Select POC for {req.fromTime}–{req.toTime}
+                                    {availVols.length===0&&<span style={{color:'var(--amber)',marginLeft:8}}>— No volunteers available</span>}
+                                  </div>
+                                  <div style={{display:'flex',flexWrap:'wrap',gap:6}}>
+                                    {availVols.map(v=>{
+                                      const va = getVolAvail(v.id, day);
+                                      const covers = canCover(v.id, day, req.fromTime, req.toTime);
+                                      const assigned = !covers && getVolAssignments(v.id,day).length>0;
+                                      const free = getFreeSlots(v.id,day);
+                                      const isCurrentlyAssigned = assignment?.volunteerId===v.id;
+                                      const totalMins = toMins(va.end)-toMins(va.start);
+
+                                      return (
+                                        <div key={v.id}
+                                          onClick={()=>{
+                                            if(!covers&&!isCurrentlyAssigned) return;
+                                            setConfirmAssign({req,vol:v});
+                                            setOpenDropdown(null);
+                                          }}
+                                          style={{
+                                            padding:'8px 12px',borderRadius:8,border:`1px solid ${isCurrentlyAssigned?'var(--teal)':covers?'var(--line)':'var(--line)'}`,
+                                            background:isCurrentlyAssigned?'var(--teal-wash)':covers?'#fff':'#f5f5f5',
+                                            opacity:covers||isCurrentlyAssigned?1:0.5,
+                                            cursor:covers||isCurrentlyAssigned?'pointer':'not-allowed',
+                                            minWidth:160,maxWidth:220,
+                                          }}
+                                          title={covers?`Assign ${v.name}`:assigned?`${v.name} already assigned elsewhere`:`${v.name} not available for this window`}>
+                                          {/* Name row */}
+                                          <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:5}}>
+                                            <div style={{width:24,height:24,borderRadius:'50%',background:covers||isCurrentlyAssigned?'var(--teal)':'#999',
+                                              color:'#fff',display:'flex',alignItems:'center',justifyContent:'center',fontSize:9,fontWeight:700,flexShrink:0}}>
+                                              {initials(v.name)}
+                                            </div>
+                                            <div style={{flex:1,minWidth:0}}>
+                                              <div style={{fontSize:12,fontWeight:500,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{v.name}</div>
+                                              <div style={{fontSize:10,color:'var(--muted)'}}>{va.start}–{va.end}</div>
+                                            </div>
+                                            {isCurrentlyAssigned&&<span style={{fontSize:10,color:'var(--teal)',fontWeight:700}}>✓</span>}
+                                          </div>
+                                          {/* Mini timeline bar */}
+                                          <div style={{position:'relative',height:5,background:'#E8E8E8',borderRadius:3,overflow:'hidden',marginBottom:3}}>
+                                            {getVolAssignments(v.id,day).map((a,i)=>{
+                                              const left=((a.from-toMins(va.start))/totalMins)*100;
+                                              const width=((a.to-a.from)/totalMins)*100;
+                                              return <div key={i} style={{position:'absolute',left:`${left}%`,width:`${width}%`,height:'100%',background:a.contactId===req.contactId?'var(--teal)':'#aaa',borderRadius:2}}/>;
+                                            })}
+                                            {/* Requirement window marker */}
+                                            {(()=>{
+                                              const rf=toMins(req.fromTime),rt=toMins(req.toTime);
+                                              const l=((rf-toMins(va.start))/totalMins)*100;
+                                              const w=((rt-rf)/totalMins)*100;
+                                              return <div style={{position:'absolute',left:`${l}%`,width:`${w}%`,height:'100%',border:'1.5px solid var(--amber)',borderRadius:2,boxSizing:'border-box'}}/>;
+                                            })()}
+                                          </div>
+                                          {/* Free slots */}
+                                          <div style={{fontSize:9.5,color:'var(--muted)'}}>
+                                            {free.filter(s=>s.to>s.from).map((s,i)=>(
+                                              <span key={i}>{i>0?' · ':''}{fromMins(s.from)}–{fromMins(s.to)}</span>
+                                            ))}
+                                            {free.filter(s=>s.to>s.from).length===0&&<span style={{color:'var(--rose)'}}>Fully assigned</span>}
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                  <button className="btn ghost xs" style={{marginTop:8,color:'var(--muted)'}}
+                                    onClick={()=>setOpenDropdown(null)}>Cancel</button>
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </React.Fragment>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div></div>
+          }
+        </div>
+      </div>
+
+      {/* Confirm assign modal */}
+      {confirmAssign && (
+        <div className="scrim" onMouseDown={()=>setConfirmAssign(null)}>
+          <div className="modal" onMouseDown={e=>e.stopPropagation()} style={{maxWidth:380}}>
+            <div className="modal-head">
+              <h2>Assign POC?</h2>
+              <button className="x" onClick={()=>setConfirmAssign(null)}>✕</button>
+            </div>
+            <div className="modal-body">
+              <p style={{fontSize:13,marginBottom:8}}>Assign <strong>{confirmAssign.vol.name}</strong> as POC for</p>
+              <p style={{fontSize:13,marginBottom:4}}><strong>{confirmAssign.req.contactName}</strong></p>
+              <p style={{fontSize:13,color:'var(--teal)',fontWeight:600}}>
+                {fmtDate(confirmAssign.req.date)} · {confirmAssign.req.fromTime} – {confirmAssign.req.toTime}
+              </p>
+              {confirmAssign.vol.phone&&<p style={{fontSize:12,color:'var(--muted)',marginTop:4}}>Contact: {confirmAssign.vol.phone}</p>}
+            </div>
+            <div className="modal-foot">
+              <button className="btn" onClick={()=>setConfirmAssign(null)}>Cancel</button>
+              <button className="btn primary" onClick={async()=>{
+                await assignPOC(confirmAssign.req, confirmAssign.vol.id);
+                setConfirmAssign(null);
+              }}>Yes, Assign</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {autoOpen && <PocAutoAssignModal plan={planAuto} days={reqDays} day={day} vols={vols} cName={cName}
+        onApply={applyPlan} onClose={()=>setAutoOpen(false)} />}
     </>
   );
 }
 
-/* ============================ GENERIC IMPORT MODAL ============================ */
+/* ── POC auto-assign preview: nothing is saved until Apply ── */
+function PocAutoAssignModal({ plan, days, day, vols, cName, onApply, onClose }) {
+  const [scope, setScope] = useState('day');
+  const [rows, setRows] = useState(() => plan([day]));
+  const [busy, setBusy] = useState(false);
+  useEffect(() => { setRows(plan(scope === 'day' ? [day] : days)); /* eslint-disable-next-line */ }, [scope]);
+  const vName = id => vols.find(v => v.id === id)?.name || '—';
+  const willAssign = rows.filter(r => r.volId).length;
+  const noOne = rows.filter(r => !r.options.length).length;
+  return (
+    <Modal title="Auto-assign POCs" onClose={onClose} footer={null}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 10 }}>
+        <div className="seg" role="group" aria-label="Scope">
+          <button type="button" className={scope === 'day' ? 'on' : ''} onClick={() => setScope('day')}>{fmtDate(day)}</button>
+          <button type="button" className={scope === 'all' ? 'on' : ''} onClick={() => setScope('all')}>All days</button>
+        </div>
+        <span className="muted-sm">Only unassigned guests. Frozen and existing POCs are never changed.</span>
+      </div>
+      <p className="muted-sm" style={{ margin: '0 0 10px' }}>
+        Picks volunteers from the POC department who are available for the whole window and free at that time,
+        preferring the same POC a guest has on other days, then whoever is least busy. Change any pick before applying.
+      </p>
+      {!rows.length ? <Empty title="Nothing to assign" sub="Every POC need in this range already has someone." /> : (
+        <div style={{ maxHeight: '46vh', overflow: 'auto', border: '1px solid var(--line)', borderRadius: 8 }}>
+          <table className="import-tbl"><thead><tr><th>Guest</th><th>Window</th><th>POC</th></tr></thead><tbody>
+            {rows.map((r, i) => (
+              <tr key={r.req.key}>
+                <td><b>{cName(r.req.contactId)}</b>{scope === 'all' && <div className="muted-sm">{shortDate(r.req.date)}</div>}</td>
+                <td className="mono" style={{ whiteSpace: 'nowrap' }}>{r.req.fromTime}–{r.req.toTime}</td>
+                <td>
+                  {r.options.length ? (
+                    <>
+                      <select className="input" style={{ padding: '4px 6px', fontSize: 12.5 }} value={r.volId}
+                        onChange={e => setRows(p => p.map((x, j) => j === i ? { ...x, volId: e.target.value, reason: e.target.value ? 'Chosen by you' : 'Skipped' } : x))}>
+                        <option value="">Skip</option>
+                        {r.options.map(id => <option key={id} value={id}>{vName(id)}</option>)}
+                      </select>
+                      <div className="muted-sm" style={{ fontSize: 11, marginTop: 2 }}>{r.reason}</div>
+                    </>
+                  ) : <span className="mtg-flag bad">⚠ {r.reason}</span>}
+                </td>
+              </tr>
+            ))}
+          </tbody></table>
+        </div>
+      )}
+      {noOne > 0 && <div className="mtg-note" style={{ marginTop: 10 }}>⚠ {noOne} guest{noOne > 1 ? 's' : ''} can't be covered. Add volunteers to the POC department or widen their availability.</div>}
+      <div className="modal-foot" style={{ padding: '12px 0 0' }}>
+        <button className="btn" onClick={onClose}>Cancel</button>
+        <button className="btn primary" disabled={busy || !willAssign} onClick={async () => { setBusy(true); await onApply(rows); }}>
+          {busy ? 'Assigning…' : `Apply ${willAssign} assignment${willAssign === 1 ? '' : 's'}`}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+
+
 export function GenericImportModal({ title, store, activeEventId, onClose, toast,
   parseFile, planFn, existingItems, itemLabel, buildItem }) {
   const [step, setStep] = useState('choose');
@@ -1190,13 +5307,14 @@ export function ScheduleEmailModal({ contact, scheduleHtml, onClose, toast }) {
 /* ============================ FEATURE 6: EVENT DAY CHECKLIST ============================ */
 export function EventDayChecklist({ store, activeEventId }) {
   const toast = useToast();
+  const { can } = usePerm();
   const { user, profile } = (typeof useAuth === 'function') ? useAuth() : {user:null,profile:null};
   const contacts = (store.contacts||[]).filter(c=>c.status==='Confirmed');
   const poc = store.poc||[];
   const vols = store.volunteers||[];
   const checklists = store.checklist||[];
 
-  const today = new Date().toISOString().slice(0,10);
+  const today = todayISO();
 
   // If current user is a volunteer/POC, filter to only their assigned VIPs today
   const myVolId = vols.find(v=>v.phone===profile?.phone||v.name?.toLowerCase()===profile?.email?.split('@')[0]?.toLowerCase())?.id;
@@ -1215,6 +5333,7 @@ export function EventDayChecklist({ store, activeEventId }) {
   const getChecklist = cid => checklists.find(cl=>cl.contactId===cid&&cl.eventId===activeEventId) || {contactId:cid,eventId:activeEventId};
 
   async function toggle(c, stepKey) {
+    if (!can('checklist.edit')) { return; }
     const cl = getChecklist(c.id);
     const cur = cl[stepKey];
     const updated = {
@@ -1294,6 +5413,7 @@ export function ContactNotesModal({ contact, store, activeEventId, onClose }) {
   const NOTE_TYPES = ['Call','WhatsApp','Email','Meeting','Other'];
   const typeColor = t => ({Call:'var(--teal)',WhatsApp:'#25D366',Email:'var(--blue)',Meeting:'var(--purple)',Other:'var(--muted)'}[t]||'var(--muted)');
 
+  const [dueDate, setDueDate] = useState('');
   async function addNote() {
     if (!text.trim()) return;
     setBusy(true);
@@ -1303,23 +5423,31 @@ export function ContactNotesModal({ contact, store, activeEventId, onClose }) {
         eventId: activeEventId,
         text: text.trim(),
         type,
+        dueDate: dueDate || null,
+        done: false,
         createdAt: {seconds: Math.floor(Date.now()/1000)},
-        date: new Date().toISOString().slice(0,10),
+        date: todayISO(),
       });
-      setText(''); toast('Note added.');
+      setText(''); setDueDate(''); toast('Note added.');
     } finally { setBusy(false); }
   }
 
   return (
     <Modal title={`Follow-up log — ${displayName(contact)}`} onClose={onClose} footer={null}>
-      <div style={{display:'flex',gap:8,marginBottom:14}}>
+      <div style={{display:'flex',gap:8,marginBottom:8,flexWrap:'wrap'}}>
         <select className="statsel" value={type} onChange={e=>setType(e.target.value)} style={{width:'auto'}}>
           {NOTE_TYPES.map(t=><option key={t}>{t}</option>)}
         </select>
-        <input className="input" style={{flex:1}} value={text} onChange={e=>setText(e.target.value)}
+        <input className="input" style={{flex:1,minWidth:160}} value={text} onChange={e=>setText(e.target.value)}
           placeholder="e.g. Called, said will confirm by Friday…"
           onKeyDown={e=>e.key==='Enter'&&addNote()}/>
         <button className="btn primary sm" onClick={addNote} disabled={busy||!text.trim()}>Add</button>
+      </div>
+      <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:14}}>
+        <span style={{fontSize:12,color:'var(--muted)',whiteSpace:'nowrap'}}>📅 Follow-up due:</span>
+        <input className="input" type="date" value={dueDate} onChange={e=>setDueDate(e.target.value)} style={{width:160}}/>
+        {dueDate&&<button className="btn ghost xs" onClick={()=>setDueDate('')}>Clear</button>}
+        <span style={{fontSize:11.5,color:'var(--faint)'}}>Optional — shows on dashboard if set</span>
       </div>
       <div style={{maxHeight:'50vh',overflow:'auto',display:'flex',flexDirection:'column',gap:8}}>
         {notes.map(n=>(
@@ -1347,7 +5475,7 @@ export function DuplicateWarningModal({ incoming, existing, onSaveAnyway, onCanc
       <div style={{background:'var(--amber-wash)',borderRadius:9,padding:'10px 14px',fontSize:13,color:'var(--amber)',marginBottom:14,fontWeight:500}}>
         ⚠ This contact looks similar to one that already exists.
       </div>
-      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12,marginBottom:16}}>
+      <div className="split-2" style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12,marginBottom:16}}>
         <div style={{background:'#F9F8F4',borderRadius:9,padding:'12px 14px',border:'1px solid var(--line)'}}>
           <div style={{fontSize:11,fontWeight:700,color:'var(--muted)',marginBottom:6,textTransform:'uppercase',letterSpacing:'.06em'}}>New contact</div>
           <div style={{fontWeight:600,fontSize:14}}>{incoming.name}</div>
@@ -1490,7 +5618,7 @@ export function DepartmentMaster({ store }) {
 /* ============================ FEATURE 14: MULTI-EVENT DASHBOARD ============================ */
 export function AllEventsDashboard({ rawStore }) {
   const events = rawStore.events||[];
-  const today = new Date().toISOString().slice(0,10);
+  const today = todayISO();
 
   function daysUntil(dateStr) {
     if (!dateStr) return null;
@@ -1590,7 +5718,7 @@ export function VolunteerView({ store, activeEventId, go }) {
   const tasks = store.tasks||[];
   const contacts = store.contacts||[];
   const checklists = store.checklist||[];
-  const today = new Date().toISOString().slice(0,10);
+  const today = todayISO();
 
   // Find this volunteer by matching email prefix to name
   const myVol = vols.find(v=>v.name?.toLowerCase()===profile?.email?.split('@')[0]?.toLowerCase())
@@ -1733,7 +5861,7 @@ export function NotificationBell({ store, profile }) {
         )}
       </button>
       {open && (
-        <div style={{
+        <div className="notif-pop" style={{
           position: 'absolute', right: 0, top: '100%', marginTop: 8,
           width: 340, background: '#fff', borderRadius: 12, border: '1px solid var(--line)',
           boxShadow: '0 12px 40px rgba(0,0,0,.18)', zIndex: 60, overflow: 'hidden',
@@ -1784,7 +5912,7 @@ export function ExportData({ store, rawStore }) {
       const ws = XLSX.utils.json_to_sheet(data);
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, name);
-      XLSX.writeFile(wb, `VK_${name}_${new Date().toISOString().slice(0,10)}.xlsx`);
+      XLSX.writeFile(wb, `VK_${name}_${todayISO()}.xlsx`);
       toast(`${name} exported.`);
     });
   }
@@ -1803,35 +5931,31 @@ export function ExportData({ store, rawStore }) {
   const contactName = id => { const c = contacts.find(x => x.id === id); return c ? displayName(c) : ''; };
 
   const EXPORTS = [
-    {
-      label: 'Contacts (Outreach)',
-      icon: '📋',
-      count: contacts.length,
-      run: () => exportSheet('Contacts', contacts, [
-        ['name','Name'], ['honor','Honorific'], ['desig','Designation'], ['org','Organisation'],
-        ['field','Field'], ['phone','Phone'], ['email','Email'],
-        ['liaisonName','POC / Liaison'], ['liaisonPhone','Liaison Phone'],
-        ['type','Type'], ['status','Confirmation Status'], ['remark','Remarks'],
-      ]),
-    },
+
     {
       label: 'Logistics',
       icon: '✈️',
       count: logi.length,
+      cols: [['name','Guest Name'],['inbMode','Arrival Mode'],['inbDate','Arrival Date'],['inbTime','Arrival Time'],['inbLoc','Arrival Location'],['hotel','Hotel'],['checkin','Check-in Time'],['outDate','Departure Date'],['outDepart','Departs for Airport'],['outFlight','Outbound Flight'],['special','Special Requirements']],
+      get allRows() { return logi.map(L => ({...L, name: contactName(L.contactId || L.id)})); },
       run: () => exportSheet('Logistics', logi.map(L => ({
         ...L, name: contactName(L.contactId || L.id),
       })), [
-        ['name','Guest Name'], ['inbMode','Arrival Mode'], ['inbDate','Arrival Date'],
-        ['inbTime','Arrival Time'], ['inbLoc','Arrival Location'],
-        ['hotel','Hotel'], ['checkin','Check-in Time'],
-        ['outDate','Departure Date'], ['outDepart','Departs for Airport'],
-        ['outFlight','Outbound Flight'], ['special','Special Requirements'],
+        ['name','Guest Name'],
+        ['arrivalDate','Arrival Date'], ['arrivalTime','Arrival Time'], ['arrivalFlight','Arrival Flight'],
+        ['hotelName','Hotel'], ['hotelCheckIn','Hotel Check-in'], ['hotelCheckOut','Hotel Check-out'],
+        ['departureDate','Departure Date'], ['departureTime','Departure Time'], ['departureFlight','Departure Flight'],
+        ['departureFrom','Departure From'],
+        ['flightReq','Flight Required'], ['accomReq','Accommodation Required'], ['carReq','Car Required'],
+        ['remarks','Special Requirements'],
       ]),
     },
     {
       label: 'Event Schedule',
       icon: '🗓️',
       count: sessions.length,
+      cols: [['date','Date'],['start','Start Time'],['end','End Time'],['title','Session Title'],['topic','Topic'],['type','Type']],
+      get allRows() { return sessions; },
       run: () => exportSheet('Sessions', sessions, [
         ['date','Date'], ['start','Start Time'], ['end','End Time'],
         ['title','Session Title'], ['topic','Topic'], ['type','Type'],
@@ -1841,8 +5965,10 @@ export function ExportData({ store, rawStore }) {
       label: 'Volunteers',
       icon: '👥',
       count: vols.length,
+      cols: [['name','Name'],['phone','Phone'],['city','City'],['area','Area']],
+      get allRows() { return vols; },
       run: () => exportSheet('Volunteers', vols, [
-        ['name','Name'], ['phone','Phone'], ['city','City'], ['skills','Skills'],
+        ['name','Name'], ['phone','Phone'], ['city','City'], ['area','Area'],
       ]),
     },
     {
@@ -1862,6 +5988,8 @@ export function ExportData({ store, rawStore }) {
       label: 'Tasks',
       icon: '✅',
       count: tasks.length,
+      cols: [['title','Task'],['deptName','Department'],['assigneeName','Owner'],['due','Due Date'],['status','Status'],['notes','Notes']],
+      get allRows() { return tasks.map(t=>({...t,deptName:deptName(t.deptId),assigneeName:volName(t.assigneeId)})); },
       run: () => exportSheet('Tasks', tasks.map(t => ({
         ...t,
         deptName: deptName(t.deptId),
@@ -1871,29 +5999,8 @@ export function ExportData({ store, rawStore }) {
         ['due','Due Date'], ['status','Status'], ['notes','Notes'],
       ]),
     },
-    {
-      label: 'Felicitation Kits',
-      icon: '🎁',
-      count: kits.length,
-      run: () => exportSheet('Felicitation', kits.map(k => ({
-        ...k, guestName: contactName(k.contactId),
-      })), [
-        ['guestName','Guest'], ['momento','Momento ✓'], ['shawl','Shawl ✓'],
-        ['kumkum','Kumkum ✓'], ['cover','Cover ✓'],
-        ['gold_coin','Gold Coin ✓'], ['silver_coin','Silver Coin ✓'], ['frame','Frame ✓'],
-      ]),
-    },
-    {
-      label: 'Full backup (all contacts)',
-      icon: '💾',
-      count: (rawStore.contacts || []).length,
-      run: () => exportSheet('AllContacts_Backup', rawStore.contacts || [], [
-        ['name','Name'], ['honor','Honorific'], ['desig','Designation'], ['org','Organisation'],
-        ['field','Field'], ['phone','Phone'], ['email','Email'],
-        ['liaisonName','POC'], ['type','Type'], ['status','Status'], ['remark','Remarks'],
-        ['eventId','Event ID'],
-      ]),
-    },
+
+
   ];
 
   return (
@@ -1901,7 +6008,27 @@ export function ExportData({ store, rawStore }) {
       <div className="page-head"><div className="ph-txt">
         <h1>Export Data</h1>
         <p>Download any module as an Excel file — for sharing, reporting or backup. All exports include the data for the currently active event.</p>
-      </div></div>
+      </div>
+        <button className="btn primary sm" onClick={() => {
+          import('xlsx').then(XLSX => {
+            const wb = XLSX.utils.book_new();
+            EXPORTS.forEach(ex => {
+              if (!ex.allRows || !ex.allRows.length) return;
+              const data = ex.allRows.map(r => {
+                const o = {};
+                ex.cols.forEach(([key, label]) => { o[label] = r[key] ?? ''; });
+                return o;
+              });
+              const ws = XLSX.utils.json_to_sheet(data);
+              XLSX.utils.book_append_sheet(wb, ws, ex.label.slice(0,31));
+            });
+            XLSX.writeFile(wb, 'VK_JYOT_Full_Export_' + todayISO() + '.xlsx');
+            toast('Full export downloaded.');
+          });
+        }}>
+          💾 Export all sheets
+        </button>
+      </div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(280px,1fr))', gap: 14 }}>
         {EXPORTS.map((ex, i) => (
           <div key={i} style={{
@@ -1924,18 +6051,196 @@ export function ExportData({ store, rawStore }) {
 }
 
 /* ============================ FEATURE 19: HELP & GUIDE ============================ */
+/* ══ VK Personalised Schedule — exact document format ═══════════════
+   Matches the VK4 template: header banner, guest name, two-col table,
+   date rows spanning full width, hotel at bottom, footer banner.
+═══════════════════════════════════════════════════════════════════════ */
+export function VKSchedulePrint({ contact, store, activeEventId, onClose }) {
+  const logistics   = store.logistics   || [];
+  const sessions    = store.sessions    || [];
+  const assignments = store.assignments || [];
+  const founder     = store.founder     || [];
+  const personalised = store.personalisedSchedule || [];
+
+  const L = logistics.find(l => l.contactId === contact.id) || {};
+  const sahebji = founder.find(f => f.contactId === contact.id);
+
+  // Build schedule rows from personalisedSchedule rows + auto session rows
+  const allRows = [];
+
+  // Auto rows from assignments
+  const assignedSessionIds = assignments.filter(a => a.contactId === contact.id).map(a => a.sessionId);
+  const assignedSessions = sessions.filter(s => assignedSessionIds.includes(s.id));
+
+  // Auto rows from personalisedSchedule — exclude POC auto rows from print
+  const savedRows = personalised.filter(r => r.contactId === contact.id && !r.id?.startsWith('poc_auto_'));
+
+  // Merge: saved rows take precedence, add session rows if not already there
+  const rowsWithDates = [];
+
+  savedRows.forEach(r => {
+    if (r.date && r.time && r.event) {
+      rowsWithDates.push({ date: r.date, time: r.time, event: r.event, auto: !!r.auto });
+    }
+  });
+
+  // Add logistics rows
+  if (L.arrivalDate && L.arrivalFlightTime) {
+    rowsWithDates.push({ date: L.arrivalFlightDate || L.arrivalDate, time: L.arrivalFlightTime, event: `Arrival at ${L.arrivalLocation || 'Mumbai Airport'}` });
+  }
+  if (L.arrivalDate && L.arrivalTime) {
+    rowsWithDates.push({ date: L.arrivalDate, time: L.arrivalTime, event: `Journey towards Hotel` });
+  }
+  if (L.departureDate && L.departureTime) {
+    rowsWithDates.push({ date: L.departureDate, time: L.departureTime, event: 'Departure towards Airport' });
+  }
+  if (L.departureFlightDate && L.departureFlightTime) {
+    rowsWithDates.push({ date: L.departureFlightDate, time: L.departureFlightTime, event: `Outbound Flight${L.departureFlightNo ? ' ' + L.departureFlightNo : ''}` });
+  }
+
+  // Add sahebji row
+  if (sahebji?.date && sahebji?.time) {
+    rowsWithDates.push({ date: sahebji.date, time: sahebji.time, event: 'One on One Meeting with His Holiness Spiritual Sovereign Jainacharya Yugbhushan Suri, 79th Successor to Tirthankar Shri Mahavir Swami\n\nat VIP Lounge' });
+  }
+
+  // Add assigned sessions
+  assignedSessions.forEach(s => {
+    const exists = rowsWithDates.some(r => r.date === s.date && r.time === s.start);
+    if (!exists) {
+      rowsWithDates.push({ date: s.date, time: s.start, event: s.title + (s.topic ? '\n\nTopic: ' + s.topic : '') });
+    }
+  });
+
+  // Sort by date then time
+  rowsWithDates.sort((a, b) => {
+    const ad = (a.date + a.time).replace(/[^0-9]/g,'');
+    const bd = (b.date + b.time).replace(/[^0-9]/g,'');
+    return ad > bd ? 1 : -1;
+  });
+
+  // Group by date
+  const byDate = {};
+  rowsWithDates.forEach(r => {
+    const d = r.date || 'No date';
+    if (!byDate[d]) byDate[d] = [];
+    byDate[d].push(r);
+  });
+
+  // Format date like "18th January 2026"
+  function formatDateLong(iso) {
+    if (!iso) return '';
+    const d = new Date(iso + 'T12:00:00');
+    const day = d.getDate();
+    const suffix = day === 1||day===21||day===31?'st':day===2||day===22?'nd':day===3||day===23?'rd':'th';
+    return `${day}${suffix} ${d.toLocaleDateString('en-IN',{month:'long'})} ${d.getFullYear()}`;
+  }
+
+  const printRef = React.useRef();
+
+  function handlePrint() {
+    const printContents = printRef.current.innerHTML;
+    const w = window.open('','_blank','width=900,height=700');
+    w.document.write(`<!DOCTYPE html><html><head><title>Schedule - ${displayName(contact)}</title>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=EB+Garamond:wght@400;600;700&family=Cinzel:wght@400;600&display=swap');
+      * { margin:0; padding:0; box-sizing:border-box; }
+      body { font-family:'EB Garamond',Georgia,serif; font-size:13pt; color:#1a1a1a; background:#fff; }
+      .schedule-wrap { max-width:750px; margin:0 auto; padding:24px 32px; }
+      .header-bar { width:100%; margin-bottom:18px; }
+      .heading { font-family:'Cinzel',serif; font-size:16pt; font-weight:400; letter-spacing:.08em; color:#2C1810; text-align:center; margin:10px 0 4px; }
+      .guest-name { font-family:'EB Garamond',serif; font-size:20pt; font-weight:600; color:#0F6E56; text-align:center; margin-bottom:10px; }
+      .divider { width:100%; margin-bottom:18px; border:none; border-top:2px solid #0F6E56; }
+      table { width:100%; border-collapse:collapse; }
+      td { padding:7px 10px; vertical-align:top; border:1px solid #ccc; }
+      .time-col { width:90px; font-weight:600; white-space:nowrap; }
+      .date-row td { background:#F5F0E8; font-weight:700; font-size:13pt; border:1px solid #ccc; padding:7px 10px; }
+      .event-text { white-space:pre-line; }
+      .hotel-line { margin-top:14px; font-size:12pt; }
+      .hotel-line b { color:#0F6E56; }
+      .footer-bar { width:100%; margin-top:20px; }
+      @media print { body { -webkit-print-color-adjust:exact; print-color-adjust:exact; } }
+    </style></head><body><div class="schedule-wrap">${printContents}</div></body></html>`);
+    w.document.close();
+    setTimeout(()=>{ w.focus(); w.print(); }, 500);
+  }
+
+  return (
+    <Modal title={`Schedule — ${displayName(contact)}`} onClose={onClose} footer={null} size="lg">
+      <div style={{display:'flex',justifyContent:'flex-end',gap:8,marginBottom:12}}>
+        <button className="btn primary sm" onClick={handlePrint}>🖨️ Print / Save PDF</button>
+        <button className="btn" onClick={onClose}>Close</button>
+      </div>
+
+      {/* Preview */}
+      <div ref={printRef} style={{background:'#fff',padding:'24px 32px',border:'1px solid var(--line)',borderRadius:8,maxHeight:'70vh',overflow:'auto'}}>
+        {/* Header banner */}
+        <div style={{background:'#0F6E56',height:12,borderRadius:4,marginBottom:14}}/>
+        <div style={{textAlign:'center',marginBottom:6}}>
+          <div style={{fontFamily:'Georgia,serif',fontSize:13,letterSpacing:'.1em',color:'#2C1810',textTransform:'uppercase',marginBottom:4}}>
+            Personalised Schedule
+          </div>
+          <div style={{fontFamily:'Georgia,serif',fontSize:18,fontWeight:600,color:'#0F6E56',marginBottom:10}}>
+            {displayName(contact)}
+          </div>
+        </div>
+        <div style={{height:2,background:'#0F6E56',marginBottom:16}}/>
+
+        {/* Schedule table */}
+        <table style={{width:'100%',borderCollapse:'collapse',fontSize:12.5}}>
+          <tbody>
+            {Object.entries(byDate).map(([date, rows]) => (
+              <React.Fragment key={date}>
+                {/* Date row */}
+                <tr>
+                  <td colSpan={2} style={{
+                    background:'#F5F0E8', fontWeight:700, fontSize:13,
+                    padding:'7px 10px', border:'1px solid #ccc',
+                    fontFamily:'Georgia,serif'
+                  }}>
+                    {formatDateLong(date !== 'No date' ? date : '')}
+                  </td>
+                </tr>
+                {/* Time rows */}
+                {rows.map((r, i) => (
+                  <tr key={i}>
+                    <td style={{width:80,fontWeight:600,padding:'7px 10px',border:'1px solid #ccc',verticalAlign:'top',whiteSpace:'nowrap',fontFamily:'Georgia,serif'}}>
+                      {r.time}
+                    </td>
+                    <td style={{padding:'7px 10px',border:'1px solid #ccc',verticalAlign:'top',fontFamily:'Georgia,serif',whiteSpace:'pre-line'}}>
+                      {r.event}
+                    </td>
+                  </tr>
+                ))}
+              </React.Fragment>
+            ))}
+          </tbody>
+        </table>
+
+        {/* Hotel */}
+        {L.hotelName && (
+          <div style={{marginTop:14,fontSize:12.5,fontFamily:'Georgia,serif'}}>
+            <b style={{color:'#0F6E56'}}>Stay</b>: {L.hotelName}
+          </div>
+        )}
+
+        {/* Footer banner */}
+        <div style={{background:'linear-gradient(135deg,#0F6E56,#1D9E75)',height:8,borderRadius:4,marginTop:20}}/>
+      </div>
+    </Modal>
+  );
+}
+
 export function HelpGuide({ profile }) {
   const role = profile?.role || 'Volunteer';
   const [tab, setTab] = useState('features');
 
   const ALL_FEATURES = [
     { roles: ['Master', 'HOD', 'Volunteer'], icon: '🏠', title: 'Dashboard', desc: 'Your personalised home screen. Masters see the full event picture. HODs see their department tasks. Volunteers see their POC duties and assigned tasks.' },
-    { roles: ['Master', 'HOD'], icon: '🔴', title: 'Control Room', desc: 'Live event-day view. See who is arriving today, who is on-site, who is departing, and which sessions are running right now.' },
     { roles: ['Master', 'HOD'], icon: '📋', title: 'Outreach', desc: 'The permanent expert directory. Add contacts, track confirmation status (Pending → Contacted → Tentative → Confirmed), log follow-up notes, and import from Excel. Confirming someone automatically creates a Logistics record.' },
     { roles: ['Master', 'HOD'], icon: '✈️', title: 'Logistics', desc: 'Travel and stay details for confirmed guests. Appears automatically when someone is confirmed. Fill in arrival mode, time, hotel check-in, and departure details.' },
-    { roles: ['Master', 'HOD'], icon: '🗓️', title: 'Scheduling', desc: 'Three tabs: Event schedule (add/edit sessions), Session assignments (tick which panelist speaks at which session), and Founder one-on-ones (schedule individual meetings).' },
+    { roles: ['Master', 'HOD'], icon: '🗓️', title: 'Scheduling', desc: 'Three tabs: Event schedule (add/edit sessions), Session assignments (tick which panelist speaks at which session), and Sahebji one-on-ones (schedule individual meetings).' },
     { roles: ['Master', 'HOD', 'Volunteer'], icon: '👥', title: 'Volunteers & POC', desc: 'The volunteer directory and the per-day POC duty roster. Assign a volunteer to escort a VIP on a specific day. Swapping a sick POC only affects that day — other days are untouched.' },
-    { roles: ['Master', 'HOD'], icon: '📊', title: 'Volunteer Availability', desc: 'A colour-coded grid showing which volunteers are free on each event day (Full Day / Morning / Afternoon / Evening). Set dates on the event first to see the grid.' },
+    { roles: ['Master', 'HOD'], icon: '🙋', title: 'Volunteers', desc: 'One place for your volunteer directory and each person\'s availability for this event. Filter by city, area, department or day; tap a volunteer to edit their profile or day-by-day hours; import everyone (with availability) from Excel.' },
     { roles: ['Master', 'HOD'], icon: '🤝', title: 'Smart POC', desc: 'Shows each VIP\'s visit days and which volunteers are available. One click assigns. The Auto-assign button picks the least-loaded available volunteer for every unfilled slot.' },
     { roles: ['Master', 'HOD', 'Volunteer'], icon: '☑️', title: 'Event Checklist', desc: 'Mobile-friendly per-VIP checklist: Picked up → Hotel → Venue → Session → Kit → Departed. Each step is timestamped when tapped. POCs see their assigned VIPs.' },
     { roles: ['Master', 'HOD'], icon: '🎁', title: 'Felicitation Kits', desc: 'Track which kit items (Momento, Shawl, Kumkum, Cover, Gold Coin, Silver Coin, Frame) are packed for each confirmed guest. Summary cards show totals.' },
@@ -1956,8 +6261,8 @@ export function HelpGuide({ profile }) {
     { step: 4, title: 'Fill in logistics', desc: 'Go to Logistics. Fill in travel mode, arrival time, hotel, and departure for each confirmed guest.' },
     { step: 5, title: 'Add sessions', desc: 'Go to Scheduling → Event schedule. Add each session with date, time and type.' },
     { step: 6, title: 'Assign panelists', desc: 'Scheduling → Session assignments. Tick which confirmed guest speaks at which panel.' },
-    { step: 7, title: 'Schedule founder meetings', desc: 'Scheduling → Founder one-on-ones. Set date and time for each VIP\'s meeting.' },
-    { step: 8, title: 'Set volunteer availability', desc: 'Go to Vol. Availability. Mark which volunteers are free on each day.' },
+    { step: 7, title: 'Schedule founder meetings', desc: 'Scheduling → Sahebji one-on-ones. Set date and time for each VIP\'s meeting.' },
+    { step: 8, title: 'Set volunteer availability', desc: 'Go to Volunteers → Add availability. Pick volunteers by city/area and mark the days and hours they are free.' },
     { step: 9, title: 'Assign POCs', desc: 'Go to Smart POC. Use Auto-assign or pick manually for each VIP\'s day.' },
     { step: 10, title: 'Generate schedules', desc: 'Go to Generate. Select a guest and click Generate — their full personalised schedule is ready to print or email.' },
   ];
@@ -2039,16 +6344,42 @@ export function HelpGuide({ profile }) {
 /* ============================ GLOBAL SEARCH ============================ */
 export function GlobalSearch({ store, onNavigate, onClose }) {
   const [q, setQ] = useState('');
-  const results = useMemo(() => {
-    if (!q.trim() || q.length < 2) return [];
+  const [results, setResults] = useState([]);
+
+  // Use effect instead of useMemo to avoid stale closure issues
+  useEffect(() => {
+    if (!q.trim() || q.length < 2) { setResults([]); return; }
     const t = q.toLowerCase();
     const out = [];
-    (store.contacts||[]).forEach(c=>{ if((c.name||'').toLowerCase().includes(t)||(c.org||'').toLowerCase().includes(t)||(c.phone||'').includes(t)) out.push({type:'Contact',label:displayName(c),sub:c.org||c.field,view:'outreach'}); });
-    (store.volunteers||[]).forEach(v=>{ if((v.name||'').toLowerCase().includes(t)||(v.skills||'').toLowerCase().includes(t)) out.push({type:'Volunteer',label:v.name,sub:v.skills,view:'people'}); });
-    (store.sessions||[]).forEach(s=>{ if((s.title||'').toLowerCase().includes(t)||(s.topic||'').toLowerCase().includes(t)) out.push({type:'Session',label:s.title,sub:s.topic||s.date,view:'schedule'}); });
-    (store.tasks||[]).forEach(t2=>{ if((t2.title||'').toLowerCase().includes(t)) out.push({type:'Task',label:t2.title,sub:t2.status,view:'depts'}); });
-    (store.departments||[]).forEach(d=>{ if((d.name||'').toLowerCase().includes(t)) out.push({type:'Department',label:d.name,sub:d.desc,view:'depts'}); });
-    return out.slice(0, 20);
+    try {
+      const safe = k => Array.isArray(store?.[k]) ? store[k] : [];
+      safe('contacts').forEach(c => {
+        if (!c?.name) return;
+        if ((c.name||'').toLowerCase().includes(t)||(c.org||'').toLowerCase().includes(t)||(c.phone||'').includes(t))
+          out.push({type:'Contact', label:[c.honor,c.name,c.suffix].filter(Boolean).join(' '), sub:c.org||c.field||'', view:'outreach'});
+      });
+      safe('volunteers').forEach(v => {
+        if (!v?.name) return;
+        if ((v.name||'').toLowerCase().includes(t)||(v.skills||'').toLowerCase().includes(t))
+          out.push({type:'Volunteer', label:v.name, sub:v.skills||'', view:'people'});
+      });
+      safe('sessions').forEach(s => {
+        if (!s?.title) return;
+        if ((s.title||'').toLowerCase().includes(t)||(s.topic||'').toLowerCase().includes(t))
+          out.push({type:'Session', label:s.title, sub:s.topic||s.date||'', view:'schedule'});
+      });
+      safe('tasks').forEach(t2 => {
+        if (!t2?.title) return;
+        if (t2.title.toLowerCase().includes(t))
+          out.push({type:'Task', label:t2.title, sub:t2.status||'', view:'depts'});
+      });
+      safe('departments').forEach(d => {
+        if (!d?.name) return;
+        if (d.name.toLowerCase().includes(t))
+          out.push({type:'Department', label:d.name, sub:d.desc||'', view:'depts'});
+      });
+    } catch(e) { console.warn('Search error:', e); }
+    setResults(out.slice(0, 20));
   }, [q, store]);
 
   useEffect(() => {
@@ -2059,17 +6390,22 @@ export function GlobalSearch({ store, onNavigate, onClose }) {
   const typeColor = { Contact:'var(--teal)', Volunteer:'var(--blue)', Session:'var(--purple)', Task:'var(--amber)', Department:'var(--muted)' };
 
   return (
-    <div className="scrim" onMouseDown={onClose} style={{alignItems:'flex-start',paddingTop:60}}>
-      <div style={{background:'#fff',borderRadius:16,width:'100%',maxWidth:560,boxShadow:'0 24px 60px rgba(0,0,0,.25)',overflow:'hidden'}} onMouseDown={e=>e.stopPropagation()}>
+    <div style={{position:'fixed',inset:0,background:'rgba(33,48,44,.42)',zIndex:80,display:'flex',alignItems:'flex-start',justifyContent:'center',padding:'60px 12px 20px'}}
+      onMouseDown={onClose}>
+      <div style={{background:'#fff',borderRadius:16,width:'100%',maxWidth:560,boxShadow:'0 24px 60px rgba(0,0,0,.25)',overflow:'hidden'}}
+        onMouseDown={e=>e.stopPropagation()}>
         <div style={{display:'flex',alignItems:'center',gap:12,padding:'14px 18px',borderBottom:'1px solid var(--line)'}}>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" strokeWidth="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
-          <input autoFocus style={{flex:1,border:'none',outline:'none',fontSize:16,fontFamily:'var(--sans)',color:'var(--ink)'}} placeholder="Search contacts, volunteers, sessions, tasks…" value={q} onChange={e=>setQ(e.target.value)}/>
+          <input autoFocus style={{flex:1,border:'none',outline:'none',fontSize:16,fontFamily:'var(--sans)',color:'var(--ink)'}}
+            placeholder="Search contacts, volunteers, sessions, tasks…"
+            value={q} onChange={e=>setQ(e.target.value)}/>
           <button style={{border:'none',background:'none',color:'var(--muted)',cursor:'pointer',fontSize:13}} onClick={onClose}>Esc</button>
         </div>
         {results.length > 0 && (
           <div style={{maxHeight:400,overflow:'auto'}}>
             {results.map((r,i) => (
-              <button key={i} onClick={()=>{onNavigate(r.view);onClose();}} style={{width:'100%',display:'flex',alignItems:'center',gap:12,padding:'11px 18px',border:'none',background:'none',cursor:'pointer',textAlign:'left',borderBottom:'1px solid var(--line)'}}>
+              <button key={i} onClick={()=>{onNavigate(r.view);onClose();}}
+                style={{width:'100%',display:'flex',alignItems:'center',gap:12,padding:'11px 18px',border:'none',background:'none',cursor:'pointer',textAlign:'left',borderBottom:'1px solid var(--line)'}}>
                 <span style={{fontSize:10.5,fontWeight:700,color:typeColor[r.type],background:typeColor[r.type]+'18',padding:'2px 8px',borderRadius:20,minWidth:70,textAlign:'center',textTransform:'uppercase',letterSpacing:'.04em'}}>{r.type}</span>
                 <div style={{flex:1}}>
                   <div style={{fontSize:13.5,fontWeight:500}}>{r.label}</div>
@@ -2080,8 +6416,10 @@ export function GlobalSearch({ store, onNavigate, onClose }) {
             ))}
           </div>
         )}
-        {q.length >= 2 && !results.length && <div style={{padding:'24px',textAlign:'center',color:'var(--muted)',fontSize:13}}>No results for "<b>{q}</b>"</div>}
-        {q.length < 2 && <div style={{padding:'16px 18px',color:'var(--muted)',fontSize:13}}>Type at least 2 characters to search across all modules.</div>}
+        {q.length >= 2 && !results.length &&
+          <div style={{padding:'24px',textAlign:'center',color:'var(--muted)',fontSize:13}}>No results for "<b>{q}</b>"</div>}
+        {q.length < 2 &&
+          <div style={{padding:'16px 18px',color:'var(--muted)',fontSize:13}}>Type at least 2 characters to search across all modules.</div>}
       </div>
     </div>
   );
@@ -2156,6 +6494,7 @@ export function WhatsAppModal({ contact, store, activeEventId, onClose }) {
 export function LogisticsImportModal({ store, activeEventId, onClose, toast }) {
   const [step, setStep] = useState('choose');
   const [plan, setPlan] = useState(null);
+  const [picks, setPicks] = useState({}); // row index → chosen contactId ('' = skip)
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
@@ -2166,30 +6505,40 @@ export function LogisticsImportModal({ store, activeEventId, onClose, toast }) {
       const { items } = await parseLogisticsFile(file);
       if (!items.length) { setErr('No matching rows found. Make sure your sheet has a Name or Phone column.'); return; }
       const p = planLogisticsImport(items, store.contacts||[], store.logistics||[]);
-      setPlan(p); setStep('preview');
+      setPlan(p); setPicks({}); setStep('preview');
     } catch(e) { setErr('Could not read file: ' + (e.message||e)); }
   }
 
   async function commit() {
     setBusy(true);
     try {
-      const { saveItem } = await import('./data');
-      for (const row of plan.plan.filter(p=>p.mode!=='unmatched')) {
-        await saveItem('logistics', { ...row.item, eventId: activeEventId });
-      }
+      const { resolveLogisticsRow } = await import('./excel');
+      const contacts = store.contacts||[];
+      const rows = [];
+      plan.plan.forEach((p, i) => {
+        if (p.mode === 'new' || p.mode === 'update') rows.push(p);
+        else if (p.mode === 'ambiguous' && picks[i]) {
+          const c = contacts.find(x => x.id === picks[i]);
+          if (c) rows.push(resolveLogisticsRow(p.row, c, store.logistics||[]));
+        }
+      });
+      for (const row of rows) await saveItem('logistics', { ...row.item, eventId: activeEventId });
       onClose();
-      toast(`Logistics imported — ${plan.newCount} new, ${plan.updateCount} updated, ${plan.unmatchedCount} unmatched.`);
+      const skipped = plan.plan.length - rows.length;
+      toast(`Logistics imported — ${rows.length} saved${skipped?`, ${skipped} skipped`:''}.`);
     } catch(e) { setErr('Save failed: '+(e.message||e)); setBusy(false); }
   }
 
-  const modeColor = m => m==='new'?'var(--teal)':m==='update'?'var(--amber)':'var(--rose)';
-  const modeLabel = m => m==='new'?'New':m==='update'?'Update':'No match';
+  const modeColor = m => m==='new'?'var(--teal)':m==='update'?'var(--amber)':m==='ambiguous'?'var(--blue)':'var(--rose)';
+  const modeLabel = m => m==='new'?'New':m==='update'?'Update':m==='ambiguous'?'Choose':'No match';
+  const pickedCount = plan ? plan.plan.filter((p,i)=>p.mode==='ambiguous'&&picks[i]).length : 0;
+  const total = plan ? plan.newCount + plan.updateCount + pickedCount : 0;
 
   return (
     <Modal title="Import logistics from Excel" onClose={onClose} footer={null}>
       {err&&<div style={{background:'var(--rose-wash)',color:'var(--rose)',padding:'9px 12px',borderRadius:8,fontSize:13,marginBottom:12}}>{err}</div>}
       {step==='choose'&&<>
-        <p className="muted-sm" style={{marginTop:0}}>Upload your travel sheet. Each row is matched to an existing contact by phone number or name. Columns recognised: Name, Phone, Arrival Mode, Arrival Date, Arrival Time, Arrival Location, Hotel, Check-in, Departure Date, Departs for Airport, Flight Time, Special Requirements.</p>
+        <p className="muted-sm" style={{marginTop:0}}>Upload your travel sheet. Each row is matched to an existing contact by phone number or exact name. Close-but-not-exact matches are shown for you to confirm. Columns recognised: Name, Phone, Arrival Mode, Arrival Date, Arrival Time, Arrival Location, Hotel, Check-in, Departure Date, Departs for Airport, Flight Time, Special Requirements.</p>
         <label className="dropzone">
           <span style={{display:'flex',justifyContent:'center'}}>{ICON.upload}</span>
           <div>Click to choose a file (.xlsx or .csv)</div>
@@ -2198,20 +6547,31 @@ export function LogisticsImportModal({ store, activeEventId, onClose, toast }) {
         <div className="modal-foot" style={{padding:'12px 0 0'}}><button className="btn" onClick={onClose}>Cancel</button></div>
       </>}
       {step==='preview'&&plan&&<>
-        <div style={{display:'flex',gap:16,marginBottom:12}}>
-          <div><div style={{fontFamily:'var(--serif)',fontSize:24,color:'var(--teal)'}}>{plan.newCount}</div><div className="muted-sm">new records</div></div>
-          <div><div style={{fontFamily:'var(--serif)',fontSize:24,color:'var(--amber)'}}>{plan.updateCount}</div><div className="muted-sm">will update</div></div>
-          <div><div style={{fontFamily:'var(--serif)',fontSize:24,color:'var(--rose)'}}>{plan.unmatchedCount}</div><div className="muted-sm">no contact match</div></div>
+        <div style={{display:'flex',gap:16,marginBottom:12,flexWrap:'wrap'}}>
+          <div><div style={{fontFamily:'var(--serif)',fontSize:24,color:'var(--teal)'}}>{plan.newCount}</div><div className="muted-sm">new</div></div>
+          <div><div style={{fontFamily:'var(--serif)',fontSize:24,color:'var(--amber)'}}>{plan.updateCount}</div><div className="muted-sm">update</div></div>
+          <div><div style={{fontFamily:'var(--serif)',fontSize:24,color:'var(--blue)'}}>{plan.ambiguousCount}</div><div className="muted-sm">need a choice</div></div>
+          <div><div style={{fontFamily:'var(--serif)',fontSize:24,color:'var(--rose)'}}>{plan.unmatchedCount}</div><div className="muted-sm">no match</div></div>
         </div>
-        {plan.unmatchedCount>0&&<div style={{background:'var(--amber-wash)',padding:'8px 12px',borderRadius:8,fontSize:12.5,color:'var(--amber)',marginBottom:10}}>
-          ⚠ Unmatched rows will be skipped. Make sure these contacts exist in Outreach first, or add them manually.
+        {plan.ambiguousCount>0&&<div style={{background:'var(--blue-wash)',padding:'8px 12px',borderRadius:8,fontSize:12.5,color:'var(--blue)',marginBottom:10}}>
+          Pick the right contact for rows marked "Choose". Rows left on "Skip" are not imported.
         </div>}
-        <div style={{maxHeight:'36vh',overflow:'auto',border:'1px solid var(--line)',borderRadius:8}}>
+        {plan.unmatchedCount>0&&<div style={{background:'var(--amber-wash)',padding:'8px 12px',borderRadius:8,fontSize:12.5,color:'var(--amber)',marginBottom:10}}>
+          ⚠ Unmatched rows will be skipped. Add these contacts in Outreach first, then import again.
+        </div>}
+        <div style={{maxHeight:'40vh',overflow:'auto',border:'1px solid var(--line)',borderRadius:8}}>
           <table className="import-tbl"><thead><tr><th>Name in sheet</th><th>Matched contact</th><th>Result</th></tr></thead><tbody>
             {plan.plan.map((p,i)=>(
               <tr key={i}>
-                <td>{p.contactName||'—'}</td>
-                <td className="muted-sm">{p.mode!=='unmatched'?p.contactName:'—'}</td>
+                <td>{p.sheetName||'—'}</td>
+                <td className="muted-sm">
+                  {p.mode==='ambiguous'
+                    ? <><select className="input" style={{padding:'4px 6px',fontSize:12.5}} value={picks[i]||''} onChange={e=>setPicks(x=>({...x,[i]:e.target.value}))}>
+                        <option value="">Skip this row</option>
+                        {p.candidates.map(c=><option key={c.id} value={c.id}>{c.name}{c.org?` — ${c.org}`:''}</option>)}
+                      </select><div style={{fontSize:11,marginTop:2}}>{p.reason}</div></>
+                    : p.mode!=='unmatched'?p.contactName:'—'}
+                </td>
                 <td><span style={{fontSize:11,fontWeight:700,color:modeColor(p.mode)}}>{modeLabel(p.mode)}</span></td>
               </tr>
             ))}
@@ -2219,8 +6579,8 @@ export function LogisticsImportModal({ store, activeEventId, onClose, toast }) {
         </div>
         <div className="modal-foot" style={{padding:'12px 0 0'}}>
           <button className="btn" onClick={()=>setStep('choose')}>Back</button>
-          <button className="btn primary" onClick={commit} disabled={busy||plan.newCount+plan.updateCount===0}>
-            {busy?'Importing…':`Import ${plan.newCount+plan.updateCount} rows`}
+          <button className="btn primary" onClick={commit} disabled={busy||total===0}>
+            {busy?'Importing…':`Import ${total} row${total===1?'':'s'}`}
           </button>
         </div>
       </>}
@@ -2240,12 +6600,12 @@ export function EventReport({ store, rawStore, activeEventId }) {
   const event = (rawStore?.events||[]).find(e=>e.id===activeEventId)||{};
 
   const conf = contacts.filter(c=>c.status==='Confirmed');
-  const logiDone = conf.filter(c=>logi.some(l=>(l.contactId===c.id||l.id===c.id)&&(l.hotel||l.inbTime)));
-  const today = new Date().toISOString().slice(0,10);
+  const logiDone = conf.filter(c=>logi.some(l=>(l.contactId===c.id||l.id===c.id)&&(l.hotelName||l.arrivalDate||l.arrivalTime||l.hotel||l.inbTime)));
+  const today = todayISO();
   const eventDays = [];
   if (event.startDate && event.endDate) {
-    let d=new Date(event.startDate+'T00:00:00'); const end=new Date(event.endDate+'T00:00:00'); let g=0;
-    while(d<=end&&g<20){eventDays.push(d.toISOString().slice(0,10));d=new Date(d);d.setDate(d.getDate()+1);g++;}
+    let d=new Date(event.startDate+'T12:00:00'); const end=new Date(event.endDate+'T12:00:00'); let g=0;
+    while(d<=end&&g<20){eventDays.push(localISO(d));d=new Date(d);d.setDate(d.getDate()+1);g++;}
   }
   const pocCoverage = conf.length&&eventDays.length
     ? Math.round((conf.filter(c=>eventDays.some(day=>poc.some(p=>p.contactId===c.id&&p.day===day))).length/conf.length)*100)
@@ -2368,5 +6728,399 @@ export function ContactHistoryModal({ contact, rawStore, onClose }) {
           </div>}
       <div className="modal-foot" style={{padding:'12px 0 0'}}><button className="btn" onClick={onClose}>Close</button></div>
     </Modal>
+  );
+}
+
+/* ============================ FEATURE 1: DATA MIGRATION TOOL ============================ */
+export function MigrationTool({ store, activeEventId }) {
+  const toast = useToast();
+  const [files, setFiles] = useState([]); // [{file, detected, parsed, plan}]
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+  const [step, setStep] = useState('upload'); // upload | preview | done
+
+  const SHEET_TYPES = ['contacts','sessions','volunteers','tasks','logistics','departments'];
+
+  async function detectAndParse(file) {
+    const { parseContactsFile, parseSessionsFile, parseVolunteersFile, parseTasksFile, parseLogisticsFile } = await import('./excel');
+    const PARSERS = { contacts: parseContactsFile, sessions: parseSessionsFile, volunteers: parseVolunteersFile, tasks: parseTasksFile, logistics: parseLogisticsFile };
+
+    // Try each parser and pick the one that returns the most rows
+    let best = { type: 'contacts', items: [], score: 0 };
+    for (const [type, parser] of Object.entries(PARSERS)) {
+      try {
+        const result = await parser(file);
+        if (result.items.length > best.score) {
+          best = { type, items: result.items, score: result.items.length };
+        }
+      } catch {}
+    }
+
+    // Also check column headers for a definitive match
+    try {
+      const XLSX = await import('xlsx');
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: 'array' });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+      const headers = (raw[0] || []).map(h => String(h).toLowerCase());
+      const headerStr = headers.join(' ');
+      if (headerStr.includes('hotel') || headerStr.includes('arrival') || headerStr.includes('departure')) best.type = 'logistics';
+      else if (headerStr.includes('session') || headerStr.includes('topic') || (headerStr.includes('start') && headerStr.includes('end'))) best.type = 'sessions';
+      else if (headerStr.includes('department') || headerStr.includes('dept') || headerStr.includes('hod')) best.type = 'departments';
+      else if (headerStr.includes('task') || headerStr.includes('due date') || headerStr.includes('assignee')) best.type = 'tasks';
+      else if (headerStr.includes('skills') || headerStr.includes('volunteer')) best.type = 'volunteers';
+    } catch {}
+
+    return { file, detected: best.type, items: best.items, score: best.score };
+  }
+
+  async function handleFiles(fileList) {
+    const arr = Array.from(fileList);
+    if (!arr.length) return;
+    setBusy(true);
+    try {
+      const results = await Promise.all(arr.map(detectAndParse));
+      setFiles(results);
+      setStep('preview');
+    } catch(e) { toast('Error reading files: ' + (e.message||e)); }
+    finally { setBusy(false); }
+  }
+
+  function changeType(idx, type) {
+    setFiles(prev => prev.map((f,i) => i===idx ? {...f, detected:type} : f));
+  }
+
+  async function commitAll() {
+    setBusy(true);
+    const { batchUpsert } = await import('./data');
+    const { planImport, contactKey, planLogisticsImport, planSessionsImport, planVolunteersImport, planTasksImport } = await import('./excel');
+    let totals = { contacts:0, sessions:0, volunteers:0, tasks:0, logistics:0, departments:0 };
+
+    try {
+      const { matchDept, matchVolunteer } = await import('./excel');
+      const withIds = arr => arr.map(i => ({ ...i, id: i.id || crypto.randomUUID() }));
+      const of = type => files.filter(f => f.detected === type);
+      // Order matters: things that others link to are imported first, with known ids.
+      // 1. Contacts (logistics links to them)
+      let allContacts = [...(store.contacts||[])];
+      for (const f of of('contacts')) {
+        const plan = planImport(f.items, allContacts);
+        const items = withIds(plan.plan.map(p => ({...p.item, eventId: activeEventId})));
+        await batchUpsert('contacts', items);
+        allContacts = [...allContacts.filter(c => !items.some(i => i.id === c.id)), ...items];
+        totals.contacts += items.length;
+      }
+      // 2. Departments (tasks link to them)
+      let allDepts = [...(store.departments||[])];
+      for (const f of of('departments')) {
+        const newDepts = withIds(f.items.filter(d => d.name && !matchDept(d.name, allDepts)));
+        await batchUpsert('departments', newDepts);
+        allDepts = [...allDepts, ...newDepts];
+        totals.departments += newDepts.length;
+      }
+      // 3. Volunteers (task owners link to them)
+      let allVols = [...(store.volunteers||[])];
+      for (const f of of('volunteers')) {
+        const plan = planVolunteersImport(f.items, allVols);
+        const items = withIds(plan.plan.map(p => p.item));
+        await batchUpsert('volunteers', items);
+        allVols = [...allVols.filter(v => !items.some(i => i.id === v.id)), ...items];
+        totals.volunteers += items.length;
+      }
+      // 4. Tasks — Department/Owner names linked to real records; unknown departments are created
+      let ownerMisses = 0;
+      for (const f of of('tasks')) {
+        const plan = planTasksImport(f.items, store.tasks||[]);
+        const items = [];
+        for (const p of plan.plan) {
+          const it = p.item;
+          let dept = it.deptName ? matchDept(it.deptName, allDepts) : null;
+          if (!dept && it.deptName) {
+            dept = { id: crypto.randomUUID(), name: it.deptName.trim(), desc: '', hodIds: [] };
+            await batchUpsert('departments', [dept]); allDepts.push(dept); totals.departments++;
+          }
+          const vol = it.assigneeName ? matchVolunteer(it.assigneeName, allVols) : null;
+          if (it.assigneeName && !vol) ownerMisses++;
+          items.push({ ...it, eventId: activeEventId, deptId: dept?.id || it.deptId || allDepts[0]?.id || '',
+            assigneeId: vol?.id || it.assigneeId || '', deptName: '', assigneeName: vol || !it.assigneeName ? '' : it.assigneeName });
+        }
+        await batchUpsert('tasks', items);
+        totals.tasks += items.length;
+      }
+      if (ownerMisses) toast(`${ownerMisses} task owner name${ownerMisses>1?'s':''} didn't match a volunteer — see the banner in Departments & Tasks.`);
+      // 5. Logistics and sessions
+      for (const f of of('logistics')) {
+        const plan = planLogisticsImport(f.items, allContacts, store.logistics||[]);
+        const items = plan.plan.filter(p => p.mode==='new' || p.mode==='update').map(p => ({...p.item, eventId: activeEventId}));
+        await batchUpsert('logistics', items);
+        totals.logistics += items.length;
+      }
+      for (const f of of('sessions')) {
+        const plan = planSessionsImport(f.items, store.sessions||[]);
+        const items = plan.plan.map(p => ({...p.item, eventId: activeEventId}));
+        await batchUpsert('sessions', items);
+        totals.sessions += items.length;
+      }
+      setDone(true); setStep('done');
+      toast(`Migration complete! ${Object.entries(totals).filter(([,v])=>v>0).map(([k,v])=>`${v} ${k}`).join(', ')}.`);
+    } catch(e) { toast('Migration failed: '+(e.message||e)); }
+    finally { setBusy(false); }
+  }
+
+  const typeColor = {contacts:'var(--teal)',sessions:'var(--blue)',volunteers:'var(--purple)',tasks:'var(--amber)',logistics:'var(--amber)',departments:'var(--muted)'};
+  const totalRows = files.reduce((s,f)=>s+f.score,0);
+
+  return (
+    <>
+      <div className="page-head"><div className="ph-txt">
+        <h1>Data Migration Tool</h1>
+        <p>Upload all your existing Google Sheets at once. The tool auto-detects what each file contains and imports everything in one go.</p>
+      </div></div>
+
+      {step==='upload' && (
+        <div className="panel">
+          <div className="panel-head"><h2>Upload your sheets</h2><div className="desc">Upload up to 6 files — one per sheet type</div></div>
+          <div className="panel-pad">
+            <div className="flow-note" style={{marginBottom:20}}>{ICON.info}<div>Upload your existing Google Sheets exported as .xlsx files. You can upload all of them at once — contacts, logistics, sessions, volunteers, departments, and tasks. The tool will auto-detect what each file contains.</div></div>
+            <label className="dropzone" style={{cursor:busy?'wait':'pointer'}}>
+              <span style={{fontSize:32}}>📂</span>
+              <div style={{fontWeight:600,fontSize:15,marginTop:4}}>Drop all your sheets here</div>
+              <div style={{fontSize:13,color:'var(--muted)'}}>or click to choose files (.xlsx or .csv)</div>
+              <input type="file" accept=".xlsx,.xls,.csv" multiple style={{display:'none'}} onChange={e=>handleFiles(e.target.files)} disabled={busy}/>
+            </label>
+            {busy && <div style={{textAlign:'center',padding:20,color:'var(--muted)'}}>Reading files…</div>}
+          </div>
+        </div>
+      )}
+
+      {step==='preview' && (
+        <>
+          <div className="flow-note">{ICON.info}<div>Review what was detected in each file. Change the type if the auto-detection is wrong. Then click <b>Import all</b> to migrate everything.</div></div>
+          {files.map((f,i) => (
+            <div className="panel" key={i} style={{marginBottom:14}}>
+              <div className="panel-head">
+                <div>
+                  <div className="nm">{f.file.name}</div>
+                  <div className="muted-sm">{f.score} rows detected</div>
+                </div>
+                <div className="right" style={{alignItems:'center',gap:10}}>
+                  <span style={{fontSize:12,color:'var(--muted)'}}>Type:</span>
+                  <select className="statsel" value={f.detected} onChange={e=>changeType(i,e.target.value)}
+                    style={{background:typeColor[f.detected]+'18',color:typeColor[f.detected],fontWeight:600}}>
+                    {SHEET_TYPES.map(t=><option key={t} value={t}>{t.charAt(0).toUpperCase()+t.slice(1)}</option>)}
+                  </select>
+                </div>
+              </div>
+              {f.items.length > 0 && (
+                <div style={{padding:'8px 16px 12px'}}>
+                  <div style={{fontSize:12,color:'var(--muted)',marginBottom:6}}>Preview (first 3 rows):</div>
+                  <div style={{overflowX:'auto'}}>
+                    <table className="import-tbl" style={{fontSize:12}}>
+                      <thead><tr>{Object.keys(f.items[0]||{}).slice(0,6).map(k=><th key={k}>{k}</th>)}</tr></thead>
+                      <tbody>{f.items.slice(0,3).map((row,j)=><tr key={j}>{Object.keys(f.items[0]).slice(0,6).map(k=><td key={k}>{String(row[k]||'').slice(0,40)}</td>)}</tr>)}</tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          ))}
+          <div style={{display:'flex',gap:12,justifyContent:'flex-end',marginTop:8,paddingBottom:40}}>
+            <button className="btn" onClick={()=>{setFiles([]);setStep('upload');}}>Start over</button>
+            <button className="btn primary" onClick={commitAll} disabled={busy||!totalRows}>
+              {busy?'Importing…':`Import all ${totalRows} rows across ${files.length} files`}
+            </button>
+          </div>
+        </>
+      )}
+
+      {step==='done' && (
+        <div className="panel panel-pad" style={{textAlign:'center',padding:'40px 20px'}}>
+          <div style={{fontSize:48,marginBottom:12}}>✅</div>
+          <div style={{fontFamily:'var(--serif)',fontSize:22,marginBottom:8}}>Migration complete</div>
+          <p style={{color:'var(--muted)',fontSize:14,marginBottom:20}}>All your data has been imported. Go to Outreach to verify your contacts, Logistics to check travel details, and Scheduling to review sessions.</p>
+          <div style={{display:'flex',gap:10,justifyContent:'center',flexWrap:'wrap'}}>
+            <button className="btn" onClick={()=>{setFiles([]);setStep('upload');}}>Import more files</button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+/* ============================================================
+   FEATURE 5: WHATSAPP BROADCAST LIST GENERATOR
+   ============================================================ */
+export function WhatsAppBroadcast({ contacts, onClose }) {
+  const [selected, setSelected] = useState(new Set(contacts.map(c=>c.id)));
+  const [msgTemplate, setMsgTemplate] = useState('invite');
+  const [copied, setCopied] = useState('');
+
+  const TEMPLATES = {
+    invite: 'Jai Jinendra! We cordially invite you to Vasudhaiva Kutumbakam Ki Oar — a gathering of eminent experts in law, geopolitics and economics. Kindly confirm your participation.',
+    confirm: 'Jai Jinendra! Thank you for confirming your participation in VK 4.0. We are truly honoured. Our team will reach out with further details shortly.',
+    followup: 'Jai Jinendra! This is a gentle follow-up regarding your participation in VK 4.0. We would be grateful to receive your confirmation at your earliest convenience.',
+    reminder: 'Jai Jinendra! A reminder that VK 4.0 is approaching. Please confirm your attendance so we can make the necessary arrangements.',
+  };
+
+  const sel = contacts.filter(c=>selected.has(c.id));
+
+  const phoneList = sel.map(c=>`${displayName(c)}: ${c.phone||'—'}`).join('\n');
+  const numbersOnly = sel.map(c=>String(c.phone||'').replace(/[^\d+]/g,'')).filter(p=>p.length>=7).join('\n');
+  const fullMessage = sel.map((c,i)=>`${i+1}. ${displayName(c)}\n   ${c.phone||'—'}\n   ${TEMPLATES[msgTemplate]}`).join('\n\n');
+
+  function copy(text, key) {
+    navigator.clipboard.writeText(text);
+    setCopied(key);
+    setTimeout(()=>setCopied(''), 2000);
+  }
+
+  return (
+    <Modal title={`WhatsApp Broadcast — ${sel.length} contacts`} onClose={onClose} footer={null}>
+      <div style={{display:'flex',gap:8,marginBottom:12,flexWrap:'wrap'}}>
+        {contacts.map(c=>(
+          <label key={c.id} style={{display:'flex',alignItems:'center',gap:5,padding:'4px 10px',borderRadius:20,
+            border:`1.5px solid ${selected.has(c.id)?'var(--teal)':'var(--line)'}`,
+            background:selected.has(c.id)?'var(--teal-wash)':'#fff',cursor:'pointer',fontSize:12.5}}>
+            <input type="checkbox" checked={selected.has(c.id)} onChange={()=>{
+              const s=new Set(selected); s.has(c.id)?s.delete(c.id):s.add(c.id); setSelected(s);
+            }} style={{accentColor:'var(--teal)',marginRight:2}}/>{c.name}
+          </label>
+        ))}
+      </div>
+      <div style={{display:'flex',gap:6,marginBottom:12,flexWrap:'wrap'}}>
+        {Object.entries({invite:'Invitation',confirm:'Confirmation',followup:'Follow-up',reminder:'Reminder'}).map(([k,v])=>(
+          <button key={k} className={'btn sm'+(msgTemplate===k?' primary':'')} onClick={()=>setMsgTemplate(k)}>{v}</button>
+        ))}
+      </div>
+      <div className="split-2" style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:12}}>
+        <div>
+          <div style={{fontSize:11.5,fontWeight:600,color:'var(--muted)',marginBottom:6}}>NAMES + PHONES</div>
+          <div style={{background:'#F9F8F4',borderRadius:8,padding:'10px 12px',fontSize:12,fontFamily:'var(--mono)',whiteSpace:'pre-wrap',maxHeight:120,overflow:'auto',border:'1px solid var(--line)'}}>{phoneList||'—'}</div>
+          <button className="btn sm" style={{marginTop:6,width:'100%'}} onClick={()=>copy(phoneList,'names')}>
+            {copied==='names'?'✓ Copied!':'📋 Copy list'}
+          </button>
+        </div>
+        <div>
+          <div style={{fontSize:11.5,fontWeight:600,color:'var(--muted)',marginBottom:6}}>NUMBERS ONLY</div>
+          <div style={{background:'#F9F8F4',borderRadius:8,padding:'10px 12px',fontSize:12,fontFamily:'var(--mono)',whiteSpace:'pre-wrap',maxHeight:120,overflow:'auto',border:'1px solid var(--line)'}}>{numbersOnly||'—'}</div>
+          <button className="btn sm" style={{marginTop:6,width:'100%'}} onClick={()=>copy(numbersOnly,'nums')}>
+            {copied==='nums'?'✓ Copied!':'📋 Copy numbers'}
+          </button>
+        </div>
+      </div>
+      <div>
+        <div style={{fontSize:11.5,fontWeight:600,color:'var(--muted)',marginBottom:6}}>PERSONALISED MESSAGE (paste into WhatsApp one by one)</div>
+        <div style={{background:'#ECF8ED',borderRadius:8,padding:'10px 12px',fontSize:12,lineHeight:1.5,whiteSpace:'pre-wrap',maxHeight:180,overflow:'auto',border:'1px solid #D4EDDA'}}>{fullMessage||'—'}</div>
+        <button className="btn primary sm" style={{marginTop:6,width:'100%'}} onClick={()=>copy(fullMessage,'full')}>
+          {copied==='full'?'✓ Copied!':'📋 Copy personalised messages'}
+        </button>
+      </div>
+      <div className="modal-foot" style={{padding:'12px 0 0'}}>
+        <button className="btn" onClick={onClose}>Close</button>
+      </div>
+    </Modal>
+  );
+}
+
+/* ============================================================
+   FEATURE 6: FOLLOW-UP DUE DATES
+   ============================================================ */
+export function FollowUpDueToday({ store, go }) {
+  const today = todayISO();
+  const notes = store.contact_notes || [];
+  const contacts = store.contacts || [];
+  const due = notes.filter(n => n.dueDate && n.dueDate <= today && !n.done);
+  const overdue = due.filter(n => n.dueDate < today);
+  const todayDue = due.filter(n => n.dueDate === today);
+  if (!due.length) return null;
+  return (
+    <div className="panel" style={{borderColor:overdue.length?'var(--rose)':'var(--amber)',borderWidth:2,marginBottom:18}}>
+      <div className="panel-head" style={{background:overdue.length?'var(--rose-wash)':'var(--amber-wash)'}}>
+        <h2 style={{color:overdue.length?'var(--rose)':'var(--amber)'}}>
+          {overdue.length?`⚠ ${overdue.length} overdue follow-up${overdue.length>1?'s':''}`:`📅 ${todayDue.length} follow-up${todayDue.length>1?'s':''} due today`}
+        </h2>
+      </div>
+      <div className="panel-body"><table><tbody>
+        {due.slice(0,5).map(n=>{
+          const c=contacts.find(x=>x.id===n.contactId);
+          const isOverdue = n.dueDate < today;
+          return <tr key={n.id}>
+            <td><div className="person"><div className="avatar" style={isOverdue?{background:'var(--rose-wash)',color:'var(--rose)'}:{}}>{initials(c?.name||'?')}</div>
+              <div><div className="nm">{c?displayName(c):'Unknown'}</div>
+              <div className="role">{n.text?.slice(0,60)}{n.text?.length>60?'…':''}</div></div></div></td>
+            <td><span style={{fontSize:12,fontWeight:600,color:isOverdue?'var(--rose)':'var(--amber)'}}>{isOverdue?`Overdue (${n.dueDate})`:`Due today`}</span></td>
+            <td style={{textAlign:'right'}}><button className="btn sm" onClick={()=>go('outreach')}>Open Outreach</button></td>
+          </tr>;
+        })}
+        {due.length>5&&<tr><td colSpan="3"><span className="muted-sm">+{due.length-5} more</span></td></tr>}
+      </tbody></table></div>
+    </div>
+  );
+}
+
+/* ============================================================
+   FEATURE 9: VIP ARRIVAL COUNTDOWN WIDGET
+   ============================================================ */
+/* ── ArrivalCountdown widget (standalone) ─────────────────────── */
+function ArrivalWidget({label, count, color, names}) {
+  return (
+    <div style={{background:'var(--surface)',border:`2px solid ${color}20`,borderTop:`3px solid ${color}`,borderRadius:'var(--r-lg)',padding:'12px 14px',flex:1,minWidth:120}}>
+      <div style={{fontSize:28,fontFamily:'var(--serif)',color,lineHeight:1,fontWeight:500}}>{count}</div>
+      <div style={{fontSize:11.5,fontWeight:600,color:'var(--muted)',marginTop:3,marginBottom:6,textTransform:'uppercase',letterSpacing:'.05em'}}>{label}</div>
+      {names.slice(0,3).map((n,i)=><div key={i} style={{fontSize:11,color:'var(--muted)',lineHeight:1.4}}>{n}</div>)}
+      {names.length>3&&<div style={{fontSize:11,color:'var(--faint)'}}>+{names.length-3} more</div>}
+    </div>
+  );
+}
+
+
+export function ArrivalCountdown({ store }) {
+  const contacts = store.contacts || [];
+  const logi = store.logistics || [];
+  const today = todayISO();
+  const tomorrow = tomorrowISO();
+
+  const getL = cid => { const L = logi.find(l=>l.contactId===cid||l.id===cid)||{}; return { ...L, inbDate: L.arrivalDate||L.inbDate, outDate: L.departureDate||L.outDate, inbTime: L.arrivalTime||L.inbTime, outDepart: L.departureTime||L.outDepart }; };
+  const conf = contacts.filter(c=>c.status==='Confirmed');
+  const arriving_today = conf.filter(c=>getL(c.id).inbDate===today);
+  const arriving_tomorrow = conf.filter(c=>getL(c.id).inbDate===tomorrow);
+  const on_site = conf.filter(c=>{const L=getL(c.id);return L.inbDate&&L.outDate&&L.inbDate<=today&&L.outDate>=today;});
+  const departing_today = conf.filter(c=>getL(c.id).outDate===today);
+
+  // ArrivalWidget is defined as standalone function
+
+  return (
+    <div style={{display:'flex',gap:10,flexWrap:'wrap',marginBottom:18}}>
+      <ArrivalWidget label="Arriving today" count={arriving_today.length} color="var(--teal)" names={arriving_today.map(c=>`${c.name} · ${getL(c.id).inbTime||'—'}`)}/>
+      <ArrivalWidget label="On-site now" count={on_site.length} color="var(--blue)" names={on_site.map(c=>c.name)}/>
+      <ArrivalWidget label="Arriving tomorrow" count={arriving_tomorrow.length} color="var(--amber)" names={arriving_tomorrow.map(c=>c.name)}/>
+      <ArrivalWidget label="Departing today" count={departing_today.length} color="var(--rose)" names={departing_today.map(c=>`${c.name} · ${getL(c.id).outDepart||'—'}`)}/>
+    </div>
+  );
+}
+
+/* ============================================================
+   FEATURE 8: DEPARTMENT COMPLETION NOTIFICATION
+   ============================================================ */
+export function DeptCompletionBanner({ store }) {
+  const depts = store.departments || [];
+  const tasks = store.tasks || [];
+  const justCompleted = depts.filter(d=>{
+    const dt = tasks.filter(t=>t.deptId===d.id);
+    return dt.length > 0 && dt.every(t=>t.status==='Done') && !d.notified;
+  });
+  if (!justCompleted.length) return null;
+  return (
+    <div style={{background:'var(--teal-wash)',border:'2px solid var(--teal)',borderRadius:'var(--r-lg)',padding:'12px 16px',marginBottom:18,display:'flex',alignItems:'center',gap:12,flexWrap:'wrap'}}>
+      <span style={{fontSize:20}}>🎉</span>
+      <div style={{flex:1}}>
+        <div style={{fontWeight:600,fontSize:14,color:'var(--teal)'}}>All tasks complete!</div>
+        <div style={{fontSize:13,color:'var(--muted)',marginTop:2}}>
+          {justCompleted.map(d=>d.name).join(', ')} {justCompleted.length===1?'has':'have'} completed all tasks.
+          {justCompleted.some(d=>!d.ready)&&' HODs can now mark their department as ready in Department Master.'}
+        </div>
+      </div>
+    </div>
   );
 }

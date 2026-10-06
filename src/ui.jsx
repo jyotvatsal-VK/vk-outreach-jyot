@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState, useCallback } from 'react';
+import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
 
 export const ICON = {
   dash: <svg className="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><rect x="3" y="3" width="7" height="9" rx="1.5" /><rect x="14" y="3" width="7" height="5" rx="1.5" /><rect x="14" y="12" width="7" height="9" rx="1.5" /><rect x="3" y="16" width="7" height="5" rx="1.5" /></svg>,
@@ -20,6 +20,15 @@ export const ICON = {
 };
 
 const ToastCtx = createContext(() => {});
+
+/* Toast text is escaped so names/titles from the database can never inject HTML.
+   Only plain <b>…</b> is allowed back in, because existing messages use it for emphasis. */
+function safeToastHtml(msg) {
+  return String(msg ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+    .replace(/&lt;(\/?)b&gt;/g, '<$1b>');
+}
 export const useToast = () => useContext(ToastCtx);
 export function ToastProvider({ children }) {
   const [items, setItems] = useState([]);
@@ -33,7 +42,7 @@ export function ToastProvider({ children }) {
       {children}
       <div className="toast-wrap">
         {items.map((t) => (
-          <div className="toast" key={t.id}>{ICON.check}<div dangerouslySetInnerHTML={{ __html: t.msg }} /></div>
+          <div className="toast" key={t.id}>{ICON.check}<div dangerouslySetInnerHTML={{ __html: safeToastHtml(t.msg) }} /></div>
         ))}
       </div>
     </ToastCtx.Provider>
@@ -74,4 +83,23 @@ export function SearchBox({ value, onChange }) {
       <input placeholder="Search…" value={value} onChange={(e) => onChange(e.target.value)} />
     </span>
   );
+}
+
+/* ---- Error Boundary ---- */
+export class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { hasError: false, error: null }; }
+  static getDerivedStateFromError(error) { return { hasError: true, error }; }
+  componentDidCatch(error, info) { console.error('Module error:', error, info); }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{padding:'32px 24px',background:'var(--rose-wash)',borderRadius:'var(--r-lg)',border:'1px solid #E9C9D2',margin:'20px 0'}}>
+          <div style={{fontFamily:'var(--serif)',fontSize:18,color:'var(--rose)',marginBottom:8}}>Something went wrong in this module</div>
+          <div style={{fontSize:13,color:'var(--muted)',marginBottom:16,fontFamily:'var(--mono)'}}>{this.state.error?.message||'Unknown error'}</div>
+          <button className="btn" onClick={()=>this.setState({hasError:false,error:null})}>Try again</button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }

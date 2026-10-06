@@ -1,0 +1,36 @@
+
+> vk-outreach-jyot@1.0.0 build
+> vite build
+
+[36mvite v7.3.5 [32mbuilding client environment for production...[36m[39m
+transforming...
+[32m✓[39m 58 modules transformed.
+rendering chunks...
+[33m[plugin vite:reporter] 
+(!) C:/Users/user/Desktop/VK_Outreach_Program_JYOT/vk-jyot/src/firebase.js is dynamically imported by C:/Users/user/Desktop/VK_Outreach_Program_JYOT/vk-jyot/src/settings.jsx but also statically imported by C:/Users/user/Desktop/VK_Outreach_Program_JYOT/vk-jyot/src/activity.js, C:/Users/user/Desktop/VK_Outreach_Program_JYOT/vk-jyot/src/auth.jsx, C:/Users/user/Desktop/VK_Outreach_Program_JYOT/vk-jyot/src/data.js, C:/Users/user/Desktop/VK_Outreach_Program_JYOT/vk-jyot/src/settings.jsx, dynamic import will not move module into another chunk.
+[39m
+[33m[plugin vite:reporter] 
+(!) C:/Users/user/Desktop/VK_Outreach_Program_JYOT/vk-jyot/src/data.js is dynamically imported by C:/Users/user/Desktop/VK_Outreach_Program_JYOT/vk-jyot/src/views.jsx, C:/Users/user/Desktop/VK_Outreach_Program_JYOT/vk-jyot/src/views.jsx, C:/Users/user/Desktop/VK_Outreach_Program_JYOT/vk-jyot/src/views.jsx but also statically imported by C:/Users/user/Desktop/VK_Outreach_Program_JYOT/vk-jyot/src/App.jsx, C:/Users/user/Desktop/VK_Outreach_Program_JYOT/vk-jyot/src/schedule.js, C:/Users/user/Desktop/VK_Outreach_Program_JYOT/vk-jyot/src/settings.jsx, C:/Users/user/Desktop/VK_Outreach_Program_JYOT/vk-jyot/src/views.jsx, dynamic import will not move module into another chunk.
+[39m
+[33m[plugin vite:reporter] 
+(!) C:/Users/user/Desktop/VK_Outreach_Program_JYOT/vk-jyot/src/excel.js is dynamically imported by C:/Users/user/Desktop/VK_Outreach_Program_JYOT/vk-jyot/src/views.jsx, C:/Users/user/Desktop/VK_Outreach_Program_JYOT/vk-jyot/src/views.jsx, C:/Users/user/Desktop/VK_Outreach_Program_JYOT/vk-jyot/src/views.jsx but also statically imported by C:/Users/user/Desktop/VK_Outreach_Program_JYOT/vk-jyot/src/views.jsx, dynamic import will not move module into another chunk.
+[39m
+computing gzip size...
+[2mdist/[22m[32mregisterSW.js                     [39m[1m[2m  0.13 kB[22m[1m[22m
+[2mdist/[22m[32mmanifest.webmanifest              [39m[1m[2m  0.43 kB[22m[1m[22m
+[2mdist/[22m[32mindex.html                        [39m[1m[2m  1.15 kB[22m[1m[22m[2m │ gzip:   0.55 kB[22m
+[2mdist/[22m[35massets/index-BUyrW03d.css         [39m[1m[2m 18.13 kB[22m[1m[22m[2m │ gzip:   4.38 kB[22m
+[2mdist/[22m[36massets/react-vendor-DnxA9v5e.js   [39m[1m[2m140.91 kB[22m[1m[22m[2m │ gzip:  45.31 kB[22m
+[2mdist/[22m[36massets/firebase-core-CTsjldav.js  [39m[1m[2m155.52 kB[22m[1m[22m[2m │ gzip:  45.09 kB[22m
+[2mdist/[22m[36massets/index-CBSvgyDe.js          [39m[1m[2m265.37 kB[22m[1m[22m[2m │ gzip:  67.02 kB[22m
+[2mdist/[22m[36massets/index-BLYagUJu.js          [39m[1m[2m356.95 kB[22m[1m[22m[2m │ gzip: 103.03 kB[22m
+[2mdist/[22m[36massets/xlsx-CNerDvZX.js           [39m[1m[2m429.19 kB[22m[1m[22m[2m │ gzip: 142.94 kB[22m
+[2mdist/[22m[36massets/firebase-db-B_ReGuE_.js    [39m[1m[2m573.30 kB[22m[1m[22m[2m │ gzip: 169.06 kB[22m
+[32m✓ built in 5.36s[39m
+
+PWA v1.3.0
+mode      generateSW
+precache  18 entries (1913.26 KiB)
+files generated
+  dist/sw.js
+  dist/workbox-07e28819.js

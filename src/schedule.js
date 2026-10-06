@@ -9,7 +9,12 @@ const ord = (n) => { const s = ['th', 'st', 'nd', 'rd'], v = n % 100; return n +
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 export const fmtDate = (iso) => { if (!iso) return ''; const [y, m, d] = iso.split('-').map(Number); return `${ord(d)} ${MONTHS[m - 1]} ${y}`; };
 export const shortDate = (iso) => { if (!iso) return '—'; const [y, m, d] = iso.split('-').map(Number); return `${ord(d)} ${MONTHS[m - 1].slice(0, 3)}`; };
-function daysBetween(a, b) { const out = []; let d = new Date(a + 'T00:00:00'); const end = new Date(b + 'T00:00:00'); let g = 0; while (d <= end && g < 60) { out.push(d.toISOString().slice(0, 10)); d.setDate(d.getDate() + 1); g++; } return out; }
+/* Local-date helpers. Never use toISOString().slice(0,10) for calendar dates:
+   it converts to UTC, which in IST shifts any time before 05:30 to the previous day. */
+export const localISO = (d = new Date()) => { const x = d instanceof Date ? d : new Date(d); return x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0') + '-' + String(x.getDate()).padStart(2, '0'); };
+export const todayISO = () => localISO(new Date());
+export const tomorrowISO = () => { const d = new Date(); d.setDate(d.getDate() + 1); return localISO(d); };
+function daysBetween(a, b) { const out = []; let d = new Date(a + 'T12:00:00'); const end = new Date(b + 'T12:00:00'); let g = 0; while (d <= end && g < 60) { out.push(localISO(d)); d.setDate(d.getDate() + 1); g++; } return out; }
 
 /* Build one VIP's personalised schedule from logistics + sessions + founder + standard hospitality. */
 export function buildPersonalSchedule(c, store) {
