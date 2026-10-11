@@ -612,3 +612,28 @@ tr:hover .rowacts{opacity:1}
 .gp-check td,.gp-check th{padding:4px 8px;text-align:left}
 .gp-hl{margin:6px 0 8px 18px;padding:0}
 @media(max-width:900px){.gp-grid{grid-template-columns:1fr}.gp-kv{grid-template-columns:90px 1fr}}
+.gp-other{margin-top:8px;padding-top:6px;border-top:1px dashed var(--line)}
+.gp-mand{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
+.gp-chip{font-size:11.5px;font-weight:600;padding:2px 8px;border-radius:10px;background:#F1F1EC;color:var(--muted);white-space:nowrap}
+.gp-chip.ok{background:var(--teal-wash);color:var(--teal)}
+.gp-chip.warn{background:var(--amber-wash);color:var(--amber)}
+.gp-src{font-size:10.5px;color:var(--muted);background:#F1F1EC;padding:1px 6px;border-radius:8px;white-space:nowrap}
+.gp-item{align-items:center}
+.gp-item.src-travel,.gp-item.src-logistics{color:var(--blue)}
+.gp-item.src-sahebji{color:var(--purple)}
+.gp-item.src-poc-allocation{color:var(--teal)}
+@media print{
+  .gp.print-target{padding:0 4px}
+  .gp.print-target section,.gp.print-target .gp-day{break-inside:avoid}
+  .gp.print-target .gp-grid{grid-template-columns:1fr 1fr}
+  .gp.print-target a{color:inherit;text-decoration:none}
+}
+
+/* ── Icon sizing safety net ──
+   Icons have no size of their own, so an icon placed anywhere without a specific rule used to
+   stretch to fill its box (the giant inbox on empty screens). Every icon now defaults to text size;
+   the specific rules above (.btn .ic, .nav-item .ic …) still win where set. */
+.ic{width:16px;height:16px;flex:none;vertical-align:-3px}
+.empty .ic{width:30px;height:30px;color:var(--faint);opacity:.8;vertical-align:middle}
+.gp a{color:var(--teal);text-decoration:none}
+.gp a:hover{text-decoration:underline}

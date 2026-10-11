@@ -280,7 +280,7 @@ function overlap(a, b) {
 }
 
 /* ══ Screen ══ */
-export function Assistant({ store, activeEventId }) {
+export function Assistant({ store, rawStore, activeEventId }) {
   const { profile } = useAuth();
   const toast = useToast();
   const can = k => hasPermission(profile, k);
@@ -326,7 +326,7 @@ export function Assistant({ store, activeEventId }) {
           </div>
         )}
         {!sel && !q && <div style={{ padding: 16 }}><Empty title="Search for a guest" sub="Type part of a name, organisation or phone number." /></div>}
-        {sel && <GuestProfile c={sel} store={store} activeEventId={activeEventId} canLookup={can('ai.lookup')} toast={toast} />}
+        {sel && <GuestProfile c={sel} store={store} rawStore={rawStore} activeEventId={activeEventId} canLookup={can('ai.lookup')} toast={toast} />}
       </div>}
     </>
   );
@@ -449,40 +449,185 @@ function AskAI({ store, activeEventId, onOpenGuest, canOpen }) {
   );
 }
 
-/* ══ Guest profile ══ */
-function GuestProfile({ c, store, activeEventId, canLookup, toast }) {
+/* ══ Guest profile ══════════════════════════════════════════════════
+   Gathers everything the app holds about one guest, from every module. "Other recorded fields"
+   lists anything saved on the guest's records that isn't shown above, so nothing is ever hidden. */
+
+// Personalised Schedule rows exactly as that screen builds them (auto rows + hand-added rows,
+// hidden rows left out, per-guest time changes applied, POC Required ticks)
+const MANDATORY_KEYWORDS = {
+  arrivalAtVenue: ['arrival at venue'], guidedTour: ['guided tour', 'exhibition'], mediaBytes: ['media bytes', 'media byte'],
+  sahebji: ['sahebji', 'one-on-one', 'one on one'], podcast: ['podcast'],
+};
+function personalSchedule(store, c, L, cfg) {
+  const cid = c.id;
+  const saved = (store.personalisedSchedule || []).filter(r => r.contactId === cid);
+  const isLegacyAuto = r => { const b = r.refId || r.id || ''; return b.startsWith('auto_session_') && !b.includes('__'); };
+  const canon = r => { const b = r.refId || r.id || ''; return isLegacyAuto(r) ? `${b}__${cid}` : b; };
+  const override = id => saved.find(r => r.override && r.refId === id);
+  const deleted = new Set(saved.filter(r => r.auto && r.deleted).map(canon));
+  const pocOv = Object.fromEntries(saved.filter(r => r.auto && !r.deleted && !r.override).map(r => [canon(r), r.pocRequired || false]));
+  // hand-added rows, in the same threaded order as the Personalised Schedule screen
+  const manualAll = saved.filter(r => !r.auto && !r.override);
+  const byId = Object.fromEntries(manualAll.map(r => [r.id, r]));
+  const seen = new Set(), manual = [];
+  const chain = r => { if (!r || seen.has(r.id)) return; seen.add(r.id); manual.push(r); manualAll.filter(x => x.insertAfter === r.id && !seen.has(x.id)).forEach(chain); };
+  const byTime = (a, b) => ((a.date || '') + (a.time || '')) > ((b.date || '') + (b.time || '')) ? 1 : -1;
+  manualAll.filter(r => !r.insertAfter || !byId[r.insertAfter]).sort(byTime).forEach(chain);
+  manualAll.filter(r => !seen.has(r.id)).sort(byTime).forEach(chain);
+
+  const autos = [];
+  const arrSrc = L.arrivalOverride ? 'manual' : (L.arrivalSource || 'manual');
+  if (L.arrivalDate && L.arrivalTime) autos.push({ id: `auto_arrival_${cid}`, date: L.arrivalDate, time: L.arrivalTime, source: 'Logistics',
+    event: arrSrc === 'flight' ? `Arrival at ${L.arrivalLocation || 'the Airport'}${L.arrivalFlightNo ? ` (${L.arrivalFlightNo})` : ''}` : arrSrc === 'car' ? `Arrival at ${L.arrivalLocation || 'the venue'} by car` : 'Arrival at the Airport' });
+  const plan = travelPlan(L, cfg);
+  plan.steps.forEach(st => {
+    if (st.key === 'land' || (st.key === 'reach' && arrSrc === 'car')) return;
+    autos.push({ id: `auto_travel_${st.key}_${cid}`, date: st.date, time: st.time, event: st.label, source: 'Travel' });
+  });
+  if (!plan.steps.some(st => st.key === 'depart') && L.departureDate && L.departureTime)
+    autos.push({ id: `auto_travel_depart_${cid}`, date: L.departureDate, time: L.departureTime, event: `Departure${L.departureLocation ? ' from ' + L.departureLocation : ''}`, source: 'Travel' });
+  const sIds = (store.assignments || []).filter(a => a.contactId === cid).map(a => a.sessionId);
+  (store.sessions || []).filter(s => sIds.includes(s.id)).forEach(s => {
+    const id = `auto_session_${s.id}__${cid}`, ov = override(id);
+    autos.push({ id, date: ov?.date || s.date, time: ov?.time || s.start, event: s.title, source: 'Scheduling', overridden: !!ov });
+  });
+  const m = (store.founder || []).find(f => f.contactId === cid);
+  const manualSahebji = manualAll.some(r => /sahebji|one-on-one|one on one/i.test(r.event || ''));
+  if (m && m.date && m.time && !manualSahebji) autos.push({ id: `auto_sahebji_${cid}`, date: m.date, time: m.time, event: 'One-on-One Meeting with Sahebji', source: 'Sahebji' });
+  saved.filter(r => r.auto && r.id?.startsWith('poc_auto_') && !r.deleted).forEach(r => autos.push({ ...r, source: 'POC Allocation' }));
+
+  const rows = [
+    ...manual.filter(r => !r.deleted && !(r.event || '').startsWith('__session__')).map(r => ({ ...r, source: 'Manual' })),
+    ...autos.filter(r => !deleted.has(r.id)).map(r => ({ ...r, pocRequired: pocOv[r.id] ?? r.pocRequired ?? false })),
+  ].sort(byTime);
+
+  // Mandatory items: ticked for this guest → must appear somewhere in the schedule
+  const cfgItems = ((store.appConfig || []).find(x => x.id === 'mandatoryItems')?.items || [])
+    .map(i => typeof i === 'string' ? { key: i.toLowerCase().replace(/\s+/g, '_'), label: i } : i).filter(i => i && i.key);
+  const DEF = [{ key: 'guidedTour', label: 'Guided tour' }, { key: 'mediaBytes', label: 'Media Bytes' }, { key: 'sahebji', label: 'Sahebji meeting' }, { key: 'podcast', label: 'Podcast' }];
+  const ALL = [{ key: 'arrivalAtVenue', label: 'Arrival at Venue' }, ...DEF, ...cfgItems.filter(ci => !DEF.find(d => d.key === ci.key)).map(i => ({ key: i.key, label: i.label || i.key }))];
+  const chosen = (store.personalisedMandatory || []).find(r => r.contactId === cid) || { arrivalAtVenue: true };
+  const mandatory = ALL.filter(it => chosen[it.key]).map(it => {
+    const kws = MANDATORY_KEYWORDS[it.key] || [(it.label || it.key).toLowerCase()];
+    return { label: it.label, done: rows.some(r => kws.some(k => (r.event || '').toLowerCase().includes(k))) };
+  });
+  return { rows, mandatory };
+}
+
+// A volunteer's slots on a day (same rule as POC Allocation: a ticked day with no times = 09:00–22:00)
+function volSlots(store, volId, day, eventId) {
+  const a = (store.availability || []).find(x => x.volId === volId && x.day === day && x.eventId === eventId);
+  if (!a || !a.checked) return [];
+  if (!a.fullDay && Array.isArray(a.slots) && a.slots.some(s => s.start && s.end)) return a.slots.filter(s => s.start && s.end);
+  if (a.start && a.end) return [{ start: a.start, end: a.end }];
+  return [{ start: '09:00', end: '22:00' }];
+}
+
+const SHOWN = {
+  contact: ['id', 'eventId', '_updated', 'name', 'honor', 'suffix', 'desig', 'org', 'field', 'type', 'status', 'phone', 'email', 'address', 'liaisonName', 'liaisonPhone',
+    'eventRole', 'eventNotes', 'remark', 'tags', 'last', 'createdAt', 'updatedAt'],
+  logistics: ['id', 'eventId', '_updated', 'contactId', 'arrivalDate', 'arrivalTime', 'arrivalLocation', 'departureDate', 'departureTime', 'departureLocation',
+    'arrivalSource', 'departureSource', 'arrivalOverride', 'departureOverride', 'plannedArrivalDate', 'plannedDepartureDate',
+    'flightReq', 'carReq', 'accomReq', 'arrivalFrom', 'arrivalTo', 'arrivalFlightNo', 'arrivalFlightDate', 'arrivalFlightTime', 'arrivalPnr',
+    'departureFrom', 'departureTo', 'departureFlightNo', 'departureFlightDate', 'departureFlightTime', 'departureIntl', 'departurePnr',
+    'hotelName', 'checkinDate', 'checkinTime', 'checkoutDate', 'checkoutTime', 'carVendorId', 'carDriverId', 'carType', 'carPickupFrom',
+    'carPickupDate', 'carPickupTime', 'carDepartureDate', 'carDepartureTime', 'overallPocId', 'remarks', 'item'],
+};
+const LABEL = k => k.replace(/([A-Z])/g, ' $1').replace(/^./, x => x.toUpperCase()).replace(/_/g, ' ');
+const show = v => {
+  if (v === true) return 'Yes'; if (v === false) return 'No';
+  if (Array.isArray(v)) return v.map(x => (typeof x === 'object' ? JSON.stringify(x) : String(x))).join(', ');
+  if (v && typeof v === 'object') return v.seconds ? tsText(v) : JSON.stringify(v);
+  return String(v);
+};
+const when = ms => new Date(ms).toLocaleString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+const tsText = v => v?.seconds ? when(v.seconds * 1000) : (typeof v === 'number' ? when(v) : '');
+function OtherFields({ rec, known, title = 'Other recorded fields' }) {
+  const extra = Object.entries(rec || {}).filter(([k, v]) => !known.includes(k) && v !== '' && v !== null && v !== undefined && !(Array.isArray(v) && !v.length) && !k.startsWith('_'));
+  if (!extra.length) return null;
+  return (
+    <div className="gp-other">
+      <div className="muted-sm" style={{ fontWeight: 600, marginBottom: 2 }}>{title}</div>
+      {extra.map(([k, v]) => <div key={k} className="gp-kv"><span>{LABEL(k)}</span><div>{show(v)}</div></div>)}
+    </div>
+  );
+}
+
+export function GuestProfile({ c, store, rawStore, activeEventId, canLookup, toast }) {
   const cfg = getTravelCfg(store, activeEventId);
   const L = pickLogistics(store.logistics || [], c.id);
   const vols = store.volunteers || [];
   const vendors = store.carVendors || [];
-  const vName = id => vols.find(v => v.id === id)?.name || '—';
+  const vol = id => vols.find(v => v.id === id);
+  const vName = id => vol(id)?.name || '—';
   const plan = travelPlan(L, cfg);
   const warns = travelWarnings(L, cfg);
   const sessions = (store.assignments || []).filter(a => a.contactId === c.id)
     .map(a => (store.sessions || []).find(s => s.id === a.sessionId)).filter(Boolean)
     .sort((a, b) => `${a.date}${a.start}` > `${b.date}${b.start}` ? 1 : -1);
+  const minute = (store.minuteItems || []).filter(mi => mi.speakerId === c.id)
+    .map(mi => ({ ...mi, session: (store.sessions || []).find(s => s.id === mi.sessionId) }));
   const m = (store.founder || []).find(f => f.contactId === c.id);
   const pocs = (store.poc || []).filter(p => p.contactId === c.id && p.eventId === activeEventId).sort((a, b) => a.day > b.day ? 1 : -1);
   const notes = (store.contact_notes || []).filter(n => n.contactId === c.id).sort((a, b) => ((b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0)));
-  const manual = (store.personalisedSchedule || []).filter(r => r.contactId === c.id && !r.auto && !r.deleted && !r.override && r.date && r.time && !(r.event || '').startsWith('__session__'));
   const vendor = vendors.find(v => v.id === L.carVendorId);
   const driver = vendor?.drivers?.find(d => d.id === L.carDriverId);
   const pending = pendingFor(L);
+  const { rows, mandatory } = personalSchedule(store, c, L, cfg);
+  const kit = (store.felicitation || []).find(k => k.contactId === c.id) || {};
+  const KIT = ['Momento', 'Shawl', 'Kumkum', 'Cover', 'Gold Coin', 'Silver Coin', 'Frame'];
+  const kitKey = i => i.toLowerCase().replace(/ /g, '_');
+  const nights = L.checkinDate && L.checkoutDate ? Math.max(0, Math.round((Date.parse(L.checkoutDate) - Date.parse(L.checkinDate)) / 864e5)) : null;
 
-  // Day-by-day: arrival, travel steps, sessions, Sahebji, POC, manual rows
-  const items = [];
-  if (L.arrivalDate && L.arrivalTime) items.push({ date: L.arrivalDate, time: L.arrivalTime, text: `Arrival${L.arrivalLocation ? ' at ' + L.arrivalLocation : ''}`, kind: 'travel' });
-  plan.steps.filter(s => s.key !== 'land').forEach(s => items.push({ date: s.date, time: s.time, text: s.label, kind: 'travel' }));
-  sessions.forEach(s => items.push({ date: s.date, time: s.start || '', text: `${s.title}${s.venue ? ' · ' + s.venue : ''}`, kind: 'session' }));
-  if (m?.date && m?.time) items.push({ date: m.date, time: m.time, text: `One-on-one with Sahebji (${m.duration || 30} min)${m.frozen ? ' 🔒' : ''}`, kind: 'sahebji' });
-  pocs.forEach(p => items.push({ date: p.day, time: p.fromTime || '', text: `POC: ${vName(p.volunteerId)}${p.fromTime ? ` (${p.fromTime}–${p.toTime})` : ''}`, kind: 'poc' }));
-  manual.forEach(r => items.push({ date: r.date, time: r.time, text: r.event, kind: 'manual' }));
-  const days = [...new Set(items.map(i => i.date))].sort();
+  // POC: needed (from POC Required ticks) vs assigned, with the same checks POC Allocation makes
+  const needs = pocNeeds(store.personalisedSchedule || [], c.id);
+  const pocDays = [...new Set([...Object.keys(needs), ...pocs.map(p => p.day)])].sort();
+  const pocIssues = day => {
+    const need = needs[day], p = pocs.find(x => x.day === day), out = [];
+    if (need && !p) out.push('No POC assigned');
+    if (!p) return out;
+    if (!need) out.push('POC no longer required for this day');
+    else if (p.fromTime && (p.fromTime !== need.from || p.toTime !== need.to)) out.push(`Timing changed — now needed ${need.from}–${need.to}`);
+    const v = vol(p.volunteerId);
+    if (!v) out.push('Assigned volunteer no longer exists');
+    else {
+      const sl = volSlots(store, v.id, day, activeEventId);
+      if (!sl.length) out.push(`${v.name} is not available on this day`);
+      else if (p.fromTime && p.toTime && !sl.some(x => tMin(x.start) <= tMin(p.fromTime) && tMin(x.end) >= tMin(p.toTime))) out.push(`Outside ${v.name}'s hours (${sl.map(x => `${x.start}–${x.end}`).join(', ')})`);
+    }
+    if ((L.arrivalDate && day < L.arrivalDate) || (L.departureDate && day > L.departureDate)) out.push('Outside the guest’s stay');
+    return out;
+  };
 
-  const Row = ({ k, v }) => v ? <div className="gp-kv"><span>{k}</span><div>{v}</div></div> : null;
+  // Same person in other events (phone, or name)
+  const allC = rawStore?.contacts || [], events = rawStore?.events || [];
+  const ph = x => String(x || '').replace(/\D/g, '').slice(-10), nm = x => String(x || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const others = allC.filter(o => o.id !== c.id && o.eventId !== activeEventId && (
+    (ph(c.phone).length >= 7 && ph(o.phone) === ph(c.phone)) || (nm(c.name).length > 3 && nm(o.name) === nm(c.name))))
+    .map(o => ({ o, ev: events.find(e => e.id === o.eventId) })).filter(x => x.ev)
+    .sort((a, b) => (b.ev.startDate || '') > (a.ev.startDate || '') ? 1 : -1);
+
+  // Recent changes to this guest's records (activity log keeps the guest's name or the record id)
+  const myIds = new Set([c.id, L.id, m?.id, kit.id, ...pocs.map(p => p.id), ...(store.personalisedSchedule || []).filter(r => r.contactId === c.id).map(r => r.id), ...notes.map(n => n.id)].filter(Boolean));
+  const activity = (rawStore?.activity_log || store.activity_log || [])
+    .filter(a => myIds.has(a.detail) || (c.name && a.detail === c.name) || a.detail === displayName(c))
+    .sort((a, b) => (b.ts?.seconds || 0) - (a.ts?.seconds || 0)).slice(0, 15);
+
+  const days = [...new Set(rows.map(r => r.date).filter(Boolean))].sort();
+  const Row = ({ k, v }) => (v || v === 0) ? <div className="gp-kv"><span>{k}</span><div>{v}</div></div> : null;
   const arr = sourceLabel(L, 'arrival'), dep = sourceLabel(L, 'departure');
+  const req = k => L[k] === 'not_required' ? 'Not required' : 'Required';
+
+  const [printing, setPrinting] = useState(false);
+  React.useEffect(() => {
+    if (!printing) return;
+    const t = setTimeout(() => { window.print(); setPrinting(false); }, 80);
+    return () => clearTimeout(t);
+  }, [printing]);
+
   return (
-    <div className="gp">
+    <div className={'gp' + (printing ? ' print-target' : '')}>
       <div className="gp-head">
         <div style={{ flex: 1, minWidth: 220 }}>
           <div className="gp-name">{displayName(c)}</div>
@@ -490,66 +635,151 @@ function GuestProfile({ c, store, activeEventId, canLookup, toast }) {
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
             {c.status && <span className={'badge b-' + c.status.toLowerCase()}>{c.status}</span>}
             {c.type && <span className="badge b-type">{c.type}</span>}
-            {(c.tags || []).map(t => <span key={t} className="badge">{t}</span>)}
+            {(c.tags || []).map(t => <span key={t} className="gp-chip">{t}</span>)}
           </div>
         </div>
-        {pending.length > 0 && <div className="src-warn" style={{ maxWidth: 260 }}>⚠ Still missing: {pending.join(', ')}</div>}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-end' }}>
+          <button className="btn sm no-print" onClick={() => setPrinting(true)}>🖨 Print / PDF</button>
+          <span className="print-only muted-sm">Printed {when(Date.now())}</span>
+          {pending.length > 0 && <div className="src-warn" style={{ maxWidth: 260 }}>⚠ Still missing: {pending.join(', ')}</div>}
+        </div>
       </div>
 
       <div className="gp-grid">
         <section>
           <h3>Contact</h3>
+          <Row k="Name" v={[c.honor, c.name, c.suffix].filter(Boolean).join(' ')} />
+          <Row k="Designation" v={c.desig} />
+          <Row k="Organisation" v={c.org} />
           <Row k="Field" v={c.field} />
           <Row k="Phone" v={c.phone && <a href={`tel:${c.phone}`}>{c.phone}</a>} />
           <Row k="Email" v={c.email && <a href={`mailto:${c.email}`}>{c.email}</a>} />
+          <Row k="Address" v={c.address} />
           <Row k="Liaison" v={[c.liaisonName, c.liaisonPhone].filter(Boolean).join(' · ')} />
           <Row k="Event role" v={c.eventRole} />
           <Row k="Event notes" v={c.eventNotes} />
           <Row k="Remark" v={c.remark} />
+          <Row k="Added" v={tsText(c.createdAt)} />
+          <Row k="Last updated" v={tsText(c._updated)} />
+          <OtherFields rec={c} known={SHOWN.contact} />
         </section>
         <section>
           <h3>Travel & stay</h3>
-          <Row k="Arrival" v={L.arrivalDate && <>{shortDate(L.arrivalDate)} {L.arrivalTime} {L.arrivalLocation && `· ${L.arrivalLocation}`} <span className={'src-tag ' + arr.cls}>{arr.t}</span></>} />
-          <Row k="Departure" v={L.departureDate && <>{shortDate(L.departureDate)} {L.departureTime} {L.departureLocation && `· ${L.departureLocation}`} <span className={'src-tag ' + dep.cls}>{dep.t}</span></>} />
+          <Row k="Arrival" v={L.arrivalDate && <>{shortDate(L.arrivalDate)} {L.arrivalTime} {L.arrivalLocation && `· ${L.arrivalLocation}`} <span className={'src-tag ' + arr.cls}>{arr.t}</span>
+            {L.plannedArrivalDate && L.plannedArrivalDate !== L.arrivalDate && <div className="muted-sm">Planned: {shortDate(L.plannedArrivalDate)}</div>}</>} />
+          <Row k="Departure" v={L.departureDate && <>{shortDate(L.departureDate)} {L.departureTime} {L.departureLocation && `· ${L.departureLocation}`} <span className={'src-tag ' + dep.cls}>{dep.t}</span>
+            {L.plannedDepartureDate && L.plannedDepartureDate !== L.departureDate && <div className="muted-sm">Planned: {shortDate(L.plannedDepartureDate)}</div>}</>} />
+          <Row k="Needs" v={`Flight: ${req('flightReq')} · Car: ${req('carReq')} · Hotel: ${req('accomReq')}`} />
           <Row k="Flights" v={L.flightReq === 'not_required' ? 'Not required' : (L.arrivalFlightNo || L.departureFlightNo) ? <>
-            {L.arrivalFlightNo && <div>In: {L.arrivalFlightNo} · {L.arrivalFrom} → {L.arrivalTo} · lands {shortDate(L.arrivalFlightDate)} {L.arrivalFlightTime}{L.arrivalPnr ? ` · PNR ${L.arrivalPnr}` : ''}</div>}
-            {L.departureFlightNo && <div>Out: {L.departureFlightNo} · {L.departureFrom} → {L.departureTo} · {shortDate(L.departureFlightDate)} {L.departureFlightTime}{L.departureIntl ? ' · international' : ''}{L.departurePnr ? ` · PNR ${L.departurePnr}` : ''}</div>}
+            {L.arrivalFlightNo && <div>In: {L.arrivalFlightNo} · {L.arrivalFrom || '?'} → {L.arrivalTo || '?'} · lands {shortDate(L.arrivalFlightDate)} {L.arrivalFlightTime}{L.arrivalPnr ? ` · PNR ${L.arrivalPnr}` : ''}</div>}
+            {L.departureFlightNo && <div>Out: {L.departureFlightNo} · {L.departureFrom || '?'} → {L.departureTo || '?'} · {shortDate(L.departureFlightDate)} {L.departureFlightTime}{L.departureIntl ? ' · international' : ''}{L.departurePnr ? ` · PNR ${L.departurePnr}` : ''}</div>}
           </> : 'Not booked yet'} />
-          <Row k="Hotel" v={L.accomReq === 'not_required' ? 'Not required' : L.hotelName ? `${L.hotelName} · ${shortDate(L.checkinDate)} → ${shortDate(L.checkoutDate)}` : 'Not set'} />
+          <Row k="Hotel" v={L.accomReq === 'not_required' ? 'Not required' : L.hotelName ? <>
+            {L.hotelName}
+            <div className="muted-sm">Check-in {shortDate(L.checkinDate)} {L.checkinTime || ''} · Check-out {shortDate(L.checkoutDate)} {L.checkoutTime || ''}{nights !== null ? ` · ${nights} night${nights === 1 ? '' : 's'}` : ''}</div>
+          </> : 'Not set'} />
           <Row k="Car" v={L.carReq === 'not_required' ? 'Not required' : vendor ? <>
-            {vendor.name}{L.carType ? ` · ${L.carType}` : ''}{driver ? ` · driver ${driver.name}${driver.contact ? ' (' + driver.contact + ')' : ''}` : ''}
+            {vendor.name}{vendor.contact ? ` (${vendor.contact})` : ''}{L.carType ? ` · ${L.carType}` : ''}
+            {driver && <div>Driver: {driver.name}{driver.contact ? ` · ${driver.contact}` : ''}</div>}
             {L.carPickupDate && <div className="muted-sm">Pickup {shortDate(L.carPickupDate)} {L.carPickupTime}{L.carPickupFrom ? ` from ${L.carPickupFrom}` : ''}</div>}
             {L.carDepartureDate && <div className="muted-sm">Drop {shortDate(L.carDepartureDate)} {L.carDepartureTime}</div>}
           </> : 'Not booked yet'} />
-          <Row k="Overall POC" v={L.overallPocId && vName(L.overallPocId)} />
-          {warns.map(w => <div key={w.key} className="src-warn">⚠ {w.text}</div>)}
+          <Row k="Overall POC" v={L.overallPocId && <>{vName(L.overallPocId)}{vol(L.overallPocId)?.phone ? ` · ${vol(L.overallPocId).phone}` : ''}</>} />
+          <Row k="Remarks" v={L.remarks} />
+          {warns.map(w => <div key={w.key} className="src-warn" style={{ maxWidth: 'none' }}>⚠ {w.text}</div>)}
+          <OtherFields rec={L} known={SHOWN.logistics} />
         </section>
       </div>
 
+      {plan.steps.length > 0 && (
+        <section>
+          <h3>Travel plan</h3>
+          <div className="travel-plan">{plan.steps.map(st => <div key={st.key} className={'tp-step ' + st.key}><span className="mono">{shortDate(st.date)} {st.time}</span><span>{st.label}</span></div>)}</div>
+          {plan.missing.length > 0 && <div className="muted-sm" style={{ marginTop: 6 }}>Add a travel time for {plan.missing.join(' and ')} (Logistics → 🕒 Travel times) to complete it.</div>}
+        </section>
+      )}
+
       <section>
-        <h3>Day by day</h3>
+        <h3>Programme</h3>
+        {sessions.length ? sessions.map(s => (
+          <div key={s.id} className="gp-kv"><span>{shortDate(s.date)} {s.start}{s.end ? `–${s.end}` : ''}</span>
+            <div><b>{s.title}</b>{s.type ? ` · ${s.type}` : ''}{s.venue ? ` · ${s.venue}` : ''}{s.topic && <div className="muted-sm">Topic: {s.topic}</div>}</div></div>
+        )) : <div className="muted-sm">Not assigned to any session.</div>}
+        {minute.length > 0 && <>
+          <div className="muted-sm" style={{ fontWeight: 600, margin: '8px 0 2px' }}>Speaking slots (minute-to-minute)</div>
+          {minute.map(mi => <div key={mi.id} className="gp-kv"><span>{mi.schedule || '—'}{mi.duration ? ` · ${mi.duration}` : ''}</span><div>{mi.detail}{mi.session ? <span className="muted-sm"> — {mi.session.title}, {shortDate(mi.session.date)}</span> : ''}</div></div>)}
+        </>}
+        <div className="gp-kv"><span>Sahebji meeting</span><div>{!m ? 'No meeting yet'
+          : m.durationReq === 'not_required' ? 'Not required'
+          : m.date && m.time ? <>{shortDate(m.date)} {m.time} · {m.duration || 30} min · {m.venue || 'VIP Lounge'}{m.frozen ? ' · 🔒 frozen' : ''}{m.notes && <div className="muted-sm">{m.notes}</div>}</>
+          : 'Needs a time'}</div></div>
+      </section>
+
+      <section>
+        <h3>Personalised schedule</h3>
+        {mandatory.length > 0 && (
+          <div className="gp-mand">{mandatory.map(x => <span key={x.label} className={'gp-chip ' + (x.done ? 'ok' : 'warn')}>{x.done ? '✓' : '⚠'} {x.label}</span>)}</div>
+        )}
         {days.length ? days.map(d => (
           <div key={d} className="gp-day">
             <div className="gp-day-h">{fmtDate(d)}</div>
-            {items.filter(i => i.date === d).sort((a, b) => tMin(a.time) - tMin(b.time)).map((i, k) => (
-              <div key={k} className={'gp-item ' + i.kind}><span className="mono">{i.time || '—'}</span><span>{i.text}</span></div>
+            {rows.filter(r => r.date === d).map((r, k) => (
+              <div key={r.id || k} className={'gp-item src-' + r.source.toLowerCase().replace(/\s+/g, '-')}>
+                <span className="mono">{r.time || '—'}</span>
+                <span style={{ flex: 1 }}>{r.event}{r.overridden ? ' (time changed for this guest)' : ''}</span>
+                {r.pocRequired && <span className="gp-chip ok">POC</span>}
+                <span className="gp-src">{r.source}</span>
+              </div>
             ))}
           </div>
         )) : <div className="muted-sm">Nothing scheduled yet.</div>}
-        {m && !m.date && m.durationReq !== 'not_required' && <div className="muted-sm" style={{ marginTop: 6 }}>Sahebji meeting: needs a time.</div>}
-        {plan.missing.length > 0 && <div className="muted-sm" style={{ marginTop: 6 }}>Add a travel time for {plan.missing.join(' and ')} (Logistics → 🕒 Travel times) to complete the travel plan.</div>}
       </section>
 
-      {notes.length > 0 && (
+      <section>
+        <h3>POC</h3>
+        {pocDays.length ? pocDays.map(d => {
+          const p = pocs.find(x => x.day === d), need = needs[d], issues = pocIssues(d);
+          return (
+            <div key={d} className="gp-kv"><span>{shortDate(d)}</span><div>
+              {need ? <span className="muted-sm">Needed {need.from}–{need.to} · </span> : null}
+              {p ? <>{vName(p.volunteerId)}{vol(p.volunteerId)?.phone ? ` · ${vol(p.volunteerId).phone}` : ''}{p.fromTime ? ` · ${p.fromTime}–${p.toTime}` : ''}{p.frozen ? ' · 🔒' : ''}</> : <b>Not assigned</b>}
+              {issues.map(t => <div key={t} className="src-warn" style={{ maxWidth: 'none' }}>⚠ {t}</div>)}
+            </div></div>
+          );
+        }) : <div className="muted-sm">No POC needed or assigned.</div>}
+      </section>
+
+      <section>
+        <h3>Felicitation kit</h3>
+        <div className="gp-mand">{KIT.map(i => <span key={i} className={'gp-chip ' + (kit[kitKey(i)] ? 'ok' : '')}>{kit[kitKey(i)] ? '✓' : '○'} {i}</span>)}</div>
+      </section>
+
+      <section>
+        <h3>Notes & follow-ups</h3>
+        {notes.length ? notes.map(n => (
+          <div key={n.id} className="gp-note"><span className="muted-sm">{n.date || ''} · {n.type}</span> {n.text}{n.dueDate && !n.done ? <span className="src-warn"> · follow up {shortDate(n.dueDate)}</span> : ''}{n.dueDate && n.done ? <span className="muted-sm"> · done</span> : ''}</div>
+        )) : <div className="muted-sm">No notes.</div>}
+      </section>
+
+      {others.length > 0 && (
         <section>
-          <h3>Notes & follow-ups</h3>
-          {notes.slice(0, 10).map(n => (
-            <div key={n.id} className="gp-note"><span className="muted-sm">{n.date || ''} · {n.type}</span> {n.text}{n.dueDate && !n.done ? <span className="src-warn"> · follow up {shortDate(n.dueDate)}</span> : ''}</div>
+          <h3>Other events</h3>
+          {others.map(({ o, ev }) => (
+            <div key={o.id} className="gp-kv"><span>{ev.name}</span><div>{o.status || '—'}{o.type ? ` · ${o.type}` : ''}{o.eventRole ? ` · ${o.eventRole}` : ''}{ev.startDate ? <span className="muted-sm"> · {shortDate(ev.startDate)}</span> : ''}</div></div>
           ))}
         </section>
       )}
 
-      {canLookup && <OnlineLookup c={c} activeEventId={activeEventId} toast={toast} />}
+      {activity.length > 0 && (
+        <section className="no-print">
+          <h3>Recent changes</h3>
+          {activity.map(a => (
+            <div key={a.id} className="gp-note"><span className="muted-sm">{tsText(a.ts)} · {a.email || 'someone'}</span> {a.action}</div>
+          ))}
+        </section>
+      )}
+
+      {canLookup && <div className="no-print"><OnlineLookup c={c} activeEventId={activeEventId} toast={toast} /></div>}
     </div>
   );
 }
