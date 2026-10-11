@@ -1476,6 +1476,8 @@ async function ticketToPayload(file) {
 }
 
 function FlightModal({ contactId, item, onClose, toast, activeEventId, cfg, places = [], guestName = '' }) {
+  const { can } = usePerm();
+  const canAiTicket = can('ai.ticket');   // the ticket (name, PNR) goes to Gemini — only for people given this
   const [f, setF] = useState(() => ({
     arrivalFrom: '', arrivalTo: '', arrivalFlightNo: '', arrivalFlightDate: '', arrivalFlightTime: '',
     departureFrom: '', departureTo: '', departureFlightNo: '', departureFlightDate: '', departureFlightTime: '', departureIntl: false,
@@ -1509,7 +1511,7 @@ function FlightModal({ contactId, item, onClose, toast, activeEventId, cfg, plac
         res = await fetch('/api/parse-ticket', {
           method: 'POST', signal: ctl.signal,
           headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-          body: JSON.stringify({ ...payload, guestName }),
+          body: JSON.stringify(payload),   // the guest name is NOT sent; the name check happens here
         });
       } catch (e) {
         if (ctl.signal.aborted) throw new Error(ctl.signal.reason === 'timeout'
@@ -1552,7 +1554,7 @@ function FlightModal({ contactId, item, onClose, toast, activeEventId, cfg, plac
   return (
     <Modal title="✈️ Flight details" onClose={onClose} onSave={scan?.busy ? null : save} saveLabel="Save flight details">
       <PlacesDatalist places={places} />
-      <div className="ticket-scan">
+      {canAiTicket && <div className="ticket-scan">
         <label className={'btn sm' + (scan?.busy ? ' disabled' : '')} style={{ cursor: scan?.busy ? 'wait' : 'pointer' }}>
           📎 {scan?.busy ? `Reading ticket… ${secs}s` : 'Upload ticket'}
           <input type="file" accept="application/pdf,image/*" style={{ display: 'none' }} disabled={!!scan?.busy}
@@ -1561,7 +1563,7 @@ function FlightModal({ contactId, item, onClose, toast, activeEventId, cfg, plac
         {scan?.busy
           ? <button type="button" className="btn ghost sm" onClick={() => scanCtl.current?.abort('cancel')}>Cancel</button>
           : <span className="muted-sm">PDF, photo or screenshot. AI reads it and fills the form for you to check.</span>}
-      </div>
+      </div>}
       {scan?.error && <div className="av-err" style={{ marginBottom: 10 }}>{scan.error}</div>}
       {scan?.journeys && (
         <div className="ticket-preview">

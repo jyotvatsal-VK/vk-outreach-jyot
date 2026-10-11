@@ -1532,6 +1532,7 @@ const ALL_NAV_MODULES = [
   { id:'allevents',    label:'All Events' },
   { id:'deptmaster',   label:'Department Master' },
   { id:'export',       label:'Export Data' },
+  { id:'assistant',    label:'Guest info & AI' },
   { id:'help',         label:'Help & Guide' },
   { id:'events',       label:'Events' },
   { id:'settings',     label:'Settings' },

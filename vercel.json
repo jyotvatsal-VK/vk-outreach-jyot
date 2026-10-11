@@ -1,5 +1,7 @@
 {
   "functions": {
-    "api/parse-ticket.js": { "maxDuration": 60 }
+    "api/parse-ticket.js": { "maxDuration": 60 },
+    "api/ask.js": { "maxDuration": 60 },
+    "api/lookup.js": { "maxDuration": 60 }
   }
 }

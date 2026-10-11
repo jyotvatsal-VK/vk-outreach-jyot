@@ -4,15 +4,18 @@
    Nothing is stored: the file is sent to Gemini, the answer comes back, the file is dropped.
 
    Vercel → Project → Settings → Environment Variables:
-     GEMINI_API_KEY   required  — key from https://aistudio.google.com/apikey
-     GEMINI_MODEL     optional  — defaults to gemini-2.5-flash (falls back to gemini-flash-latest)
-     VITE_FB_API_KEY  already set for the app — used here to check the caller is signed in
+     Gemini key (any capitalisation of GEMINI_KEY / GEMINI_API_KEY), VITE_FB_API_KEY, VITE_FB_PROJECT_ID — see _lib.js
+   Only users given "Read flight tickets with AI" (ai.ticket), or Master, can call it — checked here on the server.
+   Note: on the Gemini free tier, Google may use what is sent to improve its products. The ticket includes the
+   passenger's name and PNR, which is why this is limited to the people you choose.
 
-   Request:  { data: <base64>, mimeType: 'application/pdf' | 'image/…', guestName?: string }
+   Request:  { data: <base64>, mimeType: 'application/pdf' | 'image/…' }
              Authorization: Bearer <Firebase ID token>
    Response: { passengers: [..], pnr, airline, isInternational, legs: [{ flightNo, from:{city,code,terminal},
                to:{…}, departDate:'YYYY-MM-DD', departTime:'HH:MM', arriveDate, arriveTime }] }
 ══════════════════════════════════════════════════════════════════ */
+
+import { requireUser, geminiKey, gemini, readBody } from './_lib.js';
 
 const ALLOWED = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'];
 const MAX_B64 = 4_300_000;   // Vercel's request limit is 4.5 MB
@@ -69,83 +72,29 @@ const fixTime = s => { const m = String(s || '').match(/^(\d{1,2})[:.](\d{2})/);
 const str = (s, n = 80) => String(s ?? '').trim().slice(0, n);
 const place = p => ({ city: str(p?.city, 60), code: str(p?.code, 4).toUpperCase(), terminal: str(p?.terminal, 10).replace(/^terminal\s*/i, '') });
 
-async function signedIn(req) {
-  const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  const fbKey = process.env.VITE_FB_API_KEY || process.env.FB_API_KEY;
-  if (!token || !fbKey) return false;
-  try {
-    const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(fbKey)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...(req.headers.origin ? { Referer: req.headers.origin + '/' } : {}) },
-      body: JSON.stringify({ idToken: token }),
-    });
-    if (!r.ok) return false;
-    const j = await r.json();
-    return Array.isArray(j.users) && j.users.length > 0;
-  } catch { return false; }
-}
-
-async function callModel(key, model, body, deadline) {
-  const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), Math.max(5_000, deadline - Date.now()));
-  try {
-    return await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-      method: 'POST', signal: ctl.signal,
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-      body: JSON.stringify(body),
-    });
-  } catch (e) {
-    if (e.name === 'AbortError') throw new Error('the AI took too long. Try a screenshot of just the flight details.');
-    throw e;
-  } finally { clearTimeout(t); }
-}
-
-async function askGemini(key, data, mimeType) {
-  const deadline = Date.now() + 55_000;   // stay inside the function's 60 s limit (vercel.json)
-  const models = [...new Set([process.env.GEMINI_MODEL, 'gemini-2.5-flash', 'gemini-flash-latest'].filter(Boolean))];
-  const base = {
-    contents: [{ role: 'user', parts: [{ text: PROMPT }, { inline_data: { mime_type: mimeType, data } }] }],
-    generationConfig: { temperature: 0, responseMimeType: 'application/json', responseSchema: SCHEMA },
-  };
-  // Copying fields off a ticket needs no "thinking" — switching it off makes the answer several times faster
-  const fast = { ...base, generationConfig: { ...base.generationConfig, thinkingConfig: { thinkingBudget: 0 } } };
-  let lastErr = '';
-  for (const model of models) {
-    let r = await callModel(key, model, fast, deadline);
-    if (r.status === 400) {                                   // a model that doesn't accept the thinking setting
-      const j0 = await r.clone().json().catch(() => ({}));
-      if (/thinking/i.test(j0?.error?.message || '')) r = await callModel(key, model, base, deadline);
-    }
-    if (r.status === 404) { lastErr = `Model ${model} not available`; continue; }   // try the next model name
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j?.error?.message || `Gemini error ${r.status}`);
-    const text = (j.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');
-    if (!text) throw new Error('The AI returned no answer for this file.');
-    return JSON.parse(text);
-  }
-  throw new Error(lastErr || 'No Gemini model available');
-}
-
 export default async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
   if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST' });
 
-  // Accept the usual spellings of the variable name (Vercel names are case-sensitive)
-  const keyName = Object.keys(process.env).find(k => /^gemini(_api)?_key$/i.test(k));   // Gemini_key, GEMINI_API_KEY, gemini_key …
-  const key = keyName ? process.env[keyName] : '';
-  if (!key) return res.status(503).json({ error: 'Ticket reading isn’t switched on yet — add GEMINI_API_KEY in Vercel and redeploy.' });
-  if (!(await signedIn(req))) return res.status(401).json({ error: 'Please sign in again, then retry.' });
+  const key = geminiKey();
+  if (!key) return res.status(503).json({ error: 'Ticket reading isn’t switched on yet — add the Gemini key in Vercel and redeploy.' });
+  const who = await requireUser(req, 'ai.ticket');          // only people given "Read flight tickets with AI"
+  if (!who.ok) return res.status(who.status).json({ error: who.error });
 
-  let body = req.body;
-  if (typeof body === 'string') { try { body = JSON.parse(body); } catch { body = {}; } }
-  const data = String(body?.data || '');
-  const mimeType = String(body?.mimeType || '').toLowerCase();
+  const body = readBody(req);
+  const data = String(body.data || '');
+  const mimeType = String(body.mimeType || '').toLowerCase();
   if (!data) return res.status(400).json({ error: 'No file received.' });
   if (!ALLOWED.includes(mimeType)) return res.status(400).json({ error: 'Upload a PDF, JPG, PNG, WEBP or HEIC file.' });
   if (data.length > MAX_B64) return res.status(413).json({ error: 'File too large (max about 3 MB). Try a screenshot instead.' });
 
   try {
-    const out = await askGemini(key, data, mimeType);
+    const { text } = await gemini(key, {
+      contents: [{ role: 'user', parts: [{ text: PROMPT }, { inline_data: { mime_type: mimeType, data } }] }],
+      generationConfig: { temperature: 0, responseMimeType: 'application/json', responseSchema: SCHEMA },
+    }, { deadlineMs: 55_000, thinking: 0 });
+    if (!text) throw new Error('The AI returned no answer for this file.');
+    const out = JSON.parse(text);
     if (out?.isFlightTicket === false) return res.status(422).json({ error: 'This doesn’t look like a flight ticket.' });
     const legs = (Array.isArray(out?.legs) ? out.legs : []).slice(0, 12).map(l => {
       const departTime = fixTime(l.departTime), arriveTime = fixTime(l.arriveTime);

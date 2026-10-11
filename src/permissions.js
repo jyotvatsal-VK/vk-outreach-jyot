@@ -109,6 +109,17 @@ export const PERMISSION_GROUPS = [
     ],
   },
   {
+    module: 'assistant',
+    label: 'Guest info & AI',
+    icon: '✨',
+    actions: [
+      { key: 'assistant.view',     label: 'View guest profiles (no AI)' },
+      { key: 'ai.ask',             label: 'Ask AI questions (names are coded, not sent)' },
+      { key: 'ai.lookup',          label: 'Look up guests online (sends name, organisation, designation)' },
+      { key: 'ai.ticket',          label: 'Read flight tickets with AI (sends the ticket) — used in Logistics' },
+    ],
+  },
+  {
     module: 'settings',
     label: 'Settings',
     icon: '⚙️',

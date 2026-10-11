@@ -11,6 +11,7 @@ import { hasPermission } from './permissions';
 import { Dashboard, Outreach, Logistics, Scheduling, Volunteers, Depts, Reports,
          POCAllocation, ExportData, NotificationBell, GlobalSearch } from './views';
 import { Settings } from './settings';
+import { Assistant } from './assistant';
 
 const NAV = [
   { id:'dash',         label:'Dashboard',            icon:'dash'     },
@@ -23,6 +24,7 @@ const NAV = [
   { id:'reports',      label:'Personalised Schedule', icon:'doc'      },
   { id:'pocallocation',label:'POC Allocation',        icon:'users'    },
   { id:'export',       label:'Export Data',           icon:'doc'      },
+  { id:'assistant',    label:'Guest info & AI',       icon:'spark'    },
   { id:'settings',     label:'Settings',              icon:'users'    },
 ];
 
@@ -170,7 +172,7 @@ function Shell({ user, profile, logout }) {
     depts: Depts, reports: Reports,
     availability: Volunteers,
     pocallocation: POCAllocation,
-    export: ExportData, settings: Settings,
+    export: ExportData, settings: Settings, assistant: Assistant,
   };
   const Active = VIEWS[view] || Dashboard;
 
