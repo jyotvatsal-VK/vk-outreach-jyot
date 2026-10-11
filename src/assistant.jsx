@@ -74,11 +74,7 @@ function buildCoder(store) {
   });
   vols.forEach(v => { if (v.name) pairs.push([v.name, vCode.get(v.id)]); });
   hotels.forEach(h => pairs.push([h, hCode.get(h.toLowerCase())]));
-  const firstCount = {};
-  const firsts = [];
-  contacts.forEach(c => { const f = String(c.name || '').trim().split(/\s+/)[0]; if (f && f.length >= 4) { firstCount[f.toLowerCase()] = (firstCount[f.toLowerCase()] || 0) + 1; firsts.push([f, gCode.get(c.id)]); } });
-  vols.forEach(v => { const f = String(v.name || '').trim().split(/\s+/)[0]; if (f && f.length >= 4) { firstCount[f.toLowerCase()] = (firstCount[f.toLowerCase()] || 0) + 1; firsts.push([f, vCode.get(v.id)]); } });
-  firsts.forEach(([f, code]) => { if (firstCount[f.toLowerCase()] === 1) pairs.push([f, code]); });
+  // (Full names only. A lone first name is never swapped: "Dr Arun Kumar Singh" must not become volunteer "Arun Bansal".)
   pairs.sort((a, b) => b[0].length - a[0].length);
   const res = pairs.filter(([n]) => n && n.trim().length >= 3).map(([n, code]) => [new RegExp(`(^|[^A-Za-z0-9])${escRe(n.trim())}(?=$|[^A-Za-z0-9])`, 'gi'), code]);
   const scrub = str => {
@@ -87,8 +83,108 @@ function buildCoder(store) {
     // anything that still looks like a phone number or email never goes out
     return s.replace(/[\w.+-]+@[\w-]+\.[\w.]+/g, '[email]').replace(/(?<!\d)(?:\+?\d[\s-]?){9,13}\d(?!\d)/g, '[number]');   // 10+ digits; dates have only 8
   };
-  return { gCode, vCode, hCode, label, scrub, contacts, vols };
+  const people = [
+    ...contacts.map(c => ({ kind: 'guest', id: c.id, code: gCode.get(c.id), name: displayName(c), sub: [c.desig, c.org].filter(Boolean).join(' · '), words: nameWords(c.name) })),
+    ...vols.map(v => ({ kind: 'volunteer', id: v.id, code: vCode.get(v.id), name: v.name || '', sub: 'Volunteer', words: nameWords(v.name) })),
+  ].filter(p => p.words.length);
+  return { gCode, vCode, hCode, label, scrub, contacts, vols, people };
 }
+
+/* ══ Finding people in a question — done here, before anything is sent ══
+   A person matches when at least two of their name words appear close together in the question
+   ("arun singh" finds "Dr. Arun Kumar Singh"; titles and initials are ignored).
+   A single word matches only if it is someone's full name (one-word names). */
+const TITLES = new Set(['dr', 'prof', 'professor', 'mr', 'mrs', 'ms', 'miss', 'shri', 'smt', 'sri', 'ji', 'sir', 'madam', 'adv', 'hon', 'justice', 'col', 'capt', 'gen', 'maj', 'pujya', 'sant']);
+function nameWords(n) { return String(n || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length > 1 && !TITLES.has(w)); }
+function lev(a, b) {
+  if (a === b) return 0;
+  const m = a.length, n = b.length; if (!m || !n) return m || n;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[n];
+}
+const wordSim = (a, b) => 1 - lev(a, b) / Math.max(a.length, b.length);
+// Words that are never part of a name — used to spot a name we could NOT match
+const COMMON = new Set(('a an the of for to in on at by and or is are was were be been am do does did has have had will would can could should shall may ' +
+  'what when where who whom whose which why how all any each every some many much more most no not only also just than then there their them they ' +
+  'this that these those it its his her him he she we you your our me my i details detail info information everything profile about tell show give list ' +
+  'arrive arrives arriving arrival reach reaches reaching depart departs leaving leave leaves departure flight flights hotel car pickup drop poc ' +
+  'session sessions meeting sahebji schedule today tomorrow yesterday day days date time morning evening afternoon night before after between ' +
+  'guest guests volunteer volunteers panelist panelists vip delegate speaker speakers event venue airport please need want know find get ' +
+  'confirmed pending declined status assigned assign free busy available availability with without from into out up down please kindly').split(' '));
+const TRIGGER = new Set(['of', 'about', 'for', 'is', 'does', 'did', 'will', 'dr', 'prof', 'mr', 'mrs', 'ms', 'shri', 'smt', 'sri']);
+
+function findPeople(question, people) {
+  const toks = [...String(question).matchAll(/[A-Za-z0-9]+/g)].map(m => ({ w: m[0].toLowerCase(), start: m.index, end: m.index + m[0].length }));
+  const hits = [];
+  people.forEach(p => {
+    const idx = toks.map((t, i) => (p.words.includes(t.w) ? i : -1)).filter(i => i >= 0);
+    const distinct = new Set(idx.map(i => toks[i].w));
+    const need = p.words.length === 1 ? 1 : 2;
+    if (distinct.size < need) return;
+    // the matched words must sit together (at most one other word between them)
+    for (let a = 0; a < idx.length; a++) {
+      let b = a;
+      while (b + 1 < idx.length && idx[b + 1] - idx[b] <= 2) b++;
+      const grp = idx.slice(a, b + 1);
+      const words = new Set(grp.map(i => toks[i].w));
+      if (words.size >= need) hits.push({ p, from: grp[0], to: grp[grp.length - 1], score: words.size + words.size / p.words.length });
+      a = b;
+    }
+  });
+  // Best match per stretch of the question; ties on the same stretch = ambiguous
+  hits.sort((x, y) => y.score - x.score);
+  const taken = [], matched = [], ambiguous = [];
+  hits.forEach(h => {
+    if (taken.some(t => !(h.to < t.from || h.from > t.to))) return;
+    const same = hits.filter(o => o !== h && o.score === h.score && !(o.to < h.from || o.from > h.to));
+    taken.push(h);
+    if (same.length) ambiguous.push({ text: question.slice(toks[h.from].start, toks[h.to].end), options: [h.p, ...same.map(o => o.p)] });
+    else matched.push(h);
+  });
+  // A single name word on its own ("details of raj"): one person → them; several → ask which.
+  // Skipped when it sits next to other unknown name words ("arun kumar singh" is someone else, not volunteer Arun).
+  const used = new Set(); taken.forEach(t => { for (let i = t.from; i <= t.to; i++) used.add(i); });
+  const nameish = i => i >= 0 && i < toks.length && !used.has(i) && !COMMON.has(toks[i].w) && !TITLES.has(toks[i].w) && !/\d/.test(toks[i].w);
+  toks.forEach((t, i) => {
+    if (!nameish(i) || nameish(i - 1) || nameish(i + 1) || t.w.length < 3) return;
+    const who = people.filter(p => p.words.includes(t.w));
+    if (!who.length) return;
+    const h = { p: who[0], from: i, to: i, score: 1 };
+    if (who.length === 1) matched.push(h);
+    else ambiguous.push({ text: question.slice(t.start, t.end), options: who.slice(0, 8) });
+    used.add(i);
+  });
+  // Name-like words we could not match (after "of", "about", "Dr"…, or the whole question)
+  const unknown = [];
+  for (let i = 0; i < toks.length; i++) {
+    if (used.has(i) || COMMON.has(toks[i].w) || TITLES.has(toks[i].w) || /\d/.test(toks[i].w)) continue;
+    let j = i; while (j + 1 < toks.length && !used.has(j + 1) && !COMMON.has(toks[j + 1].w) && !TITLES.has(toks[j + 1].w) && !/\d/.test(toks[j + 1].w)) j++;
+    const prev = toks[i - 1]?.w;
+    const isName = j > i && (i === 0 || TRIGGER.has(prev) || (i > 0 && TITLES.has(prev)));
+    if (isName) {
+      const text = question.slice(toks[i].start, toks[j].end);
+      const qw = toks.slice(i, j + 1).map(t => t.w);
+      const sim = p => qw.reduce((sum, w) => sum + Math.max(0, ...p.words.map(pw => wordSim(w, pw))), 0) / qw.length;
+      const suggestions = people.map(p => ({ p, s: sim(p) })).filter(x => x.s >= 0.6).sort((a, b) => b.s - a.s).slice(0, 4).map(x => x.p);
+      unknown.push({ text, suggestions });
+    }
+    i = j;
+  }
+  // Question with matched people swapped for their codes (titles just before a name go too)
+  let coded = '', pos = 0;
+  [...matched].sort((a, b) => a.from - b.from).forEach(h => {
+    let f = h.from; while (f > 0 && TITLES.has(toks[f - 1].w)) f--;
+    coded += question.slice(pos, toks[f].start) + h.p.code; pos = toks[h.to].end;
+  });
+  coded += question.slice(pos);
+  return { matched: matched.map(h => h.p), ambiguous, unknown, coded };
+}
+const DETAILS_RE = /^\s*(all\s+)?(details?|info|information|everything|profile|who\s+is)\b|\b(details?|everything|all\s+info|information|profile)\s+(of|about|on|for)\b/i;
 
 function buildContext(store, activeEventId, coder) {
   const cfg = getTravelCfg(store, activeEventId);
@@ -247,11 +343,24 @@ function AskAI({ store, activeEventId, onOpenGuest, canOpen }) {
     if (!text || busy) return;
     const coder = buildCoder(store);
     coderRef.current = coder;
-    const qCoded = coder.scrub(text);
-    const guests = [...new Set((qCoded.match(/\bG\d+\b/g) || []))];
+    const found = findPeople(text, coder.people);
+    setQuestion('');
+    // Answered here, nothing sent: a name we can't place, or a name that fits several people
+    if (found.ambiguous.length || (found.unknown.length && !found.matched.length)) {
+      setTurns(t => [...t, { q: text, local: { ambiguous: found.ambiguous, unknown: found.ambiguous.length ? [] : found.unknown } }]);
+      return;
+    }
+    const guests = [...new Set(found.matched.filter(p => p.kind === 'guest').map(p => p.code))];
+    // "details of X" → the guest's profile is the exact answer, no AI needed
+    if (canOpen && DETAILS_RE.test(text) && guests.length === 1 && found.matched.length === 1) {
+      const gid = found.matched[0].id;
+      setTurns(t => [...t, { q: text, local: { opened: found.matched[0].name } }]);
+      onOpenGuest(gid);
+      return;
+    }
+    const qCoded = coder.scrub(found.coded);
     const idx = turns.length;
     setTurns(t => [...t, { q: text, qCoded, busy: true, guests }]);
-    setQuestion('');
     try {
       const context = buildContext(store, activeEventId, coder);
       const history = turns.filter(t => t.aCoded).slice(-4).map(t => ({ q: t.qCoded, a: t.aCoded }));
@@ -283,6 +392,24 @@ function AskAI({ store, activeEventId, onOpenGuest, canOpen }) {
             {canOpen && t.guests?.length > 0 && coder && (
               <div className="ai-chips">{t.guests.map(code => { const gid = idByCode(code); return gid ? <button key={code} className="btn xs" onClick={() => onOpenGuest(gid)}>Open profile: {coder.label[code]}</button> : null; })}</div>
             )}
+            {t.local?.opened && <div className="ai-a">Opened <b>{t.local.opened}</b>’s full profile below — it shows everything the app holds. Ask a follow-up here for anything specific.</div>}
+            {t.local?.ambiguous?.map((a, k) => (
+              <div key={'a' + k} className="ai-a">“{a.text}” could be more than one person. Which one?
+                <div className="ai-chips" style={{ marginTop: 6 }}>{a.options.map(p => (
+                  <button key={p.code} className="btn xs" onClick={() => { if (p.kind === 'guest' && canOpen) onOpenGuest(p.id); else setQuestion(t.q.replace(a.text, p.name)); }}>{p.name}{p.sub ? ` · ${p.sub}` : ''}</button>
+                ))}</div>
+              </div>
+            ))}
+            {t.local?.unknown?.map((u, k) => (
+              <div key={'u' + k} className="ai-a">There is no guest or volunteer called “{u.text}” in this event. Nothing was sent to the AI.
+                {u.suggestions.length > 0 ? <>
+                  {' '}Did you mean:
+                  <div className="ai-chips" style={{ marginTop: 6 }}>{u.suggestions.map(p => (
+                    <button key={p.code} className="btn xs" onClick={() => setQuestion(t.q.replace(u.text, p.name))}>{p.name}{p.sub ? ` · ${p.sub}` : ''}</button>
+                  ))}</div>
+                </> : ' Check the spelling, or whether they were added to a different event.'}
+              </div>
+            ))}
             {t.busy && <div className="ai-a muted-sm">Thinking…</div>}
             {t.error && <div className="av-err">{t.error}</div>}
             {t.aCoded && <div className="ai-a">{t.aCoded.split(/\n{2,}/).map((para, j) => <p key={j}>{para.split('\n').map((line, k) => <React.Fragment key={k}>{k > 0 && <br />}{render(line.replace(/^\s*[-*]\s+/, '• ').replace(/\*\*/g, ''))}</React.Fragment>)}</p>)}</div>}
