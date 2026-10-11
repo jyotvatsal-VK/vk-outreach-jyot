@@ -184,9 +184,11 @@ function findPeople(question, people) {
   coded += question.slice(pos);
   return { matched: matched.map(h => h.p), ambiguous, unknown, coded };
 }
-const DETAILS_RE = /^\s*(all\s+)?(details?|info|information|everything|profile|who\s+is)\b|\b(details?|everything|all\s+info|information|profile)\s+(of|about|on|for)\b/i;
+const DETAILS_RE = /^\s*(all\s+)?(details?|info|information|everything|profile)\b|\b(details?|everything|all\s+info|information|profile)\s+(of|about|on|for)\b/i;
+const WHO_IS_RE = /^\s*(who\s+is|tell\s+me\s+about|show\s+me)\s+G\d+\s*\??\s*$/i;   // "who is Raj Doshi" — but not "who is the POC for Raj Doshi"
 
-function buildContext(store, activeEventId, coder) {
+/* scope: { guestIds: Set | null, volunteers: bool, allSessions: bool } — send only what the question needs (faster answers) */
+function buildContext(store, activeEventId, coder, scope = {}) {
   const cfg = getTravelCfg(store, activeEventId);
   const logi = store.logistics || [];
   const sessions = [...(store.sessions || [])].sort((a, b) => `${a.date}${a.start}` > `${b.date}${b.start}` ? 1 : -1);
@@ -206,7 +208,7 @@ function buildContext(store, activeEventId, coder) {
   const by = (L, k) => L[`${k}Override`] ? 'typed by hand' : ({ flight: 'flight', car: 'car' })[L[`${k}Source`]] || 'planned';
   const ev = (store.events || []).find(e => e.id === activeEventId) || {};
 
-  const guests = coder.contacts.map(c => {
+  const guests = coder.contacts.filter(c => !scope.guestIds || scope.guestIds.has(c.id)).map(c => {
     const L = pickLogistics(logi, c.id);
     const plan = travelPlan(L, cfg);
     const m = founder.find(f => f.contactId === c.id);
@@ -232,7 +234,7 @@ function buildContext(store, activeEventId, coder) {
   });
 
   const deptName = id => depts.find(d => d.id === id)?.name;
-  const volunteers = coder.vols.map(v => {
+  const volunteers = scope.volunteers === false ? [] : coder.vols.filter(v => !scope.volIds || scope.volIds.has(v.id)).map(v => {
     const a = {};
     avail.filter(x => x.volId === v.id && x.eventId === activeEventId && x.checked && /^\d{4}-/.test(x.day || '')).forEach(x => {
       a[x.day] = x.fullDay ? 'full' : (Array.isArray(x.slots) && x.slots.length ? x.slots.filter(sl => sl.start && sl.end).map(sl => `${sl.start}-${sl.end}`) : (x.start && x.end ? [`${x.start}-${x.end}`] : 'available'));
@@ -247,7 +249,7 @@ function buildContext(store, activeEventId, coder) {
   return {
     event: { name: coder.scrub(ev.name || ''), start: ev.startDate || '', end: ev.endDate || '' },
     guests,
-    sessions: sessions.map(s => ({ id: sCode.get(s.id), title: coder.scrub(s.title || ''), type: s.type || '', date: s.date || '', start: s.start || '', end: s.end || '', venue: coder.scrub(s.venue || '') })),
+    sessions: sessions.filter(s => scope.allSessions !== false || guests.some(g => (g.sessions || []).includes(sCode.get(s.id)))).map(s => ({ id: sCode.get(s.id), title: coder.scrub(s.title || ''), type: s.type || '', date: s.date || '', start: s.start || '', end: s.end || '', venue: coder.scrub(s.venue || '') })),
     volunteers,
   };
 }
@@ -330,6 +332,13 @@ export function Assistant({ store, activeEventId }) {
   );
 }
 
+/* seconds since shown — so a slow answer visibly isn't stuck */
+function Secs() {
+  const [n, setN] = useState(0);
+  React.useEffect(() => { const t = setInterval(() => setN(x => x + 1), 1000); return () => clearInterval(t); }, []);
+  return <>{n}s</>;
+}
+
 /* ══ Ask AI ══ */
 function AskAI({ store, activeEventId, onOpenGuest, canOpen }) {
   const [question, setQuestion] = useState('');
@@ -352,7 +361,7 @@ function AskAI({ store, activeEventId, onOpenGuest, canOpen }) {
     }
     const guests = [...new Set(found.matched.filter(p => p.kind === 'guest').map(p => p.code))];
     // "details of X" → the guest's profile is the exact answer, no AI needed
-    if (canOpen && DETAILS_RE.test(text) && guests.length === 1 && found.matched.length === 1) {
+    if (canOpen && (DETAILS_RE.test(text) || WHO_IS_RE.test(found.coded)) && guests.length === 1 && found.matched.length === 1) {
       const gid = found.matched[0].id;
       setTurns(t => [...t, { q: text, local: { opened: found.matched[0].name } }]);
       onOpenGuest(gid);
@@ -362,7 +371,20 @@ function AskAI({ store, activeEventId, onOpenGuest, canOpen }) {
     const idx = turns.length;
     setTurns(t => [...t, { q: text, qCoded, busy: true, guests }]);
     try {
-      const context = buildContext(store, activeEventId, coder);
+      // Send only what this question needs: one guest's question doesn't need all 50 guests
+      const lower = text.toLowerCase();
+      const mGuests = found.matched.filter(p => p.kind === 'guest'), mVols = found.matched.filter(p => p.kind === 'volunteer');
+      // "who/which" about a named guest stays about that guest; plural words mean the whole event
+      const wide = /\b(any(one|body)?|every(one|body)?|all|guests|people|others?|list|how many|count|total|compare|earliest|latest|most|least)\b/.test(lower)
+        || (/\b(who|which|whom)\b/.test(lower) && !mGuests.length);
+      const aboutVols = mVols.length > 0 || /\b(volunteer|volunteers|poc|pocs|free|available|availability|busy|slot|slots|department)\b/.test(lower);
+      const scope = {
+        guestIds: mGuests.length && !wide ? new Set(mGuests.map(p => p.id)) : null,
+        volunteers: aboutVols,
+        volIds: mVols.length && !wide && !mGuests.length ? new Set(mVols.map(p => p.id)) : null,
+        allSessions: !(mGuests.length && !wide) || /\b(session|sessions|panel|panels|programme|program|agenda)\b/.test(lower),
+      };
+      const context = buildContext(store, activeEventId, coder, scope);
       const history = turns.filter(t => t.aCoded).slice(-4).map(t => ({ q: t.qCoded, a: t.aCoded }));
       const out = await postJson('/api/ask', { question: qCoded, context, history, today: todayISO() });
       setTurns(t => t.map((x, i) => i === idx ? { ...x, busy: false, aCoded: out.answer } : x));
@@ -410,7 +432,7 @@ function AskAI({ store, activeEventId, onOpenGuest, canOpen }) {
                 </> : ' Check the spelling, or whether they were added to a different event.'}
               </div>
             ))}
-            {t.busy && <div className="ai-a muted-sm">Thinking…</div>}
+            {t.busy && <div className="ai-a muted-sm">Thinking… <Secs /></div>}
             {t.error && <div className="av-err">{t.error}</div>}
             {t.aCoded && <div className="ai-a">{t.aCoded.split(/\n{2,}/).map((para, j) => <p key={j}>{para.split('\n').map((line, k) => <React.Fragment key={k}>{k > 0 && <br />}{render(line.replace(/^\s*[-*]\s+/, '• ').replace(/\*\*/g, ''))}</React.Fragment>)}</p>)}</div>}
           </div>

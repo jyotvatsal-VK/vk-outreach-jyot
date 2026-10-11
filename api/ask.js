@@ -56,7 +56,7 @@ export default async function handler(req, res) {
         { role: 'user', parts: [{ text: question }] },
       ],
       generationConfig: { temperature: 0.1, maxOutputTokens: 2048 },
-    }, { deadlineMs: 50_000, thinking: 1024 });
+    }, { deadlineMs: 54_000, thinking: 0, perTryMs: 22_000 });   // no thinking step: answers in seconds
     if (!text) throw new Error('the AI returned an empty answer.');
     return res.status(200).json({ answer: text.trim() });
   } catch (e) {

@@ -50,15 +50,17 @@ export async function requireUser(req, permKey) {
   } catch { return { ok: false, status: 403, error: 'Your account could not be checked. Try again.' }; }
 }
 
-/* Call Gemini with a time limit. `fast` turns off the model's thinking step (much quicker);
-   falls back automatically for a model that doesn't accept that setting, and tries the next model name on 404. */
-export async function gemini(key, body, { deadlineMs = 50_000, thinking = 0 } = {}) {
+/* Call Gemini with a time limit.
+   - thinking: 0 turns off the model's "thinking" step (much quicker); falls back for a model that refuses the setting.
+   - Models are tried in order. If one is slow (perTryMs), overloaded (503) or missing (404), the next one is tried
+     while time remains, so a busy free-tier model doesn't make the user wait for nothing. */
+export async function gemini(key, body, { deadlineMs = 50_000, thinking = 0, perTryMs = 25_000, models: list } = {}) {
   const deadline = Date.now() + deadlineMs;
-  const models = [...new Set([process.env.GEMINI_MODEL, 'gemini-2.5-flash', 'gemini-flash-latest'].filter(Boolean))];
+  const models = [...new Set([process.env.GEMINI_MODEL, ...(list || ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-flash-latest'])].filter(Boolean))];
   const withThinking = { ...body, generationConfig: { ...(body.generationConfig || {}), thinkingConfig: { thinkingBudget: thinking } } };
-  const call = async (model, b) => {
+  const call = async (model, b, ms) => {
     const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), Math.max(5_000, deadline - Date.now()));
+    const t = setTimeout(() => ctl.abort(), ms);
     try {
       return await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
         method: 'POST', signal: ctl.signal,
@@ -66,26 +68,36 @@ export async function gemini(key, body, { deadlineMs = 50_000, thinking = 0 } = 
         body: JSON.stringify(b),
       });
     } catch (e) {
-      if (e.name === 'AbortError') throw new Error('the AI took too long. Try a shorter question.');
+      if (e.name === 'AbortError') return { timedOut: true };
       throw e;
     } finally { clearTimeout(t); }
   };
   let lastErr = '';
-  for (const model of models) {
-    let r = await call(model, withThinking);
+  for (let i = 0; i < models.length; i++) {
+    const left = deadline - Date.now();
+    if (left < 6_000) break;
+    const isLast = i === models.length - 1 || left < perTryMs + 8_000;
+    const ms = isLast ? left : Math.min(perTryMs, left);
+    const model = models[i];
+    let r = await call(model, withThinking, ms);
+    if (r.timedOut) { lastErr = 'the AI took too long'; continue; }
     if (r.status === 400) {
       const j0 = await r.clone().json().catch(() => ({}));
-      if (/thinking/i.test(j0?.error?.message || '')) r = await call(model, body);
+      if (/thinking/i.test(j0?.error?.message || '')) {
+        r = await call(model, body, Math.max(5_000, deadline - Date.now()));
+        if (r.timedOut) { lastErr = 'the AI took too long'; continue; }
+      }
     }
     if (r.status === 404) { lastErr = `Model ${model} not available`; continue; }
+    if (r.status === 503 || r.status === 500) { lastErr = 'the AI service is busy'; continue; }
     const j = await r.json().catch(() => ({}));
     if (r.status === 429) throw new Error('the free AI quota is used up for now. Try again in a minute.');
     if (!r.ok) throw new Error(j?.error?.message || `Gemini error ${r.status}`);
     const cand = j.candidates?.[0] || {};
     const text = (cand.content?.parts || []).map(p => p.text || '').join('');
-    return { text, grounding: cand.groundingMetadata || null };
+    return { text, grounding: cand.groundingMetadata || null, model };
   }
-  throw new Error(lastErr || 'No Gemini model available');
+  throw new Error(lastErr === 'the AI took too long' ? 'the AI took too long. Please try again in a moment.' : (lastErr || 'No Gemini model available'));
 }
 
 export function readBody(req) {
