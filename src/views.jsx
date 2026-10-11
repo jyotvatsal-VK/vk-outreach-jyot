@@ -692,14 +692,12 @@ export function Outreach({ store, activeEventId }) {
           const _assigns = S(store,'assignments').filter(a=>a.contactId===_id);
           const _pocs = S(store,'poc').filter(p=>p.contactId===_id);
           const _ps = (store.personalisedSchedule||[]).filter(r=>r.contactId===_id);
-          const _feli = (store.felicitation||[]).filter(f=>f.contactId===_id);
           const linked = [
             ...(_L ? [{collection:'logistics', data:_L}] : []),
             ...(_F ? [{collection:'founder', data:_F}] : []),
             ..._assigns.map(a=>({collection:'assignments',data:a})),
             ..._pocs.map(p=>({collection:'poc',data:p})),
             ..._ps.map(r=>({collection:'personalisedSchedule',data:r})),
-            ..._feli.map(f=>({collection:'felicitation',data:f})),
           ];
           setModal(null);
           await trashItem('contacts', _c, linked, profile?.email||'');
@@ -709,7 +707,6 @@ export function Outreach({ store, activeEventId }) {
           _assigns.forEach(a=>removeItem('assignments',a.id));
           _pocs.forEach(p=>removeItem('poc',p.id));
           _ps.forEach(r=>removeItem('personalisedSchedule',r.id));
-          _feli.forEach(f=>removeItem('felicitation',f.id));
           await removeItem('contacts', _id);
           toast('Contact moved to trash. Restore within 30 days from Settings.');
         }} /> : null;
@@ -4229,73 +4226,6 @@ export function Reports({ store, activeEventId }) {
 }
 
 
-/* ============================ FELICITATION KITS ============================ */
-export function FelicitationKits({ store, activeEventId }) {
-  const toast = useToast();
-  const contacts = (store.contacts||[]).filter(c=>c.status==='Confirmed'||c.status==='VIP');
-  const kits = store.felicitation || [];
-  const getKit = cid => kits.find(k=>k.contactId===cid) || {contactId:cid, eventId:activeEventId};
-  const ITEMS = ['Momento','Shawl','Kumkum','Cover','Gold Coin','Silver Coin','Frame'];
-  const key = item => (item||'').toLowerCase().replace(/ /g,'_');
-
-  const toggle = async (c, item) => {
-    const k = getKit(c.id);
-    const updated = {...k, [key(item)]: !k[key(item)]};
-    await saveItem('felicitation', updated);
-  };
-
-  const totalNeeded = contacts.length;
-  const totalReady = kits.filter(k=>ITEMS.every(i=>k[key(i)])).length;
-
-  if (!contacts.length) return (
-    <>
-      <div className="page-head"><div className="ph-txt"><h1>Felicitation Kits</h1></div></div>
-      <div className="panel"><Empty title="No confirmed guests yet" sub="Confirm guests in Outreach to track their felicitation kits."/></div>
-    </>
-  );
-
-  return (
-    <>
-      <div className="page-head"><div className="ph-txt"><h1>Felicitation Kits</h1><p>Track which items are ready for each guest. Tick each item when it is packed and ready.</p></div></div>
-      <div className="cards">
-        <div className="stat"><div className="lab">{ICON.users}Guests</div><div className="val">{totalNeeded}</div><div className="hint">confirmed guests</div></div>
-        <div className="stat"><div className="lab">{ICON.check}Fully ready</div><div className="val">{totalReady}</div><div className="hint">all items packed</div></div>
-        {ITEMS.map(item=>{
-          const readyCount = kits.filter(k=>k[key(item)]).length;
-          return <div className="stat" key={item}><div className="lab">{item}</div><div className="val">{readyCount}<span style={{fontSize:14,color:'var(--muted)'}}>/{totalNeeded}</span></div><div className="hint">ready</div></div>;
-        })}
-      </div>
-      <div className="panel">
-        <div className="panel-head"><h2>Kit checklist</h2><div className="desc">Tick each item when packed</div></div>
-        <div className="panel-body" style={{overflowX:'auto'}}>
-          <table style={{minWidth:700}}>
-            <thead><tr>
-              <th>Guest</th>
-              {ITEMS.map(i=><th key={i} style={{textAlign:'center'}}>{i}</th>)}
-              <th>Status</th>
-            </tr></thead>
-            <tbody>
-              {contacts.map(c=>{
-                const k=getKit(c.id);
-                const allDone=ITEMS.every(i=>k[key(i)]);
-                return <tr key={c.id}>
-                  <td><div className="person"><div className="avatar">{initials(c.name)}</div><div><div className="nm">{displayName(c)}</div><div className="role">{c.type}</div></div></div></td>
-                  {ITEMS.map(item=>(
-                    <td key={item} style={{textAlign:'center'}}>
-                      <input type="checkbox" checked={!!k[key(item)]} onChange={()=>toggle(c,item)} style={{width:16,height:16,accentColor:'var(--teal)',cursor:'pointer'}}/>
-                    </td>
-                  ))}
-                  <td>{allDone?<span className="badge b-confirmed">Ready ✓</span>:<span className="badge b-pending">Pending</span>}</td>
-                </tr>;
-              })}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </>
-  );
-}
-
 /* ============================ VOLUNTEER AVAILABILITY ============================ */
 /* VolModal — volunteer profile (shared across all events) */
 function VolModal({ item, onClose, toast, vols = [], canSetAvailability = false, onNext }) {
@@ -6338,7 +6268,6 @@ export function EventDayChecklist({ store, activeEventId }) {
     {key:'hotel_checkin', label:'Checked into hotel', icon:'🏨'},
     {key:'arrived_venue', label:'Arrived at venue', icon:'📍'},
     {key:'attended_session', label:'Attended session', icon:'🎤'},
-    {key:'received_kit', label:'Received felicitation kit', icon:'🎁'},
     {key:'departed', label:'Departed', icon:'✈️'},
   ];
 
@@ -6747,7 +6676,6 @@ export function VolunteerView({ store, activeEventId, go }) {
     {key:'hotel_checkin',label:'Hotel check-in',icon:'🏨'},
     {key:'arrived_venue',label:'Arrived venue',icon:'📍'},
     {key:'attended_session',label:'Session attended',icon:'🎤'},
-    {key:'received_kit',label:'Kit received',icon:'🎁'},
     {key:'departed',label:'Departed',icon:'✈️'},
   ];
 
@@ -6936,7 +6864,6 @@ export function ExportData({ store, rawStore }) {
   const logi = store.logistics || [];
   const poc = store.poc || [];
   const depts = store.departments || [];
-  const kits = store.felicitation || [];
 
   const volName = id => vols.find(v => v.id === id)?.name || '';
   const deptName = id => depts.find(d => d.id === id)?.name || '';
@@ -7255,12 +7182,11 @@ export function HelpGuide({ profile }) {
     { roles: ['Master', 'HOD'], icon: '🙋', title: 'Volunteers', desc: 'One place for your volunteer directory and each person\'s availability for this event. Filter by city, area, department or day; tap a volunteer to edit their profile or day-by-day hours; import everyone (with availability) from Excel.' },
     { roles: ['Master', 'HOD'], icon: '🤝', title: 'Smart POC', desc: 'Shows each VIP\'s visit days and which volunteers are available. One click assigns. The Auto-assign button picks the least-loaded available volunteer for every unfilled slot.' },
     { roles: ['Master', 'HOD', 'Volunteer'], icon: '☑️', title: 'Event Checklist', desc: 'Mobile-friendly per-VIP checklist: Picked up → Hotel → Venue → Session → Kit → Departed. Each step is timestamped when tapped. POCs see their assigned VIPs.' },
-    { roles: ['Master', 'HOD'], icon: '🎁', title: 'Felicitation Kits', desc: 'Track which kit items (Momento, Shawl, Kumkum, Cover, Gold Coin, Silver Coin, Frame) are packed for each confirmed guest. Summary cards show totals.' },
     { roles: ['Master', 'HOD'], icon: '📁', title: 'Departments & Tasks', desc: 'Create departments with HODs and tasks. Tasks can be marked as "Blocked by" another task — blocked tasks cannot move to In Progress until their blocker is Done.' },
     { roles: ['Master', 'HOD'], icon: '📄', title: 'Department Master', desc: 'Auto-generated full view of each department — HOD, volunteers, all tasks with status and completion percentage. Nothing extra to enter.' },
     { roles: ['Master', 'HOD'], icon: '📑', title: 'Generate Schedules', desc: 'One-click generation of: Personalised schedule per VIP (assembled from logistics, sessions, founder meeting), Event schedule, and Founder\'s day. Toggle "Show sources" to see which module each line came from.' },
     { roles: ['Master'], icon: '🌐', title: 'All Events', desc: 'Side-by-side dashboard for all events — confirmed counts, task completion, days until event. No need to switch the active event to check status.' },
-    { roles: ['Master'], icon: '📤', title: 'Export Data', desc: 'Download any module as an Excel file — contacts, logistics, sessions, volunteers, POC roster, tasks, felicitation kits, or a full backup.' },
+    { roles: ['Master'], icon: '📤', title: 'Export Data', desc: 'Download any module as an Excel file — contacts, logistics, sessions, volunteers, POC roster, tasks, or a full backup.' },
     { roles: ['Master'], icon: '⚙️', title: 'Settings', desc: 'User management (approve/reject new signups, assign roles), activity log (every action logged with user, time and device), and data management (clear individual collections or wipe everything — with password + confirmation phrase required).' },
   ];
 

@@ -575,9 +575,6 @@ export function GuestProfile({ c, store, rawStore, activeEventId, canLookup, toa
   const driver = vendor?.drivers?.find(d => d.id === L.carDriverId);
   const pending = pendingFor(L);
   const { rows, mandatory } = personalSchedule(store, c, L, cfg);
-  const kit = (store.felicitation || []).find(k => k.contactId === c.id) || {};
-  const KIT = ['Momento', 'Shawl', 'Kumkum', 'Cover', 'Gold Coin', 'Silver Coin', 'Frame'];
-  const kitKey = i => i.toLowerCase().replace(/ /g, '_');
   const nights = L.checkinDate && L.checkoutDate ? Math.max(0, Math.round((Date.parse(L.checkoutDate) - Date.parse(L.checkinDate)) / 864e5)) : null;
 
   // POC: needed (from POC Required ticks) vs assigned, with the same checks POC Allocation makes
@@ -609,12 +606,81 @@ export function GuestProfile({ c, store, rawStore, activeEventId, canLookup, toa
     .sort((a, b) => (b.ev.startDate || '') > (a.ev.startDate || '') ? 1 : -1);
 
   // Recent changes to this guest's records (activity log keeps the guest's name or the record id)
-  const myIds = new Set([c.id, L.id, m?.id, kit.id, ...pocs.map(p => p.id), ...(store.personalisedSchedule || []).filter(r => r.contactId === c.id).map(r => r.id), ...notes.map(n => n.id)].filter(Boolean));
+  const myIds = new Set([c.id, L.id, m?.id, ...pocs.map(p => p.id), ...(store.personalisedSchedule || []).filter(r => r.contactId === c.id).map(r => r.id), ...notes.map(n => n.id)].filter(Boolean));
   const activity = (rawStore?.activity_log || store.activity_log || [])
     .filter(a => myIds.has(a.detail) || (c.name && a.detail === c.name) || a.detail === displayName(c))
     .sort((a, b) => (b.ts?.seconds || 0) - (a.ts?.seconds || 0)).slice(0, 15);
 
   const days = [...new Set(rows.map(r => r.date).filter(Boolean))].sort();
+
+  /* ── Summary: the whole profile in a few lines, built from the data above (no AI) ── */
+  const dayLbl = iso => { if (!iso) return ''; const d = new Date(iso + 'T12:00:00'); return `${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()]} ${shortDate(iso).replace(/(st|nd|rd|th) /, ' ')}`; };
+  const step = k => plan.steps.find(x => x.key === k);
+  const hotelName = L.accomReq !== 'not_required' && L.hotelName ? L.hotelName : '';
+  const summary = [];
+  // Arrives
+  {
+    const bits = [];
+    if (L.arrivalDate) {
+      const src = L.arrivalOverride ? 'manual' : (L.arrivalSource || 'manual');
+      let a = `${dayLbl(L.arrivalDate)}${L.arrivalTime ? ', ' + L.arrivalTime : ''}`;
+      if (src === 'flight') a += `${L.arrivalFlightNo ? ' on ' + L.arrivalFlightNo : ' by flight'}${L.arrivalLocation ? ' at ' + L.arrivalLocation : ''}`;
+      else if (src === 'car') a += ` by car${L.carPickupFrom ? ' from ' + L.carPickupFrom : ''}`;
+      else a += `${L.arrivalLocation ? ' · ' + L.arrivalLocation : ''} (planned${L.flightReq !== 'not_required' && !L.arrivalFlightNo ? ', flight not booked yet' : ''})`;
+      bits.push(a);
+      const pk = step('pickup');
+      if (pk && src === 'flight') bits.push(`picked up ${pk.time}${vendor ? ' by ' + vendor.name : ''}${driver ? ` (driver ${driver.name})` : ''}`);
+      const rc = step('reach');
+      if (rc) bits.push(`reaches ${plan.base} around ${rc.time}`);
+      else if (hotelName) bits.push(`stays at ${hotelName}`);
+    } else bits.push('Arrival not known yet');
+    let v = bits.join(' → ');
+    if (hotelName && nights !== null && step('reach')) v += ` · ${nights} night${nights === 1 ? '' : 's'}`;
+    summary.push({ k: 'Arrives', v });
+  }
+  // At the event
+  {
+    const bits = [];
+    sessions.slice(0, 3).forEach(se => {
+      const mine = minute.filter(mi => mi.sessionId === se.id).map(mi => `${(mi.detail || 'speaking').toLowerCase()} ${mi.schedule || ''}`.trim());
+      bits.push(`“${se.title}”, ${shortDate(se.date).replace(/(st|nd|rd|th) /, ' ')} ${se.start || ''}${mine.length ? ` (${mine.join(', ')})` : ''}`.replace(/\s+\(/, ' ('));
+    });
+    if (sessions.length > 3) bits.push(`+${sessions.length - 3} more session${sessions.length - 3 === 1 ? '' : 's'}`);
+    if (m) bits.push(m.durationReq === 'not_required' ? 'no Sahebji meeting needed' : m.date && m.time ? `Sahebji meeting ${shortDate(m.date).replace(/(st|nd|rd|th) /, ' ')} ${m.time}${m.frozen ? ' 🔒' : ''}` : 'Sahebji meeting needs a time');
+    if (bits.length) summary.push({ k: 'At the event', v: (sessions.length ? 'Speaks at ' : '') + bits.join(' · ').replace(/^no /, 'No ').replace(/^sahebji/, 'Sahebji') });
+    else summary.push({ k: 'At the event', v: 'No sessions or meetings yet' });
+  }
+  // Leaves
+  {
+    if (L.departureDate) {
+      const src = L.departureOverride ? 'manual' : (L.departureSource || 'manual');
+      const lv = step('leave'), dp = step('depart');
+      let t = dayLbl(L.departureDate);
+      if (src === 'flight') t += lv ? `: leaves ${plan.base} ${lv.time} for ${L.departureFlightNo || 'the flight'} at ${L.departureTime}` : `: ${L.departureFlightNo || 'flight'} at ${L.departureTime}${L.departureLocation ? ' from ' + L.departureLocation : ''}`;
+      else if (src === 'car') t += `: leaves by car at ${dp?.time || L.departureTime || '—'}`;
+      else t += `${L.departureTime ? ', ' + L.departureTime : ''} (planned${L.flightReq !== 'not_required' && !L.departureFlightNo ? ', return not booked yet' : ''})`;
+      summary.push({ k: 'Leaves', v: t });
+    } else summary.push({ k: 'Leaves', v: 'Departure not known yet' });
+  }
+  // POC
+  {
+    const bits = pocs.map(p => `${vName(p.volunteerId)} (${shortDate(p.day).replace(/(st|nd|rd|th) /, ' ')})`);
+    const parts = [];
+    if (bits.length) parts.push(bits.join(', '));
+    else if (Object.keys(needs).length) parts.push('needed but not assigned');
+    if (L.overallPocId) parts.push(`Overall POC: ${vName(L.overallPocId)}`);
+    if (parts.length) summary.push({ k: 'POC', v: parts.join(' · ') });
+  }
+  // Needs attention — every ⚠ on this page, in one place
+  const attention = [];
+  if (c.status && c.status !== 'Confirmed') attention.push(`Status is ${c.status}`);
+  pending.forEach(x => attention.push(`Missing ${x}`));
+  warns.forEach(w => attention.push(w.text));
+  pocDays.forEach(d => pocIssues(d).forEach(t => attention.push(`${shortDate(d).replace(/(st|nd|rd|th) /, ' ')}: ${t}`)));
+  mandatory.filter(x => !x.done).forEach(x => attention.push(`“${x.label}” missing from the schedule`));
+  plan.missing.forEach(r => attention.push(`Travel time missing: ${r}`));
+  const today = todayISO();
+  notes.filter(n => n.dueDate && !n.done && n.dueDate <= today).forEach(n => attention.push(`Follow-up ${n.dueDate < today ? 'overdue' : 'due today'} (${shortDate(n.dueDate).replace(/(st|nd|rd|th) /, ' ')})`));
   const Row = ({ k, v }) => (v || v === 0) ? <div className="gp-kv"><span>{k}</span><div>{v}</div></div> : null;
   const arr = sourceLabel(L, 'arrival'), dep = sourceLabel(L, 'departure');
   const req = k => L[k] === 'not_required' ? 'Not required' : 'Required';
@@ -644,6 +710,14 @@ export function GuestProfile({ c, store, rawStore, activeEventId, canLookup, toa
           {pending.length > 0 && <div className="src-warn" style={{ maxWidth: 260 }}>⚠ Still missing: {pending.join(', ')}</div>}
         </div>
       </div>
+
+      <section className="gp-summary">
+        <div className="gp-sum-title">Summary</div>
+        {summary.map(x => <div key={x.k} className="gp-sum-line"><span>{x.k}</span><div>{x.v}</div></div>)}
+        {attention.length > 0
+          ? <div className="gp-sum-att"><span>⚠ Needs attention</span><div>{attention.map((t, i) => <span key={i} className="gp-att">{t}</span>)}</div></div>
+          : <div className="gp-sum-ok">✓ Nothing needs attention</div>}
+      </section>
 
       <div className="gp-grid">
         <section>
@@ -747,11 +821,6 @@ export function GuestProfile({ c, store, rawStore, activeEventId, canLookup, toa
             </div></div>
           );
         }) : <div className="muted-sm">No POC needed or assigned.</div>}
-      </section>
-
-      <section>
-        <h3>Felicitation kit</h3>
-        <div className="gp-mand">{KIT.map(i => <span key={i} className={'gp-chip ' + (kit[kitKey(i)] ? 'ok' : '')}>{kit[kitKey(i)] ? '✓' : '○'} {i}</span>)}</div>
       </section>
 
       <section>

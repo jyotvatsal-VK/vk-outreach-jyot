@@ -9,7 +9,7 @@ import {
 
 export const COLLECTIONS = [
   'events', 'contacts', 'logistics', 'sessions', 'assignments',
-  'founder', 'volunteers', 'poc', 'departments', 'tasks', 'felicitation',
+  'founder', 'volunteers', 'poc', 'departments', 'tasks',
   'checklist', 'contact_notes', 'activity_log',
   'personalisedSchedule', 'personalisedMandatory',
   'availability', 'sahebjiSlots', 'appConfig', 'trash',
@@ -19,7 +19,7 @@ export const COLLECTIONS = [
 /* Collections whose rows carry an eventId and belong to one event */
 export const EVENT_SCOPED = [
   'contacts', 'logistics', 'sessions', 'assignments', 'founder', 'poc', 'tasks',
-  'felicitation', 'checklist', 'contact_notes', 'personalisedSchedule',
+  'checklist', 'contact_notes', 'personalisedSchedule',
   'personalisedMandatory', 'availability', 'sahebjiSlots', 'minuteItems',
 ];
 
@@ -96,7 +96,6 @@ export function scopedStore(store, eventId, contactFilter) {
     founder: scoped('founder'),
     poc: scoped('poc'),
     tasks: scoped('tasks'),
-    felicitation: scoped('felicitation'),
     checklist: scoped('checklist'),
     contact_notes: scoped('contact_notes'),
     activity_log: store.activity_log || [],  // global, not scoped by event

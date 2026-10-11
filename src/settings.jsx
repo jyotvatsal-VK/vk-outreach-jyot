@@ -1526,7 +1526,6 @@ const ALL_NAV_MODULES = [
   { id:'depts',        label:'Departments & Tasks' },
   { id:'reports',      label:'Personalised Schedule' },
   { id:'checklist',    label:'Event Checklist' },
-  { id:'felicitation', label:'Felicitation Kits' },
   { id:'availability', label:'Vol. Availability' },
   { id:'pocallocation',label:'POC Allocation' },
   { id:'allevents',    label:'All Events' },

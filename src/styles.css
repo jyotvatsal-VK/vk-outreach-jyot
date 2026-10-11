@@ -637,3 +637,15 @@ tr:hover .rowacts{opacity:1}
 .empty .ic{width:30px;height:30px;color:var(--faint);opacity:.8;vertical-align:middle}
 .gp a{color:var(--teal);text-decoration:none}
 .gp a:hover{text-decoration:underline}
+/* Guest profile summary box */
+.gp-summary{margin-top:14px;border:1px solid var(--teal-line);background:var(--teal-wash);border-radius:12px;padding:14px 16px}
+.gp-sum-title{font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--teal);margin-bottom:6px}
+.gp-sum-line{display:grid;grid-template-columns:110px 1fr;gap:10px;font-size:13.5px;line-height:1.5;padding:3px 0}
+.gp-sum-att{font-size:13.5px}
+.gp-sum-line>span{color:var(--teal);font-weight:600}
+.gp-sum-att{margin-top:6px;padding-top:8px;border-top:1px solid var(--teal-line)}
+.gp-sum-att>span{display:block;color:var(--amber);font-weight:600;margin-bottom:6px}
+.gp-sum-att>div{display:flex;flex-wrap:wrap;gap:6px}
+.gp-att{background:#fff;border:1px solid #E8D5A3;color:var(--amber);border-radius:8px;padding:2px 8px;font-size:12px}
+.gp-sum-ok{margin-top:6px;padding-top:8px;border-top:1px solid var(--teal-line);color:var(--teal);font-weight:600;font-size:13px}
+@media(max-width:900px){.gp-sum-line{grid-template-columns:1fr;gap:0;padding:5px 0}}
