@@ -85,18 +85,37 @@ async function signedIn(req) {
   } catch { return false; }
 }
 
+async function callModel(key, model, body, deadline) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), Math.max(5_000, deadline - Date.now()));
+  try {
+    return await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      method: 'POST', signal: ctl.signal,
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('the AI took too long. Try a screenshot of just the flight details.');
+    throw e;
+  } finally { clearTimeout(t); }
+}
+
 async function askGemini(key, data, mimeType) {
+  const deadline = Date.now() + 55_000;   // stay inside the function's 60 s limit (vercel.json)
   const models = [...new Set([process.env.GEMINI_MODEL, 'gemini-2.5-flash', 'gemini-flash-latest'].filter(Boolean))];
+  const base = {
+    contents: [{ role: 'user', parts: [{ text: PROMPT }, { inline_data: { mime_type: mimeType, data } }] }],
+    generationConfig: { temperature: 0, responseMimeType: 'application/json', responseSchema: SCHEMA },
+  };
+  // Copying fields off a ticket needs no "thinking" — switching it off makes the answer several times faster
+  const fast = { ...base, generationConfig: { ...base.generationConfig, thinkingConfig: { thinkingBudget: 0 } } };
   let lastErr = '';
   for (const model of models) {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: PROMPT }, { inline_data: { mime_type: mimeType, data } }] }],
-        generationConfig: { temperature: 0, responseMimeType: 'application/json', responseSchema: SCHEMA },
-      }),
-    });
+    let r = await callModel(key, model, fast, deadline);
+    if (r.status === 400) {                                   // a model that doesn't accept the thinking setting
+      const j0 = await r.clone().json().catch(() => ({}));
+      if (/thinking/i.test(j0?.error?.message || '')) r = await callModel(key, model, base, deadline);
+    }
     if (r.status === 404) { lastErr = `Model ${model} not available`; continue; }   // try the next model name
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j?.error?.message || `Gemini error ${r.status}`);

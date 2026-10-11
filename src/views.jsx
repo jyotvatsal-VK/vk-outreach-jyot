@@ -1485,19 +1485,41 @@ function FlightModal({ contactId, item, onClose, toast, activeEventId, cfg, plac
   const [scan, setScan] = useState(null);   // { busy } | { error } | { journeys, use, passengers, pnr, airline, intl, nameOk }
   const canon = name => places.find(pl => samePlace(pl, name)) || name;   // use the Travel-times spelling when it's the same place
 
+  // Seconds counter while reading, a Cancel button, and a hard stop at 70 s so it can never spin forever
+  const scanCtl = React.useRef(null);
+  const [secs, setSecs] = useState(0);
+  useEffect(() => {
+    if (!scan?.busy) return;
+    setSecs(0);
+    const t = setInterval(() => setSecs(n => n + 1), 1000);
+    return () => clearInterval(t);
+  }, [scan?.busy]);
+  useEffect(() => () => scanCtl.current?.abort(), []);   // closing the form stops the request
   async function readTicket(file) {
     if (!file) return;
     setScan({ busy: true });
+    const ctl = new AbortController();
+    scanCtl.current = ctl;
+    const stop = setTimeout(() => ctl.abort('timeout'), 70_000);
     try {
       const payload = await ticketToPayload(file);
       const token = await auth?.currentUser?.getIdToken?.();
-      const res = await fetch('/api/parse-ticket', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-        body: JSON.stringify({ ...payload, guestName }),
-      });
+      let res;
+      try {
+        res = await fetch('/api/parse-ticket', {
+          method: 'POST', signal: ctl.signal,
+          headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+          body: JSON.stringify({ ...payload, guestName }),
+        });
+      } catch (e) {
+        if (ctl.signal.aborted) throw new Error(ctl.signal.reason === 'timeout'
+          ? 'Reading took too long. Try a screenshot of just the flight details, or fill the form by hand.'
+          : 'Cancelled.');
+        throw new Error('Could not reach the server. Check your internet connection and try again.');
+      }
       const out = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(out.error || (res.status === 404 ? 'Ticket reading isn’t set up on the server yet.' : `Server error (${res.status})`));
+      if (!res.ok) throw new Error(out.error || (res.status === 404 ? 'Ticket reading isn’t set up on the server yet.'
+        : res.status === 504 ? 'The server timed out reading this file. Try a screenshot of just the flight details.' : `Server error (${res.status})`));
       const journeys = journeysFromLegs(out.legs || []);
       if (!journeys.length) throw new Error('No flights found on this ticket. Check it is a flight ticket, or fill the form by hand.');
       // First journey = arrival, last = departure; a one-way ticket fills whichever side is still empty
@@ -1507,6 +1529,7 @@ function FlightModal({ contactId, item, onClose, toast, activeEventId, cfg, plac
       setScan({ journeys, use, passengers: out.passengers || [], pnr: out.pnr || '', airline: out.airline || '', intl: !!out.isInternational,
         nameOk: passengerMatches(out.passengers || [], guestName) });
     } catch (e) { setScan({ error: e.message || String(e) }); }
+    finally { clearTimeout(stop); if (scanCtl.current === ctl) scanCtl.current = null; }
   }
   function fillFromScan() {
     const p = {};
@@ -1531,11 +1554,13 @@ function FlightModal({ contactId, item, onClose, toast, activeEventId, cfg, plac
       <PlacesDatalist places={places} />
       <div className="ticket-scan">
         <label className={'btn sm' + (scan?.busy ? ' disabled' : '')} style={{ cursor: scan?.busy ? 'wait' : 'pointer' }}>
-          📎 {scan?.busy ? 'Reading ticket…' : 'Upload ticket'}
+          📎 {scan?.busy ? `Reading ticket… ${secs}s` : 'Upload ticket'}
           <input type="file" accept="application/pdf,image/*" style={{ display: 'none' }} disabled={!!scan?.busy}
             onChange={e => { readTicket(e.target.files?.[0]); e.target.value = ''; }} />
         </label>
-        <span className="muted-sm">PDF, photo or screenshot. AI reads it and fills the form for you to check.</span>
+        {scan?.busy
+          ? <button type="button" className="btn ghost sm" onClick={() => scanCtl.current?.abort('cancel')}>Cancel</button>
+          : <span className="muted-sm">PDF, photo or screenshot. AI reads it and fills the form for you to check.</span>}
       </div>
       {scan?.error && <div className="av-err" style={{ marginBottom: 10 }}>{scan.error}</div>}
       {scan?.journeys && (
