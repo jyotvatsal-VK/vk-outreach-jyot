@@ -91,7 +91,7 @@ function buildCoder(store) {
 }
 
 function buildContext(store, activeEventId, coder) {
-  const cfg = getTravelCfg(store);
+  const cfg = getTravelCfg(store, activeEventId);
   const logi = store.logistics || [];
   const sessions = [...(store.sessions || [])].sort((a, b) => `${a.date}${a.start}` > `${b.date}${b.start}` ? 1 : -1);
   const sCode = new Map(sessions.map((s, i) => [s.id, `S${i + 1}`]));
@@ -129,7 +129,7 @@ function buildContext(store, activeEventId, coder) {
       poc: pocDays,
       pocNeeded: pocNeeds(rows, c.id),
       pending: pendingFor(L),
-      warnings: travelWarnings(L).map(w => coder.scrub(w.text)),
+      warnings: travelWarnings(L, cfg).map(w => coder.scrub(w.text)),
     };
     Object.keys(g).forEach(k => { const v = g[k]; if (v === null || v === '' || (Array.isArray(v) && !v.length) || (v && typeof v === 'object' && !Array.isArray(v) && !Object.keys(v).length)) delete g[k]; });
     return g;
@@ -302,13 +302,13 @@ function AskAI({ store, activeEventId, onOpenGuest, canOpen }) {
 
 /* ══ Guest profile ══ */
 function GuestProfile({ c, store, activeEventId, canLookup, toast }) {
-  const cfg = getTravelCfg(store);
+  const cfg = getTravelCfg(store, activeEventId);
   const L = pickLogistics(store.logistics || [], c.id);
   const vols = store.volunteers || [];
   const vendors = store.carVendors || [];
   const vName = id => vols.find(v => v.id === id)?.name || '—';
   const plan = travelPlan(L, cfg);
-  const warns = travelWarnings(L);
+  const warns = travelWarnings(L, cfg);
   const sessions = (store.assignments || []).filter(a => a.contactId === c.id)
     .map(a => (store.sessions || []).find(s => s.id === a.sessionId)).filter(Boolean)
     .sort((a, b) => `${a.date}${a.start}` > `${b.date}${b.start}` ? 1 : -1);

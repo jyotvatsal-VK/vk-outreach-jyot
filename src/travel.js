@@ -22,10 +22,12 @@ export const DEFAULT_TRAVEL_CFG = {
   domesticReport: 120,        // be at the airport this long before a domestic flight
   intlReport: 180,            // … international flight
   peak: '08:00-11:00, 17:00-21:00',
+  eventMargin: 2,             // days: arriving earlier / leaving later than this around the event is flagged
 };
 
-export function getTravelCfg(store) {
+export function getTravelCfg(store, eventId) {
   const c = (store?.appConfig || []).find(x => x.id === TRAVEL_CFG_ID) || {};
+  const ev = eventId ? (store?.events || []).find(e => e.id === eventId) : null;
   const num = (v, d) => { const n = parseInt(v, 10); return Number.isFinite(n) && n >= 0 ? n : d; };
   return {
     ...DEFAULT_TRAVEL_CFG,
@@ -36,6 +38,8 @@ export function getTravelCfg(store) {
     domesticReport: num(c.domesticReport, DEFAULT_TRAVEL_CFG.domesticReport),
     intlReport: num(c.intlReport, DEFAULT_TRAVEL_CFG.intlReport),
     peak: typeof c.peak === 'string' ? c.peak : DEFAULT_TRAVEL_CFG.peak,
+    eventMargin: num(c.eventMargin, DEFAULT_TRAVEL_CFG.eventMargin),
+    event: ev ? { start: ev.startDate || '', end: ev.endDate || '' } : null,   // for the "outside the event" flags
   };
 }
 
@@ -203,9 +207,37 @@ export function syncPatch(L, cfg) {
 }
 export const needsSync = (L, cfg) => Object.keys(syncPatch(L, cfg)).length > 0;
 
-/* Things worth a second look (shown as ⚠ in Logistics) */
-export function travelWarnings(L) {
+/* Is a travel date sensible for this event? Only a warning, never a block.
+   Arriving: fine from `margin` days before the start until the last day (guests may join part-way).
+   Leaving: fine any day of the event (leaving early is normal) until `margin` days after the end.
+   Returns the warning text, or '' when the date is fine or there's nothing to compare. */
+const dayNo = iso => Math.round(Date.parse(iso + 'T00:00:00Z') / 864e5);
+const fmtFull = iso => `${fmtD(iso)} ${iso.slice(0, 4)}`;
+export function eventDateIssue(kind, date, cfg) {
+  const ev = cfg?.event, margin = cfg?.eventMargin ?? 2;
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !ev?.start || !ev?.end) return '';
+  const what = kind === 'arrival' ? 'Arrives' : 'Leaves';
+  if (date.slice(0, 4) !== ev.start.slice(0, 4) && date.slice(0, 4) !== ev.end.slice(0, 4))
+    return `${what} ${fmtFull(date)} — a different year from the event (${fmtFull(ev.start)})`;
+  const d = dayNo(date), s = dayNo(ev.start), e = dayNo(ev.end);
+  const n = x => `${x} day${x === 1 ? '' : 's'}`;
+  if (kind === 'arrival') {
+    if (d < s - margin) return `Arrives ${fmtD(date)} — ${n(s - d)} before the event starts (${fmtD(ev.start)})`;
+    if (d > e) return `Arrives ${fmtD(date)} — after the event ends (${fmtD(ev.end)})`;
+  } else {
+    if (d < s) return `Leaves ${fmtD(date)} — before the event starts (${fmtD(ev.start)})`;
+    if (d > e + margin) return `Leaves ${fmtD(date)} — ${n(d - e)} after the event ends (${fmtD(ev.end)})`;
+  }
+  return '';
+}
+
+/* Things worth a second look (shown as ⚠ in Logistics). Pass the travel cfg (with its event) for the event-date checks. */
+export function travelWarnings(L, cfg) {
   const w = [];
+  const ea = eventDateIssue('arrival', L.arrivalDate, cfg);
+  if (ea) w.push({ key: 'arrEvent', text: ea });
+  const ed = eventDateIssue('departure', L.departureDate, cfg);
+  if (ed) w.push({ key: 'depEvent', text: ed });
   const booked = k => (L[`${k}Source`] || 'manual') !== 'manual' && !L[`${k}Override`];
   if (booked('arrival') && L.plannedArrivalDate && L.arrivalDate && L.plannedArrivalDate !== L.arrivalDate)
     w.push({ key: 'arrival', text: `Planned arrival ${fmtD(L.plannedArrivalDate)}, booking says ${fmtD(L.arrivalDate)}`, accept: { plannedArrivalDate: L.arrivalDate } });

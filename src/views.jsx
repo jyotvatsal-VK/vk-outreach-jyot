@@ -12,7 +12,7 @@ import {
 import { ICON, Modal, Field, Empty, SearchBox, useToast } from './ui';
 import { auth } from './firebase';
 import {
-  TRAVEL_CFG_ID, getTravelCfg, travelPlan, bookedMain, syncPatch, needsSync, travelWarnings, sourceLabel,
+  TRAVEL_CFG_ID, getTravelCfg, travelPlan, bookedMain, syncPatch, needsSync, travelWarnings, sourceLabel, eventDateIssue,
   knownPlaces, carIsTravel, samePlace, journeysFromLegs, passengerMatches,
 } from './travel';
 
@@ -1061,7 +1061,7 @@ export function Logistics({ store, activeEventId }) {
   const [logiShowFilter, setLogiShowFilter] = useState(false);
   const [ttOpen, setTtOpen] = useState(false);
   const [syncBusy, setSyncBusy] = useState(false);
-  const cfg = getTravelCfg(store);
+  const cfg = getTravelCfg(store, activeEventId);
   const places = knownPlaces(cfg, logi);
 
   // getL must be defined before logiWithNames uses it
@@ -1228,7 +1228,7 @@ export function Logistics({ store, activeEventId }) {
                           {L.arrivalTime && <div style={{ color: 'var(--muted)' }}>{L.arrivalTime}</div>}
                           {L.arrivalLocation && <div style={{ color: 'var(--muted)' }}>{L.arrivalLocation}</div>}
                           {L.arrivalDate && <span className={'src-tag ' + sourceLabel(L, 'arrival').cls}>{sourceLabel(L, 'arrival').t}</span>}
-                          {travelWarnings(L).filter(w => w.key !== 'departure' && w.key !== 'checkout').map(w => <div key={w.key} className="src-warn">⚠ {w.text}</div>)}
+                          {travelWarnings(L, cfg).filter(w => !['departure', 'checkout', 'depEvent'].includes(w.key)).map(w => <div key={w.key} className="src-warn">⚠ {w.text}</div>)}
                         </div>
                       </td>
                       <td>
@@ -1237,7 +1237,7 @@ export function Logistics({ store, activeEventId }) {
                           {L.departureTime && <div style={{ color: 'var(--muted)' }}>{L.departureTime}</div>}
                           {L.departureLocation && <div style={{ color: 'var(--muted)' }}>{L.departureLocation}</div>}
                           {L.departureDate && <span className={'src-tag ' + sourceLabel(L, 'departure').cls}>{sourceLabel(L, 'departure').t}</span>}
-                          {travelWarnings(L).filter(w => w.key === 'departure' || w.key === 'checkout').map(w => <div key={w.key} className="src-warn">⚠ {w.text}</div>)}
+                          {travelWarnings(L, cfg).filter(w => ['departure', 'checkout', 'depEvent'].includes(w.key)).map(w => <div key={w.key} className="src-warn">⚠ {w.text}</div>)}
                         </div>
                       </td>
                       <td onClick={e => e.stopPropagation()}>{can('logistics.flight') ? <LogisticsReqToggle cid={c.id} field="flightReq" getL={getL} toggleReq={toggleReq} setSubModal={setSubModal}/> : <span className="muted-sm">{getL(c.id).flightReq||'required'}</span>}</td>
@@ -1344,7 +1344,7 @@ const LogisticsExpandedRow = React.memo(function LogisticsExpandedRow({ c, L, st
   if (!shown('departure','Date'))   missing.push('Departure date');
 
   const plan = travelPlan(L, cfg);
-  const warns = travelWarnings(L);
+  const warns = travelWarnings(L, cfg);
   const sideHead = (k, title) => {
     const b = bookedFor(k);
     const lbl = follows(k) ? { t: b.source === 'flight' ? `✈ From flight${b.ref ? ' ' + b.ref : ''}` : '🚗 From car', cls: b.source } : ov[k] ? { t: 'Manual override', cls: 'manual' } : { t: 'Planned (typed by you)', cls: 'planned' };
@@ -1576,6 +1576,11 @@ function FlightModal({ contactId, item, onClose, toast, activeEventId, cfg, plac
               <div style={{ flex: 1, minWidth: 200 }}>
                 <b>{j.flightNo || 'Flight'}</b> · {j.from} → {j.to}
                 <div className="muted-sm">Departs {j.departDate} {j.departTime} · Lands {j.arriveDate} {j.arriveTime}{j.legs.length > 1 ? ` · ${j.legs.length} flights (connection)` : ''}</div>
+                {(() => {   // outside the event? judged by how this flight will be used
+                  const u = scan.use[i];
+                  const msg = u === 'arrival' ? eventDateIssue('arrival', j.arriveDate, cfg) : u === 'departure' ? eventDateIssue('departure', j.departDate, cfg) : '';
+                  return msg ? <div className="src-warn" style={{ maxWidth: 'none' }}>⚠ {msg}</div> : null;
+                })()}
               </div>
               <select className="statsel" value={scan.use[i]} onChange={e => setScan(sc => ({ ...sc, use: sc.use.map((u, k) => k === i ? e.target.value : u) }))}>
                 <option value="arrival">Use as arrival</option>
@@ -1595,7 +1600,8 @@ function FlightModal({ contactId, item, onClose, toast, activeEventId, cfg, plac
         <Field label="From"><input className="input" value={f.arrivalFrom} onChange={set('arrivalFrom')} placeholder="City or airport" /></Field>
         <Field label="To (airport / terminal)"><input className="input" list={PLACES_LIST_ID} value={f.arrivalTo} onChange={set('arrivalTo')} placeholder="e.g. Mumbai T2" /></Field>
         <Field label="Flight number"><input className="input" value={f.arrivalFlightNo} onChange={set('arrivalFlightNo')} placeholder="e.g. AI 631" /></Field>
-        <Field label="Arrival date"><input className="input" type="date" value={f.arrivalFlightDate} onChange={set('arrivalFlightDate')} /></Field>
+        <Field label="Arrival date"><input className="input" type="date" value={f.arrivalFlightDate} onChange={set('arrivalFlightDate')} />
+          {eventDateIssue('arrival', f.arrivalFlightDate, cfg) && <div className="src-warn" style={{ maxWidth: 'none' }}>⚠ {eventDateIssue('arrival', f.arrivalFlightDate, cfg)}</div>}</Field>
         <Field label="Arrival time"><TimePicker value={f.arrivalFlightTime} onChange={v => setF(p => ({...p, arrivalFlightTime:v}))}/></Field>
       </div>
       <div style={{ fontWeight: 600, fontSize: 12, color: 'var(--teal)', margin: '14px 0 8px', textTransform: 'uppercase', letterSpacing: '.05em' }}>Departure flight</div>
@@ -1603,7 +1609,8 @@ function FlightModal({ contactId, item, onClose, toast, activeEventId, cfg, plac
         <Field label="From (airport / terminal)"><input className="input" list={PLACES_LIST_ID} value={f.departureFrom} onChange={set('departureFrom')} placeholder="e.g. Mumbai T2" /></Field>
         <Field label="To"><input className="input" value={f.departureTo} onChange={set('departureTo')} placeholder="City or airport" /></Field>
         <Field label="Flight number"><input className="input" value={f.departureFlightNo} onChange={set('departureFlightNo')} placeholder="e.g. AI 632" /></Field>
-        <Field label="Departure date"><input className="input" type="date" value={f.departureFlightDate} onChange={set('departureFlightDate')} /></Field>
+        <Field label="Departure date"><input className="input" type="date" value={f.departureFlightDate} onChange={set('departureFlightDate')} />
+          {eventDateIssue('departure', f.departureFlightDate, cfg) && <div className="src-warn" style={{ maxWidth: 'none' }}>⚠ {eventDateIssue('departure', f.departureFlightDate, cfg)}</div>}</Field>
         <Field label="Flight Departure Time"><TimePicker value={f.departureFlightTime} onChange={v => setF(p => ({...p, departureFlightTime:v}))}/></Field>
         <Field label="Flight type">
           <label className="chk" style={{ margin: '6px 0 0' }}><input type="checkbox" checked={!!f.departureIntl} onChange={e => setF(p => ({ ...p, departureIntl: e.target.checked }))} />
@@ -1742,7 +1749,7 @@ function AccommodationModal({ contactId, item, onClose, toast, activeEventId, cf
 function TravelTimesModal({ cfg, places, canEdit, onClose, toast }) {
   const rid = () => Math.random().toString(36).slice(2, 9);
   const [f, setF] = useState(() => ({
-    venueName: cfg.venueName, landingBuffer: String(cfg.landingBuffer), domesticReport: String(cfg.domesticReport),
+    venueName: cfg.venueName, landingBuffer: String(cfg.landingBuffer), domesticReport: String(cfg.domesticReport), eventMargin: String(cfg.eventMargin),
     intlReport: String(cfg.intlReport), peak: cfg.peak,
     routes: cfg.routes.length ? cfg.routes.map(r => ({ id: r.id || rid(), from: r.from || '', to: r.to || '', normal: r.normal ?? '', peak: r.peak ?? '' }))
                               : [{ id: rid(), from: '', to: cfg.venueName, normal: '', peak: '' }],
@@ -1762,6 +1769,7 @@ function TravelTimesModal({ cfg, places, canEdit, onClose, toast }) {
     await saveItem('appConfig', {
       id: TRAVEL_CFG_ID, venueName: f.venueName.trim() || 'Venue', peak: f.peak.trim(),
       landingBuffer: parseInt(f.landingBuffer, 10) || 0, domesticReport: parseInt(f.domesticReport, 10) || 0, intlReport: parseInt(f.intlReport, 10) || 0,
+      eventMargin: Math.max(0, parseInt(f.eventMargin, 10) || 0),
       routes: routes.map(r => ({ id: r.id, from: r.from.trim(), to: r.to.trim(), normal: parseInt(r.normal, 10), peak: r.peak === '' ? '' : parseInt(r.peak, 10) })),
     });
     toast('Travel times saved. Use "Update from bookings" if car arrival times need refreshing.');
@@ -1783,6 +1791,7 @@ function TravelTimesModal({ cfg, places, canEdit, onClose, toast }) {
           <Field label="Landing → car ready (min)"><input className="input" type="number" min={0} value={f.landingBuffer} onChange={setV('landingBuffer')} /></Field>
           <Field label="Reach airport before domestic flight (min)"><input className="input" type="number" min={0} value={f.domesticReport} onChange={setV('domesticReport')} /></Field>
           <Field label="Reach airport before international flight (min)"><input className="input" type="number" min={0} value={f.intlReport} onChange={setV('intlReport')} /></Field>
+          <Field label="Flag arriving earlier / leaving later than (days around the event)"><input className="input" type="number" min={0} value={f.eventMargin} onChange={setV('eventMargin')} /></Field>
         </div>
         <div className="av-step" style={{ marginTop: 10 }}>Routes</div>
         <div className="tt-routes">
@@ -3500,7 +3509,7 @@ export function Reports({ store, activeEventId }) {
   const hasManualSahebji = cid => savedRows.some(r=>r.contactId===cid && !r.auto && /sahebji|one-on-one|one on one/i.test(r.event||''));
   const EDITABLE_SOURCES = ['Scheduling','Logistics','Sahebji'];
 
-  const travelCfg = getTravelCfg(store);
+  const travelCfg = getTravelCfg(store, activeEventId);
   const getAutoRows = (cid, deletedIds) => {
     const L = getL(cid);
     const autos = [];
